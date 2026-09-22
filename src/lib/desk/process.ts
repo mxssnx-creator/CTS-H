@@ -1,0 +1,644 @@
+import { INDICATIONS, LASTN, MAX_HOLD, MAX_MUL, PF, TAG, TRAIL_PCT, type Floors, type Indication } from "./constants";
+import { allShortCombos, axisQty, blockQty, capTotalQty, closePnl, comboId, liveShortOk, pfFromPnls, positionNotional } from "./math";
+
+export type Bar = { t: number; o: number; h: number; l: number; c: number; v: number };
+
+export type Side = 1 | -1;
+
+export type Cell = {
+  id: string;
+  symbol: string;
+  indication: Indication;
+  tpAtr: number;
+  slOfTp: number;
+  liveFloor: boolean;
+  n: number;
+  wins: number;
+  gw: number;
+  gl: number;
+  net: number;
+  pf: number;
+  validExec: boolean;
+  disabled: boolean;
+  lastN: number[];
+  cursorT: number;
+  side: Side | 0;
+  leg: OpenLeg | null;
+};
+
+type OpenLeg = {
+  side: Side;
+  entry: number;
+  sl: number;
+  tp: number;
+  qty: number;
+  hold: number;
+};
+
+export type LivePos = {
+  id: string;
+  symbol: string;
+  side: Side;
+  qty: number;
+  qtyBase: number;
+  entry: number;
+  mark: number;
+  peak: number;
+  sl: number;
+  tp: number;
+  combo: string;
+  indication: string;
+  hold: number;
+  dca: number;
+  openedAt: number;
+};
+
+export type TapeFill = {
+  id: string;
+  tape: "intern" | "live";
+  symbol: string;
+  combo: string;
+  pnl: number;
+  px: number;
+  ts: number;
+  side: Side;
+  indication?: string;
+};
+
+export type Series = {
+  atr: number[];
+  ema9: number[];
+  ema12: number[];
+  ema21: number[];
+  ema26: number[];
+  rsi: number[];
+  mid: number[];
+  sd: number[];
+  vol: number[];
+};
+
+const PF_NO_LOSS_NEAR = 3.999;
+
+export function atrSeries(bars: Bar[], n = 14): number[] {
+  const out = new Array<number>(bars.length).fill(0);
+  let prev = bars[0]?.c ?? 0;
+  let atr = 0;
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i]!;
+    const tr = Math.max(b.h - b.l, Math.abs(b.h - prev), Math.abs(b.l - prev));
+    atr = i === 0 ? tr : (atr * (n - 1) + tr) / n;
+    out[i] = atr;
+    prev = b.c;
+  }
+  return out;
+}
+
+function emaSeries(bars: Bar[], n: number): number[] {
+  const out = new Array<number>(bars.length).fill(0);
+  if (!bars.length) return out;
+  const k = 2 / (n + 1);
+  let e = bars[0]!.c;
+  out[0] = e;
+  for (let i = 1; i < bars.length; i++) {
+    e = bars[i]!.c * k + e * (1 - k);
+    out[i] = e;
+  }
+  return out;
+}
+
+function rsiSeries(bars: Bar[], n = 14): number[] {
+  const out = new Array<number>(bars.length).fill(50);
+  if (bars.length < n + 1) return out;
+  let g = 0;
+  let l = 0;
+  for (let i = 1; i <= n; i++) {
+    const d = bars[i]!.c - bars[i - 1]!.c;
+    if (d >= 0) g += d;
+    else l -= d;
+  }
+  const pack = (i: number, gain: number, loss: number) => {
+    if (loss <= 0) out[i] = 100;
+    else {
+      const rs = gain / loss;
+      out[i] = 100 - 100 / (1 + rs);
+    }
+  };
+  pack(n, g, l);
+  for (let i = n + 1; i < bars.length; i++) {
+    const d = bars[i]!.c - bars[i - 1]!.c;
+    const gain = d > 0 ? d : 0;
+    const loss = d < 0 ? -d : 0;
+    g = (g * (n - 1) + gain) / n;
+    l = (l * (n - 1) + loss) / n;
+    pack(i, g, l);
+  }
+  return out;
+}
+
+function bbSeries(bars: Bar[], n = 20): { mid: number[]; sd: number[] } {
+  const mid = new Array<number>(bars.length).fill(0);
+  const sd = new Array<number>(bars.length).fill(0);
+  let sum = 0;
+  let sum2 = 0;
+  for (let i = 0; i < bars.length; i++) {
+    const c = bars[i]!.c;
+    sum += c;
+    sum2 += c * c;
+    if (i >= n) {
+      const old = bars[i - n]!.c;
+      sum -= old;
+      sum2 -= old * old;
+    }
+    const len = Math.min(i + 1, n);
+    const m = sum / len;
+    const v = Math.max(0, sum2 / len - m * m);
+    mid[i] = m;
+    sd[i] = Math.sqrt(v);
+  }
+  return { mid, sd };
+}
+
+export function buildSeries(bars: Bar[]): Series {
+  const { mid, sd } = bbSeries(bars);
+  return {
+    atr: atrSeries(bars),
+    ema9: emaSeries(bars, 9),
+    ema12: emaSeries(bars, 12),
+    ema21: emaSeries(bars, 21),
+    ema26: emaSeries(bars, 26),
+    rsi: rsiSeries(bars),
+    mid,
+    sd,
+    vol: emaSeries(
+      bars.map((b) => ({ ...b, c: b.v })),
+      20,
+    ),
+  };
+}
+
+export function rsiLast(bars: Bar[], n = 14): number {
+  return rsiSeries(bars, n).at(-1) ?? 50;
+}
+
+export function emaLast(bars: Bar[], n: number): number {
+  return emaSeries(bars, n).at(-1) ?? 0;
+}
+
+export function signalAt(ind: Indication, bars: Bar[], s: Series, i: number): Side | 0 {
+  if (i < 21 || i >= bars.length) return 0;
+  const b = bars[i]!;
+  const a = Math.max(s.atr[i] ?? 0, b.c * 0.0004);
+  const impulse = (b.c - b.o) / a;
+  switch (ind) {
+    case "direction": {
+      const prev = (s.ema9[i - 1] ?? 0) - (s.ema21[i - 1] ?? 0);
+      const now = (s.ema9[i] ?? 0) - (s.ema21[i] ?? 0);
+      if (prev <= 0 && now > 0) return 1;
+      if (prev >= 0 && now < 0) return -1;
+      return 0;
+    }
+    case "move":
+      if (impulse > 0.35) return 1;
+      if (impulse < -0.35) return -1;
+      return 0;
+    case "break": {
+      let hi = -Infinity;
+      let lo = Infinity;
+      for (let k = Math.max(0, i - 8); k < i; k++) {
+        hi = Math.max(hi, bars[k]!.h);
+        lo = Math.min(lo, bars[k]!.l);
+      }
+      if (b.c > hi) return 1;
+      if (b.c < lo) return -1;
+      return 0;
+    }
+    case "rsi": {
+      const r = s.rsi[i] ?? 50;
+      const p = s.rsi[i - 1] ?? 50;
+      if (p < 35 && r >= 35) return 1;
+      if (p > 65 && r <= 65) return -1;
+      return 0;
+    }
+    case "macd": {
+      const m0 = (s.ema12[i - 1] ?? 0) - (s.ema26[i - 1] ?? 0);
+      const m1 = (s.ema12[i] ?? 0) - (s.ema26[i] ?? 0);
+      if (m0 <= 0 && m1 > 0) return 1;
+      if (m0 >= 0 && m1 < 0) return -1;
+      return 0;
+    }
+    case "bollinger": {
+      const mid = s.mid[i] ?? b.c;
+      const sd = s.sd[i] ?? 0;
+      if (!(sd > 0)) return 0;
+      if (b.c < mid - 2 * sd) return 1;
+      if (b.c > mid + 2 * sd) return -1;
+      return 0;
+    }
+    case "ema":
+      if (b.c > (s.ema21[i] ?? b.c) && bars[i - 1]!.c <= (s.ema21[i - 1] ?? b.c)) return 1;
+      if (b.c < (s.ema21[i] ?? b.c) && bars[i - 1]!.c >= (s.ema21[i - 1] ?? b.c)) return -1;
+      return 0;
+    case "active": {
+      const vol = s.vol[i] || b.v || 1;
+      if (b.v < vol) return 0;
+      if (impulse > 0.25) return 1;
+      if (impulse < -0.25) return -1;
+      return 0;
+    }
+    default:
+      return 0;
+  }
+}
+
+export type IndicationRow = {
+  name: Indication;
+  side: Side | 0;
+  detail: string;
+};
+
+export function indicationBoard(bars: Bar[]): IndicationRow[] {
+  const closed = closedBars(bars);
+  if (closed.length < 24) {
+    return INDICATIONS.map((name) => ({ name, side: 0 as const, detail: "waiting for closed bars" }));
+  }
+  const series = buildSeries(closed);
+  const i = closed.length - 1;
+  const b = closed[i]!;
+  const a = Math.max(series.atr[i] ?? 0, b.c * 0.0004);
+  const impulse = (b.c - b.o) / a;
+  const z = (series.sd[i] ?? 0) > 0 ? (b.c - (series.mid[i] ?? b.c)) / (series.sd[i] ?? 1) : 0;
+  return INDICATIONS.map((name) => {
+    const side = signalAt(name, closed, series, i);
+    const detail =
+      name === "direction"
+        ? `ema9 ${series.ema9[i]!.toFixed(4)} · ema21 ${series.ema21[i]!.toFixed(4)}`
+        : name === "move"
+          ? `impulse ${impulse.toFixed(2)} ATR`
+          : name === "break"
+            ? `close ${b.c} vs prior 8-bar range`
+            : name === "rsi"
+              ? `RSI ${series.rsi[i]!.toFixed(1)}`
+              : name === "macd"
+                ? `macd ${((series.ema12[i] ?? 0) - (series.ema26[i] ?? 0)).toFixed(4)}`
+                : name === "bollinger"
+                  ? `z ${z.toFixed(2)}`
+                  : name === "ema"
+                    ? `close vs ema21 ${((b.c / (series.ema21[i] || b.c) - 1) * 100).toFixed(3)}%`
+                    : `vol ${b.v.toFixed(2)} vs ema ${series.vol[i]!.toFixed(2)}`;
+    return { name, side, detail };
+  });
+}
+
+function closedBars(bars: Bar[]): Bar[] {
+  return bars.length > 1 ? bars.slice(0, -1) : bars;
+}
+
+function indexAfter(bars: Bar[], t: number): number {
+  let lo = 0;
+  let hi = bars.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (bars[mid]!.t <= t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function pushPnl(cell: Cell, pnl: number) {
+  cell.n += 1;
+  cell.net += pnl;
+  cell.lastN.push(pnl);
+  if (cell.lastN.length > LASTN.eval) cell.lastN.shift();
+  if (pnl >= 0) {
+    cell.wins += 1;
+    cell.gw += pnl;
+  } else cell.gl += Math.abs(pnl);
+  cell.pf = cell.gl < 1e-12 ? (cell.gw > 1e-12 ? 4 : 0) : cell.gw / cell.gl;
+}
+
+export function gateCell(cell: Cell, floors: Floors) {
+  const slice = cell.lastN.slice(-LASTN.valid);
+  const net = slice.reduce((a, b) => a + b, 0);
+  const pf = pfFromPnls(slice.map((p) => ({ pnl: p })));
+  const undersampled = slice.length < LASTN.minSamples;
+  const pass = !undersampled && pf >= floors.short && net >= 0;
+  const proven = cell.n >= 6 && cell.pf >= floors.short && cell.net > 0 && !(cell.pf >= PF_NO_LOSS_NEAR && cell.net <= 1e-6);
+  cell.validExec = cell.liveFloor && cell.n >= LASTN.minSamples && (cell.n < 6 ? pass : proven && pass);
+  const dis = cell.lastN.slice(-LASTN.disable);
+  const disNet = dis.reduce((a, b) => a + b, 0);
+  const validStill = cell.validExec;
+  cell.disabled = !validStill && dis.length >= LASTN.minSamples && disNet < 0;
+}
+
+function blankCell(symbol: string, indication: Indication, tpAtr: number, slOfTp: number): Cell {
+  return {
+    id: `${symbol}|${indication}|${comboId(tpAtr, slOfTp)}`,
+    symbol,
+    indication,
+    tpAtr,
+    slOfTp,
+    liveFloor: liveShortOk(tpAtr, slOfTp),
+    n: 0,
+    wins: 0,
+    gw: 0,
+    gl: 0,
+    net: 0,
+    pf: 0,
+    validExec: false,
+    disabled: false,
+    lastN: [],
+    cursorT: 0,
+    side: 0,
+    leg: null,
+  };
+}
+
+function advance(
+  cell: Cell,
+  bars: Bar[],
+  sides: Array<Side | 0>,
+  atr: number[],
+  notional: number,
+  from: number,
+  push: (fill: TapeFill) => void,
+) {
+  const start = Math.max(from, 22);
+  for (let i = start; i < bars.length; i++) {
+    const b = bars[i]!;
+    const a = Math.max(atr[i] ?? 0, b.c * 0.0004);
+    if (!cell.leg) {
+      const side = sides[i] ?? 0;
+      cell.cursorT = b.t;
+      if (!side) continue;
+      const tpDist = cell.tpAtr * a;
+      const slDist = cell.slOfTp * tpDist;
+      cell.side = side;
+      cell.leg = {
+        side,
+        entry: b.c,
+        tp: b.c + side * tpDist,
+        sl: b.c - side * slDist,
+        qty: notional / b.c,
+        hold: 0,
+      };
+      continue;
+    }
+    const leg = cell.leg;
+    leg.hold += 1;
+    const hitTp = leg.side > 0 ? b.h >= leg.tp : b.l <= leg.tp;
+    const hitSl = leg.side > 0 ? b.l <= leg.sl : b.h >= leg.sl;
+    cell.cursorT = b.t;
+    if (!(hitTp || hitSl || leg.hold >= MAX_HOLD)) continue;
+    const exit = hitSl ? leg.sl : hitTp ? leg.tp : b.c;
+    const pnl = closePnl(leg.side, leg.entry, exit, leg.qty);
+    pushPnl(cell, pnl);
+    push({
+      id: `i:${cell.id}:${b.t}`,
+      tape: "intern",
+      symbol: cell.symbol,
+      combo: comboId(cell.tpAtr, cell.slOfTp),
+      pnl,
+      px: exit,
+      ts: b.t,
+      side: leg.side,
+      indication: cell.indication,
+    });
+    cell.leg = null;
+  }
+  const last = bars.at(-1);
+  if (last) cell.cursorT = last.t;
+}
+
+export function syncBooks(
+  prev: Cell[],
+  books: { symbol: string; bars: Bar[] }[],
+  equity: number,
+  floors: Floors,
+): { cells: Cell[]; internFills: TapeFill[]; closes: number; valid: number; symbols: number } {
+  const byId = new Map(prev.map((c) => [c.id, c]));
+  const notional = positionNotional(equity);
+  const combos = allShortCombos();
+  const cells: Cell[] = [];
+  const cap = 240;
+  const ring: TapeFill[] = [];
+  let seq = 0;
+  const push = (fill: TapeFill) => {
+    if (seq < cap) ring.push(fill);
+    else ring[seq % cap] = fill;
+    seq += 1;
+  };
+  let closes = 0;
+  let symbols = 0;
+  for (const book of books) {
+    const bars = closedBars(book.bars);
+    if (bars.length < 24) continue;
+    symbols += 1;
+    const series = buildSeries(bars);
+    const sides = {} as Record<Indication, Array<Side | 0>>;
+    for (const indication of INDICATIONS) {
+      const row: Array<Side | 0> = new Array(bars.length).fill(0);
+      for (let i = 22; i < bars.length; i++) row[i] = signalAt(indication, bars, series, i);
+      sides[indication] = row;
+    }
+    for (const combo of combos) {
+      for (const indication of INDICATIONS) {
+        const id = `${book.symbol}|${indication}|${comboId(combo.tpAtr, combo.slOfTp)}`;
+        const lastT = bars.at(-1)?.t ?? 0;
+        const prior = byId.get(id);
+        const stale = !!prior && prior.cursorT > lastT;
+        const cell = prior && !stale
+          ? { ...prior, lastN: prior.lastN.slice(), leg: prior.leg ? { ...prior.leg } : null }
+          : blankCell(book.symbol, indication, combo.tpAtr, combo.slOfTp);
+        const from = cell.cursorT ? indexAfter(bars, cell.cursorT) : 22;
+        const before = cell.n;
+        advance(cell, bars, sides[indication]!, series.atr, notional, from, push);
+        closes += cell.n - before;
+        gateCell(cell, floors);
+        cells.push(cell);
+      }
+    }
+  }
+  let valid = 0;
+  for (const c of cells) if (c.validExec && !c.disabled) valid += 1;
+  const internFills = seq <= cap ? ring : ring.slice(seq % cap).concat(ring.slice(0, seq % cap));
+  return { cells, internFills, closes, valid, symbols };
+}
+
+export function applyFloors(cells: Cell[], floors: Floors): Cell[] {
+  return cells.map((c) => {
+    const next = { ...c, lastN: c.lastN, leg: c.leg };
+    gateCell(next, floors);
+    return next;
+  });
+}
+
+export type SizeOpts = { block: boolean; axis: boolean; normalLive: boolean; hedge: boolean };
+
+export function sizedNotional(base: number, opts: { block: boolean; axis: boolean }): number {
+  if (!(base > 0)) return 0;
+  if (opts.axis && opts.block) {
+    const ax = axisQty(base);
+    const bl = blockQty(base);
+    return capTotalQty(base, ax - base + (bl - base));
+  }
+  if (opts.axis) return axisQty(base);
+  if (opts.block) return blockQty(base);
+  return base;
+}
+
+export function openFromPerforming(
+  cells: Cell[],
+  marks: Record<string, { price: number; atr: number }>,
+  equity: number,
+  opts: SizeOpts,
+): LivePos[] {
+  const ranked = cells
+    .filter((c) => c.validExec && !c.disabled && c.liveFloor && c.net > 0 && (c.side === 1 || c.side === -1))
+    .filter((c) => opts.normalLive || c.indication !== "direction")
+    .sort((a, b) => b.pf - a.pf || b.net - a.net);
+  const seen = new Set<string>();
+  const symbols = new Set<string>();
+  const out: LivePos[] = [];
+  const base = positionNotional(equity);
+  for (const c of ranked) {
+    if (out.length >= 12) break;
+    const key = `${c.symbol}:${c.indication}`;
+    if (seen.has(key)) continue;
+    if (!opts.hedge && symbols.has(c.symbol)) continue;
+    const m = marks[c.symbol];
+    if (!m || !(m.price > 0) || !(m.atr > 0)) continue;
+    seen.add(key);
+    symbols.add(c.symbol);
+    const side = c.side as Side;
+    const a = Math.max(m.atr, m.price * 0.0008);
+    const notional = sizedNotional(base, opts);
+    const qty = notional / m.price;
+    const tpDist = c.tpAtr * a;
+    const slDist = c.slOfTp * tpDist;
+    out.push({
+      id: `x:${TAG}${c.symbol.replace("-", "")}${c.indication.slice(0, 3)}${out.length}`,
+      symbol: c.symbol,
+      side,
+      qty,
+      qtyBase: base / m.price,
+      entry: m.price,
+      mark: m.price,
+      peak: m.price,
+      tp: m.price + side * tpDist,
+      sl: m.price - side * slDist,
+      combo: comboId(c.tpAtr, c.slOfTp),
+      indication: c.indication,
+      hold: 0,
+      dca: 0,
+      openedAt: Date.now(),
+    });
+  }
+  return out;
+}
+
+export function markPositions(
+  positions: LivePos[],
+  prices: Record<string, number>,
+  opts: { trail: boolean; dca: boolean; equity: number },
+): { open: LivePos[]; closed: { pos: LivePos; pnl: number; px: number; reason: string }[]; dca: LivePos[] } {
+  const open: LivePos[] = [];
+  const closed: { pos: LivePos; pnl: number; px: number; reason: string }[] = [];
+  const dca: LivePos[] = [];
+  const base = positionNotional(opts.equity);
+  for (const p of positions) {
+    const px = prices[p.symbol];
+    if (!(px > 0)) {
+      open.push(p);
+      continue;
+    }
+    const next: LivePos = { ...p, mark: px, hold: p.hold + 1 };
+    if (next.side > 0) next.peak = Math.max(next.peak, px);
+    else next.peak = Math.min(next.peak, px);
+    if (opts.trail) {
+      const dist = next.peak * (TRAIL_PCT / 100);
+      if (next.side > 0) next.sl = Math.max(next.sl, next.peak - dist);
+      else next.sl = Math.min(next.sl, next.peak + dist);
+    }
+    if (opts.dca && next.dca < 2) {
+      const adverse = next.side > 0 ? next.entry - px : px - next.entry;
+      const room = next.qtyBase * MAX_MUL - next.qty;
+      if (adverse > Math.abs(next.entry - next.sl) * 0.45 && room > 0) {
+        const add = Math.min(room, base / px);
+        if (add > 0) {
+          next.entry = (next.entry * next.qty + px * add) / (next.qty + add);
+          next.qty += add;
+          next.dca += 1;
+          dca.push(next);
+        }
+      }
+    }
+    const hitTp = next.side > 0 ? px >= next.tp : px <= next.tp;
+    const hitSl = next.side > 0 ? px <= next.sl : px >= next.sl;
+    if (hitSl || next.hold > 180) {
+      closed.push({ pos: next, pnl: closePnl(next.side, next.entry, px, next.qty), px, reason: hitSl ? "sl" : "hold" });
+    } else if (hitTp) {
+      closed.push({ pos: next, pnl: closePnl(next.side, next.entry, px, next.qty), px, reason: "tp" });
+    } else open.push(next);
+  }
+  return { open, closed, dca };
+}
+
+export function headline(livePnls: { symbol: string; combo: string; pnl: number }[], minPf = PF.short) {
+  const map = new Map<string, { n: number; net: number; pnls: number[] }>();
+  for (const r of livePnls) {
+    const k = `${r.symbol}|${r.combo}`;
+    const g = map.get(k) ?? { n: 0, net: 0, pnls: [] };
+    g.n += 1;
+    g.net += r.pnl;
+    g.pnls.push(r.pnl);
+    map.set(k, g);
+  }
+  return [...map.entries()]
+    .map(([id, g]) => ({ id, n: g.n, net: g.net, pf: pfFromPnls(g.pnls.map((pnl) => ({ pnl }))) }))
+    .filter((r) => r.n >= 4 && r.net > 0 && r.pf >= minPf)
+    .sort((a, b) => b.pf - a.pf);
+}
+
+export function greenHour(fills: TapeFill[], now: number) {
+  const start = now - (now % 3_600_000);
+  let n = 0;
+  let net = 0;
+  for (const f of fills) {
+    if (f.tape === "live" && f.ts >= start) {
+      n += 1;
+      net += f.pnl;
+    }
+  }
+  if (!(n > 0)) return { green: false, code: "G0" as const, n, net };
+  return { green: net >= 0, code: (net >= 0 ? "G1" : "R1") as "G1" | "R1", n, net };
+}
+
+export function systemNet(closed: number, positions: LivePos[]): number {
+  let open = 0;
+  for (const p of positions) open += closePnl(p.side, p.entry, p.mark, p.qty);
+  return closed + open;
+}
+
+export function cellRollup(cells: Cell[]) {
+  let valid = 0;
+  let disabled = 0;
+  let net = 0;
+  let samples = 0;
+  for (const c of cells) {
+    if (c.validExec && !c.disabled) valid += 1;
+    if (c.disabled) disabled += 1;
+    net += c.net;
+    samples += c.n;
+  }
+  return { valid, disabled, net, samples, n: cells.length };
+}
+
+export function barSignature(books: { symbol: string; bars: Bar[] }[]): string {
+  let sig = "";
+  for (const b of books) {
+    const closed = closedBars(b.bars);
+    const last = closed.at(-1);
+    sig += `${b.symbol}:${last?.t ?? 0}:${closed.length}|`;
+  }
+  return sig;
+}

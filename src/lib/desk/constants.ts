@@ -1,0 +1,97 @@
+export const POSITION_COST_PCT = 0.0012;
+export const POSITION_RT_COST_PCT = 0.0012;
+export const PF_NO_LOSS = 4;
+export const AXIS_PARTIAL_RATIO = 3;
+export const BLOCK_ADD = 0.2;
+export const BLOCK_SHARED = 1.5;
+export const BLOCK_OVERALL = 1.5;
+export const MAX_MUL = 2.5;
+export const ENGINE_VF = 1;
+export const TRAIL_PCT = 1.5;
+export const LIVE_BLOCK_COUNTS = [1, 3, 4, 5, 6] as const;
+export const LASTN = { eval: 50, valid: 15, disable: 12, minSamples: 4 };
+export const PF = {
+  overall: 1.35,
+  base: 1,
+  axis: 1.15,
+  block: 1.2,
+  short: 0.95,
+  shortBase: 0.7,
+  shortAxis: 0.9,
+  shortBlock: 1.15,
+};
+export const LIVE_SHORT = { minTp: 0.48, minSlOfTp: 0.75, maxTp: 0.6 };
+export const SHORT_TP = [0.3, 0.32, 0.34, 0.36, 0.38, 0.4, 0.42, 0.45, 0.48, 0.5, 0.52, 0.55, 0.58, 0.6];
+export const SHORT_SL = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5];
+export const TAG = "CTSAV2_";
+export const BOOK = 10_000;
+export const MAX_HOLD = 24;
+export const MAX_LIVE_LEGS = 12;
+
+export const ACTIONS = [
+  "intern_arm",
+  "intern_all_pre",
+  "promote_real",
+  "live_paper_execute",
+  "block_volume",
+  "axis_volume",
+  "protect_grid",
+  "trail_1_5",
+  "flatten_own",
+  "flatten_losers",
+  "change_floors",
+  "enable_dca",
+  "enable_normal_live",
+  "connect_exchange",
+] as const;
+
+export type ActionId = (typeof ACTIONS)[number];
+
+export const ACTION_COPY: Record<ActionId, string> = {
+  intern_arm: "Arm intern scoring of every indication × short-GRID cell",
+  intern_all_pre: "Walk closed 1h bars through the 14×9 short GRID",
+  promote_real: "Promote last-N valid cells onto the performing set",
+  live_paper_execute: "Open gated paper legs tagged CTSA on the live tape",
+  block_volume: "Size Block additive 0.2 on N=1,3,4,5,6 (skip 2), cap 2.5×",
+  axis_volume: "Size Axis 3.0× partials, depth 2, same 2.5× cap",
+  protect_grid: "Keep one SL and one TP on each owned leg",
+  trail_1_5: "Trail the stop 1.5% from peak",
+  flatten_own: "Flatten every owned CTSA leg",
+  flatten_losers: "Flatten owned legs that are underwater",
+  change_floors: "Edit PF floors used by the gate",
+  enable_dca: "Allow one extra clip when a leg is adverse (playbook still gates it)",
+  enable_normal_live: "Let the unadjusted direction lane print live",
+  connect_exchange: "Arm the public BingX quote feed. Signed orders stay off — no keys",
+};
+
+export const PREFERRED_SYMBOLS = [
+  "BTC-USDT",
+  "ETH-USDT",
+  "SOL-USDT",
+  "XRP-USDT",
+  "DOGE-USDT",
+  "AVAX-USDT",
+  "LINK-USDT",
+  "BNB-USDT",
+  "ARB-USDT",
+  "SUI-USDT",
+];
+
+export const INDICATIONS = ["direction", "move", "break", "rsi", "macd", "bollinger", "ema", "active"] as const;
+export type Indication = (typeof INDICATIONS)[number];
+
+export type Floors = {
+  overall: number;
+  short: number;
+  base: number;
+  axis: number;
+  block: number;
+};
+
+export const DEFAULT_FLOORS: Floors = {
+  overall: PF.overall,
+  short: PF.short,
+  base: PF.base,
+  axis: PF.axis,
+  block: PF.block,
+};
