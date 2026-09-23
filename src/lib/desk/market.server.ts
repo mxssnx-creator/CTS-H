@@ -71,27 +71,34 @@ export async function loadUniverse(): Promise<Quote[]> {
 }
 
 const klineCache = new Map<string, { t: number; bars: Bar[] }>();
+let lastGood: { ts: number; books: BookSnap[] } | null = null;
 
 export async function loadKlines(symbol: string): Promise<Bar[]> {
   const key = `${symbol}:1h`;
   const hit = klineCache.get(key);
   if (hit && Date.now() - hit.t < 20_000) return hit.bars;
-  const raw = await bingx<{ open: string; close: string; high: string; low: string; volume: string; time: number }[]>(
-    `/openApi/swap/v2/quote/klines?symbol=${encodeURIComponent(symbol)}&interval=1h&limit=120`,
-  );
-  const bars: Bar[] = (raw ?? [])
-    .map((k) => ({
-      t: Number(k.time),
-      o: Number(k.open),
-      h: Number(k.high),
-      l: Number(k.low),
-      c: Number(k.close),
-      v: Number(k.volume),
-    }))
-    .filter((b) => b.c > 0)
-    .sort((a, b) => a.t - b.t);
-  klineCache.set(key, { t: Date.now(), bars });
-  return bars;
+  try {
+    const raw = await bingx<{ open: string; close: string; high: string; low: string; volume: string; time: number }[]>(
+      `/openApi/swap/v2/quote/klines?symbol=${encodeURIComponent(symbol)}&interval=1h&limit=120`,
+    );
+    const bars: Bar[] = (raw ?? [])
+      .map((k) => ({
+        t: Number(k.time),
+        o: Number(k.open),
+        h: Number(k.high),
+        l: Number(k.low),
+        c: Number(k.close),
+        v: Number(k.volume),
+      }))
+      .filter((b) => b.c > 0)
+      .sort((a, b) => a.t - b.t);
+    if (!bars.length) return hit?.bars ?? [];
+    klineCache.set(key, { t: Date.now(), bars });
+    return bars;
+  } catch (err) {
+    if (hit?.bars.length) return hit.bars;
+    throw err;
+  }
 }
 
 export async function loadDepth(symbol: string): Promise<{ bids: [number, number][]; asks: [number, number][] }> {
@@ -115,42 +122,63 @@ export async function loadFunding(symbol: string): Promise<number | null> {
   }
 }
 
-export async function loadSnapshot(symbols: string[], focus: string): Promise<{ ts: number; books: BookSnap[]; error?: string }> {
+export async function loadSnapshot(
+  symbols: string[],
+  focus: string,
+): Promise<{ ts: number; books: BookSnap[]; stale?: boolean; error?: string; healed?: string[] }> {
   const universe = symbols.length ? symbols : PREFERRED_SYMBOLS;
-  const quotes = await loadUniverse();
-  const quoteBy = new Map(quotes.map((q) => [q.symbol, q]));
-  const settled = await Promise.all(
-    universe.map(async (symbol) => {
-      try {
-        const bars = await loadKlines(symbol);
-        const quote = quoteBy.get(symbol) ?? {
-          symbol,
-          last: bars.at(-1)?.c ?? 0,
-          changePct: 0,
-          quoteVolume: 0,
-          high: bars.at(-1)?.h ?? 0,
-          low: bars.at(-1)?.l ?? 0,
-          bid: bars.at(-1)?.c ?? 0,
-          ask: bars.at(-1)?.c ?? 0,
-        };
-        let depth = { bids: [] as [number, number][], asks: [] as [number, number][] };
-        let funding: number | null = null;
-        if (symbol === focus) {
-          const [d, f] = await Promise.all([
-            loadDepth(symbol).catch(() => ({ bids: [] as [number, number][], asks: [] as [number, number][] })),
-            loadFunding(symbol),
-          ]);
-          depth = d;
-          funding = f;
+  try {
+    const quotes = await loadUniverse();
+    const quoteBy = new Map(quotes.map((q) => [q.symbol, q]));
+    const settled = await Promise.all(
+      universe.map(async (symbol) => {
+        try {
+          const bars = await loadKlines(symbol);
+          const quote = quoteBy.get(symbol) ?? {
+            symbol,
+            last: bars.at(-1)?.c ?? 0,
+            changePct: 0,
+            quoteVolume: 0,
+            high: bars.at(-1)?.h ?? 0,
+            low: bars.at(-1)?.l ?? 0,
+            bid: bars.at(-1)?.c ?? 0,
+            ask: bars.at(-1)?.c ?? 0,
+          };
+          let depth = { bids: [] as [number, number][], asks: [] as [number, number][] };
+          let funding: number | null = null;
+          if (symbol === focus) {
+            const [d, f] = await Promise.all([
+              loadDepth(symbol).catch(() => ({ bids: [] as [number, number][], asks: [] as [number, number][] })),
+              loadFunding(symbol),
+            ]);
+            depth = d;
+            funding = f;
+          }
+          if (!bars.length) return null;
+          return { symbol, bars, quote, funding, depth } satisfies BookSnap;
+        } catch {
+          return null;
         }
-        if (!bars.length) return null;
-        return { symbol, bars, quote, funding, depth } satisfies BookSnap;
-      } catch {
-        return null;
-      }
-    }),
-  );
-  const books = settled.filter((b): b is BookSnap => !!b);
-  if (!books.length) throw new Error("BingX returned no klines");
-  return { ts: Date.now(), books };
+      }),
+    );
+    const fresh = settled.filter((b): b is BookSnap => !!b);
+    const have = new Set(fresh.map((b) => b.symbol));
+    const restored = (lastGood?.books ?? []).filter((b) => universe.includes(b.symbol) && !have.has(b.symbol));
+    const books = [...fresh, ...restored];
+    if (!books.length) throw new Error("BingX returned no klines");
+    const stale = fresh.length === 0;
+    const snap = { ts: Date.now(), books };
+    lastGood = snap;
+    return {
+      ...snap,
+      stale,
+      healed: restored.map((b) => b.symbol),
+      error: stale ? "serving the last good tape" : undefined,
+    };
+  } catch (err) {
+    if (lastGood?.books.length) {
+      return { ts: lastGood.ts, books: lastGood.books, stale: true, error: err instanceof Error ? err.message : "feed failed" };
+    }
+    throw err;
+  }
 }

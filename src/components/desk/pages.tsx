@@ -14,12 +14,12 @@ import {
   SHORT_TP,
   TRAIL_PCT,
   type Floors,
-  type Indication,
 } from "@/lib/desk/constants";
 import { axisQty, blockQty, comboId, liveShortOk, pfFromPnls, positionNotional } from "@/lib/desk/math";
-import { cellRollup, greenHour, type TapeFill } from "@/lib/desk/process";
+import { atrSeries, barSignature, cellRollup, greenHour, simulateSessions, type HourPoint, type ReplaySize, type TapeFill } from "@/lib/desk/process";
 import { closePnl } from "@/lib/desk/math";
 import { focusBook, focusIndicators, liveHeadline, useDesk, useNet } from "@/lib/desk/store";
+import { CONNECTIONS, SYSTEM_ID, canAffect, orderStats, owns, positionScope } from "@/lib/desk/coord";
 
 function money(n: number) {
   const sign = n < 0 ? "-" : n > 0 ? "+" : "";
@@ -47,6 +47,7 @@ export function OverviewPage() {
   const net = useNet();
   const roll = useMemo(() => cellRollup(cells), [cells]);
   const hour = greenHour(live, lastTs || Date.now());
+  const session = useDesk((s) => s.session);
 
   return (
     <div className="flex flex-col gap-4">
@@ -57,6 +58,16 @@ export function OverviewPage() {
         <Stat k="Intern samples" v={String(roll.samples)} />
         <Stat k="Hour" v={`${hour.code} · ${money(hour.net)}`} tone={hour.code === "R1" ? "ask" : hour.code === "G1" ? "bid" : undefined} />
       </div>
+      {session?.ready ? (
+        <Panel title="24h book · prior day locked, latest day replayed">
+          <div className="mb-3 grid gap-3 sm:grid-cols-2">
+            <Stat k="Pre 24h" v={`${money(session.bookNetPre)} · ${session.greenBookPre}/24`} tone={session.bookNetPre >= 0 ? "bid" : "ask"} />
+            <Stat k="Live 24h" v={`${money(session.bookNetLive)} · ${session.greenBookLive}/24`} tone={session.bookNetLive >= 0 ? "bid" : "ask"} />
+          </div>
+          <HourDiagram rows={session.bookLive} />
+          <p className="mt-3 text-sm text-muted">{session.note}</p>
+        </Panel>
+      ) : null}
       <div className="flex gap-2 overflow-x-auto">
         {books.map((b) => (
           <button
@@ -119,25 +130,30 @@ export function OverviewPage() {
 
 function PosTable() {
   const positions = useDesk((s) => s.positions);
+  const connection = useDesk((s) => s.connection);
   const flat = useDesk((s) => s.flattenOwned);
   const losers = useDesk((s) => s.flattenLosers);
+  const scope = positionScope(connection);
   return (
     <div>
       <div className="mb-3 flex flex-wrap gap-2">
         <button onClick={flat} className="rounded-md bg-ask px-3 py-2 text-sm text-bg">
-          Flatten owned
+          Flatten in scope
         </button>
         <button onClick={losers} className="rounded-md border border-line px-3 py-2 text-sm">
-          Flatten losers
+          Flatten losers in scope
         </button>
       </div>
+      <p className="mb-3 text-sm text-muted">
+        Exchange actions use {scope.system} · {scope.connection} · {scope.type}. Other rows stay tracked and are not closed, trailed, or added to.
+      </p>
       <div className="overflow-x-auto">
         <table className="w-full font-mono text-xs">
           <thead className="text-dim">
             <tr>
               <th className="py-1 text-left">Sym</th>
               <th className="text-left">Side</th>
-              <th className="text-left">Ind</th>
+              <th className="text-left">Scope</th>
               <th className="text-left">Entry</th>
               <th className="text-left">Mark</th>
               <th className="text-left">SL</th>
@@ -148,11 +164,15 @@ function PosTable() {
           <tbody>
             {positions.map((p) => {
               const u = closePnl(p.side, p.entry, p.mark, p.qty);
+              const mine = owns(p, scope);
               return (
                 <tr key={p.id} className="border-t border-line">
                   <td className="py-1">{p.symbol}</td>
                   <td className={p.side > 0 ? "text-bid" : "text-ask"}>{p.side > 0 ? "long" : "short"}</td>
-                  <td>{p.indication}</td>
+                  <td className={mine ? "text-bid" : "text-warn"}>
+                    {p.system} · {p.connection} · {p.type}
+                    {mine ? "" : " · held"}
+                  </td>
                   <td>{p.entry}</td>
                   <td>{p.mark}</td>
                   <td>{p.sl.toPrecision(6)}</td>
@@ -164,7 +184,7 @@ function PosTable() {
             {!positions.length ? (
               <tr>
                 <td colSpan={8} className="py-2 text-muted">
-                  No owned legs. Live stage opens only cells that clear the live floor and last-N on real bars.
+                  No tracked positions. New legs are stamped {SYSTEM_ID} · {connection} · position.
                 </td>
               </tr>
             ) : null}
@@ -453,26 +473,74 @@ export function PositionsPage() {
 
 export function OrdersPage() {
   const positions = useDesk((s) => s.positions);
+  const orders = useDesk((s) => s.orders);
+  const connection = useDesk((s) => s.connection);
+  const protect = useDesk((s) => s.allow.protect_grid);
   const live = useDesk((s) => s.liveFills);
   const intern = useDesk((s) => s.internFills);
+  const scope = { system: SYSTEM_ID, connection, type: "order" as const };
+  const stats = orderStats(positions, orders, { protect, connection });
+  const owned = orders.filter((o) => owns(o, scope));
+  const held = orders.filter((o) => !owns(o, scope));
   return (
     <div className="flex flex-col gap-4">
-      <Panel title="Working CTSA tags">
-        <ul className="space-y-1 font-mono text-xs">
-          {positions.map((p) => (
-            <li key={p.id}>
-              {p.id} · {p.symbol} · {p.indication} · {p.combo} · qty {p.qty.toPrecision(4)}
-              {p.dca ? ` · dca ${p.dca}` : ""}
-            </li>
-          ))}
-          {!positions.length ? <li className="text-muted">No working tickets.</li> : null}
-        </ul>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <Stat k="In-scope qty" v={stats.qty.toPrecision(4)} />
+        <Stat k="Vs base" v={stats.base > 0 ? `${stats.mul.toFixed(2)}×` : "—"} />
+        <Stat k="Notional" v={money(stats.notional)} />
+        <Stat k="Order mismatches" v={String(stats.mismatches)} tone={stats.mismatches ? "ask" : "bid"} />
+      </div>
+      <Panel title={`Control orders · ${scope.system} · ${scope.connection} · ${scope.type}`}>
+        <p className="mb-3 text-sm text-muted">
+          Each owned position has one reduce-only stop and one reduce-only target. The close side is opposite the position. Quantity tracks the sized leg, capped at 2.5× base, including block, axis, and adds. A stop or target fills at its own price. {owned.length} in scope, {held.length} tracked on another connection and not amended. Protect {protect ? "on" : "off"}.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="w-full font-mono text-xs">
+            <thead className="text-dim">
+              <tr>
+                <th className="py-1 text-left">Order</th>
+                <th className="text-left">Kind</th>
+                <th className="text-left">Close</th>
+                <th className="text-left">Sym</th>
+                <th className="text-left">Qty</th>
+                <th className="text-left">Px</th>
+                <th className="text-left">Scope</th>
+              </tr>
+            </thead>
+            <tbody>
+              {orders.map((o) => {
+                const mine = owns(o, scope);
+                return (
+                  <tr key={o.id} className="border-t border-line">
+                    <td className="py-1">{o.kind === "sl" ? "stop" : "target"}</td>
+                    <td>{o.reduceOnly ? "reduce" : "open"}</td>
+                    <td className={o.side > 0 ? "text-bid" : "text-ask"}>{o.side > 0 ? "buy" : "sell"}</td>
+                    <td>{o.symbol}</td>
+                    <td>{o.qty.toPrecision(4)}</td>
+                    <td>{o.px}</td>
+                    <td className={mine ? "text-bid" : "text-warn"}>
+                      {o.system} · {o.connection}
+                      {mine ? "" : " · held"}
+                    </td>
+                  </tr>
+                );
+              })}
+              {!orders.length ? (
+                <tr>
+                  <td colSpan={7} className="py-2 text-muted">
+                    No working orders.
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
       </Panel>
       <div className="grid gap-4 lg:grid-cols-2">
         <Panel title="Live tape x:">
           <FillList rows={live} />
         </Panel>
-        <Panel title="Intern tape i:">
+        <Panel title="Intern tape i: · not an exchange type">
           <FillList rows={intern} />
         </Panel>
       </div>
@@ -602,38 +670,55 @@ export function ResultsPage() {
 export function StatisticsPage() {
   const books = useDesk((s) => s.books);
   const focus = useDesk((s) => focusBook(s));
+  const rows = useMemo(
+    () =>
+      books.map((b) => {
+        const closed = b.bars.length > 1 ? b.bars.slice(0, -1) : b.bars;
+        const day = closed.slice(-24);
+        const hi = day.reduce((m, bar) => Math.max(m, bar.h), 0);
+        const lo = day.reduce((m, bar) => Math.min(m, bar.l), Number.POSITIVE_INFINITY);
+        const first = day[0]?.o ?? 0;
+        const last = day.at(-1)?.c ?? 0;
+        const ret = first > 0 ? last / first - 1 : 0;
+        const atr = atrSeries(closed).at(-1) ?? 0;
+        return { symbol: b.symbol, last: b.quote.last, change: b.quote.changePct, hi, lo, ret, atr, bars: closed.length, closes: day.map((bar) => bar.c), vol: b.quote.quoteVolume };
+      }),
+    [books],
+  );
   return (
     <Panel title="Exchange statistics">
       <p className="mb-3 text-sm text-muted">
-        Funding {focus?.funding == null ? "—" : `${(focus.funding * 100).toFixed(4)}%`} on {focus?.symbol}. Prints are BingX public quotes, not a model book.
+        Funding {focus?.funding == null ? "—" : `${(focus.funding * 100).toFixed(4)}%`} on {focus?.symbol}. Range, return, and ATR use the last 24 closed BingX hours. The quote change is the exchange 24h print.
       </p>
       <div className="overflow-x-auto">
         <table className="w-full font-mono text-xs">
           <thead className="text-dim">
             <tr>
-              <th className="text-left">Symbol</th>
+              <th className="py-1 text-left">Symbol</th>
               <th className="text-left">Last</th>
-              <th className="text-left">24h</th>
-              <th className="text-left">Range</th>
+              <th className="text-left">24h quote</th>
+              <th className="text-left">24h return</th>
+              <th className="text-left">24h range</th>
+              <th className="text-left">ATR</th>
               <th className="text-left">Quote vol</th>
-              <th className="text-left">Bars</th>
+              <th className="text-left">Path</th>
             </tr>
           </thead>
           <tbody>
-            {books.map((b) => {
-              const last = b.bars.at(-1);
-              const range = last ? last.h - last.l : 0;
-              return (
-                <tr key={b.symbol} className="border-t border-line">
-                  <td className="py-1">{b.symbol}</td>
-                  <td>{b.quote.last}</td>
-                  <td className={b.quote.changePct >= 0 ? "text-bid" : "text-ask"}>{b.quote.changePct.toFixed(2)}%</td>
-                  <td>{range.toPrecision(4)}</td>
-                  <td>{Math.round(b.quote.quoteVolume).toLocaleString()}</td>
-                  <td>{b.bars.length}</td>
-                </tr>
-              );
-            })}
+            {rows.map((b) => (
+              <tr key={b.symbol} className="border-t border-line">
+                <td className="py-1">{b.symbol}</td>
+                <td>{b.last}</td>
+                <td className={b.change >= 0 ? "text-bid" : "text-ask"}>{b.change.toFixed(2)}%</td>
+                <td className={b.ret >= 0 ? "text-bid" : "text-ask"}>{(b.ret * 100).toFixed(2)}%</td>
+                <td>{b.lo === Number.POSITIVE_INFINITY ? "—" : `${((b.hi - b.lo) / (b.last || 1) * 100).toFixed(2)}%`}</td>
+                <td>{b.atr ? b.atr.toPrecision(4) : "—"}</td>
+                <td>{Math.round(b.vol).toLocaleString()}</td>
+                <td>
+                  <Spark values={b.closes} />
+                </td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
@@ -679,10 +764,10 @@ export function EnginePage() {
       </ol>
       <div className="mb-4 flex flex-wrap gap-2">
         <button onClick={flat} className="rounded-md bg-ask px-4 py-3 text-bg">
-          Flatten owned
+          Flatten in scope
         </button>
         <button onClick={losers} className="rounded-md border border-line px-4 py-3">
-          Flatten losers
+          Flatten losers in scope
         </button>
         <button onClick={halt} className="rounded-md border border-line px-4 py-3">
           {phase === "halted" ? "Resume entries" : "Halt entries"}
@@ -702,41 +787,207 @@ export function EnginePage() {
   );
 }
 
+const REPLAY_HOURS = [12, 24, 48] as const;
+const REPLAY_SIZES: ReplaySize[] = ["base", "block", "axis", "both"];
+
 export function ReplayPage() {
+  const books = useDesk((s) => s.books);
+  const floors = useDesk((s) => s.floors);
   const cells = useDesk((s) => s.cells);
-  const focus = useDesk((s) => s.focus);
-  const [ind, setInd] = useState<Indication | "all">("all");
   const roll = useMemo(() => cellRollup(cells), [cells]);
-  const best = useMemo(() => {
-    return cells
-      .filter((c) => c.symbol === focus && (ind === "all" || c.indication === ind))
-      .sort((a, b) => Number(b.validExec && !b.disabled) - Number(a.validExec && !a.disabled) || b.net - a.net || b.pf - a.pf)
-      .slice(0, 24);
-  }, [cells, focus, ind]);
+  const [hours, setHours] = useState<(typeof REPLAY_HOURS)[number]>(24);
+  const [size, setSize] = useState<ReplaySize>("both");
+  const sig = useMemo(() => barSignature(books), [books]);
+  const session = useMemo(
+    () =>
+      simulateSessions(
+        books.map((b) => ({ symbol: b.symbol, bars: b.bars })),
+        BOOK,
+        floors,
+        { hours, size },
+      ),
+    [sig, floors, hours, size],
+  );
   return (
-    <Panel title={`Replay · ${focus}`}>
-      <p className="mb-3 text-sm text-muted">
-        Each relation walks closed 1h bars forward from the last cursor. Same bars do not rescore. This is not a random path.
+    <div className="flex flex-col gap-4">
+      <Panel title="Replay settings">
+        <p className="mb-3 text-sm text-muted">
+          The pre window picks one cell per symbol. The next window replays that book only. Floors are the ones on Settings. Short floor {floors.short}. Changing the range or size reruns the closed-bar simulation. It does not look into the replay window.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {REPLAY_HOURS.map((n) => (
+            <button key={n} onClick={() => setHours(n)} className={`rounded-md border px-3 py-2 font-mono text-sm ${hours === n ? "border-accent bg-surface-2 text-fg" : "border-line text-muted"}`}>
+              {n}h + {n}h
+            </button>
+          ))}
+          {REPLAY_SIZES.map((name) => (
+            <button key={name} onClick={() => setSize(name)} className={`rounded-md border px-3 py-2 font-mono text-sm ${size === name ? "border-accent bg-surface-2 text-fg" : "border-line text-muted"}`}>
+              {name}
+            </button>
+          ))}
+        </div>
+      </Panel>
+      {!session.ready ? (
+        <Panel title="24h session">
+          <p className="text-sm text-muted">{session.note} The replay does not invent bars.</p>
+        </Panel>
+      ) : (
+        <>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Stat k={`Pre ${hours}h`} v={money(session.bookNetPre)} tone={session.bookNetPre >= 0 ? "bid" : "ask"} />
+            <Stat k="Pre green" v={`${session.greenBookPre}/${hours}`} />
+            <Stat k={`Replay ${hours}h`} v={money(session.bookNetLive)} tone={session.bookNetLive >= 0 ? "bid" : "ask"} />
+            <Stat k="Replay green" v={`${session.greenBookLive}/${hours}`} tone={session.greenBookLive === hours ? "bid" : "ask"} />
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Stat k="Pre PF" v={sessionBookPf(session.bookPre).toFixed(2)} />
+            <Stat k="Replay PF" v={sessionBookPf(session.bookLive).toFixed(2)} />
+            <Stat k="Pre drawdown" v={money(sessionDd(session.bookPre))} tone="ask" />
+            <Stat k="Replay drawdown" v={money(sessionDd(session.bookLive))} tone="ask" />
+          </div>
+          <Panel title={`Pre ${hours}h book`}>
+            <HourDiagram rows={session.bookPre} />
+          </Panel>
+          <Panel title={`Replay ${hours}h · frozen book · ${size}`}>
+            <HourDiagram rows={session.bookLive} />
+            <p className="mt-3 text-sm text-muted">{session.note}</p>
+          </Panel>
+          <Panel title="Armed book">
+            <ul className="space-y-1 font-mono text-xs">
+              {session.bookNames.map((name) => (
+                <li key={name}>{name}</li>
+              ))}
+              {!session.bookNames.length ? <li className="text-muted">No cell cleared the pre-window gate at this floor.</li> : null}
+            </ul>
+          </Panel>
+          <div className="grid gap-4 xl:grid-cols-2">
+            <HourLedger title={`Pre ${hours}h · calculation`} rows={session.bookPre} />
+            <HourLedger title={`Replay ${hours}h · frozen book`} rows={session.bookLive} />
+          </div>
+          <Panel title="Full grid · not a portfolio">
+            <p className="text-sm text-muted">
+              Every short-GRID cell is scored. Summing them counts the same hour many times, so this is the calculation, not the book. Pre net {money(session.preNet)} across {session.samplesPre} closes. Replay promotions {money(session.promotedNet)} on {session.proven} cells, {session.samplesPromoted} closes. Intern samples now {roll.samples}.
+            </p>
+          </Panel>
+        </>
+      )}
+    </div>
+  );
+}
+
+function sessionBookPf(rows: HourPoint[]) {
+  let gw = 0;
+  let gl = 0;
+  for (const r of rows) {
+    if (r.net > 0) gw += r.net;
+    else if (r.net < 0) gl -= r.net;
+  }
+  if (gl < 1e-12) return gw > 1e-12 ? 4 : 0;
+  return gw / gl;
+}
+
+function sessionDd(rows: HourPoint[]) {
+  let y = 0;
+  let peak = 0;
+  let dd = 0;
+  for (const r of rows) {
+    y += r.net;
+    peak = Math.max(peak, y);
+    dd = Math.max(dd, peak - y);
+  }
+  return dd;
+}
+
+function HourDiagram({ rows }: { rows: HourPoint[] }) {
+  if (rows.length < 2) return <p className="text-sm text-muted">Not enough hours to draw.</p>;
+  const w = 640;
+  const h = 168;
+  const pad = 16;
+  const max = Math.max(...rows.map((r) => Math.abs(r.net)), 1e-9);
+  const gap = 3;
+  const bw = (w - pad * 2 - gap * (rows.length - 1)) / rows.length;
+  let y = 0;
+  const eq = rows.map((r) => (y += r.net));
+  const elo = Math.min(...eq, 0);
+  const ehi = Math.max(...eq, 0);
+  const espan = ehi - elo || 1;
+  const ey = (v: number) => pad + (1 - (v - elo) / espan) * (h - pad * 2);
+  const line = eq
+    .map((v, i) => {
+      const x = pad + i * (bw + gap) + bw / 2;
+      return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${ey(v).toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="h-44 w-full">
+      <line x1={pad} x2={w - pad} y1={h / 2} y2={h / 2} className="stroke-line" strokeWidth="1" />
+      {rows.map((r, i) => {
+        const x = pad + i * (bw + gap);
+        const mag = (Math.abs(r.net) / max) * ((h - pad * 2) / 2);
+        const top = r.net >= 0 ? h / 2 - mag : h / 2;
+        return <rect key={r.t} x={x} y={top} width={Math.max(1, bw)} height={Math.max(1, mag)} className={r.net >= 0 ? "fill-bid" : "fill-ask"} opacity="0.85" />;
+      })}
+      <path d={line} fill="none" className="stroke-accent" strokeWidth="1.6" />
+      <text x={pad} y={12} className="fill-muted" fontSize="10">
+        {new Date(rows[0]!.t).toISOString().slice(5, 16).replace("T", " ")} UTC
+      </text>
+      <text x={w - pad} y={12} textAnchor="end" className="fill-muted" fontSize="10">
+        {new Date(rows.at(-1)!.t).toISOString().slice(5, 16).replace("T", " ")} · equity {money(eq.at(-1) ?? 0)}
+      </text>
+    </svg>
+  );
+}
+
+function Spark({ values }: { values: number[] }) {
+  if (values.length < 2) return <span className="text-dim">—</span>;
+  const lo = Math.min(...values);
+  const hi = Math.max(...values);
+  const span = hi - lo || 1;
+  const d = values
+    .map((v, i) => {
+      const x = (i / (values.length - 1)) * 80;
+      const y = 22 - ((v - lo) / span) * 18;
+      return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  const up = values.at(-1)! >= values[0]!;
+  return (
+    <svg viewBox="0 0 80 24" className="h-6 w-20">
+      <path d={d} fill="none" className={up ? "stroke-bid" : "stroke-ask"} strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function HourLedger({ title, rows }: { title: string; rows: HourPoint[] }) {
+  const net = rows.reduce((a, r) => a + r.net, 0);
+  const green = rows.filter((r) => r.net > 0).length;
+  return (
+    <Panel title={title}>
+      <p className="mb-3 font-mono text-sm">
+        {money(net)} · {green}/{rows.length} hours green
       </p>
-      <div className="mb-3 flex flex-wrap gap-2">
-        <button onClick={() => setInd("all")} className={`rounded-md border px-3 py-2 text-sm ${ind === "all" ? "border-accent" : "border-line"}`}>
-          all
-        </button>
-        {INDICATIONS.map((name) => (
-          <button key={name} onClick={() => setInd(name)} className={`rounded-md border px-3 py-2 text-sm ${ind === name ? "border-accent" : "border-line"}`}>
-            {name}
-          </button>
-        ))}
+      <div className="overflow-x-auto">
+        <table className="w-full font-mono text-xs">
+          <thead className="text-dim">
+            <tr>
+              <th className="py-1 text-left">Hour UTC</th>
+              <th className="text-left">Result</th>
+              <th className="text-left">Net</th>
+              <th className="text-left">Closes</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.t} className="border-t border-line">
+                <td className="py-1">{new Date(r.t).toISOString().replace("T", " ").slice(0, 16)}</td>
+                <td className={r.net > 0 ? "text-bid" : r.net < 0 ? "text-ask" : ""}>{r.net > 0 ? "green" : r.net < 0 ? "red" : "flat"}</td>
+                <td className={r.net > 0 ? "text-bid" : r.net < 0 ? "text-ask" : ""}>{money(r.net)}</td>
+                <td>{r.trades}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
-      <Stat k="Intern samples" v={String(roll.samples)} />
-      <ul className="mt-3 space-y-1 font-mono text-xs">
-        {best.map((c) => (
-          <li key={c.id}>
-            {c.indication} {c.id.split("|").at(-1)} pf {c.pf.toFixed(2)} n {c.n} net {money(c.net)} {c.validExec && !c.disabled ? "valid" : c.disabled ? "disabled" : ""}
-          </li>
-        ))}
-        {!best.length ? <li className="text-muted">No rows for this book yet.</li> : null}
-      </ul>
     </Panel>
   );
 }
@@ -749,21 +1000,40 @@ export function SystemPage() {
   const cells = useDesk((s) => s.cells);
   const books = useDesk((s) => s.books);
   const last = useDesk((s) => s.lastTs);
+  const coord = useDesk((s) => s.coord);
+  const connection = useDesk((s) => s.connection);
+  const health = useDesk((s) => s.health);
   return (
-    <Panel title="System">
-      <p className="font-mono text-sm">
-        status {status} · ticks {ticks} · relations {cells.length} · books {books.length}
-      </p>
-      <p className="mt-2 font-mono text-xs text-dim">last quote {last ? new Date(last).toLocaleTimeString() : "—"}</p>
-      {error ? <p className="mt-2 text-ask">{error}</p> : <p className="mt-2 text-sm text-muted">Quotes are fetched from BingX and cached on the server. No local stand-in tape.</p>}
-      <ul className="mt-3 max-h-64 space-y-1 overflow-auto font-mono text-xs text-muted">
-        {events.map((e, i) => (
-          <li key={`${e.t}-${i}`}>
-            {new Date(e.t).toLocaleTimeString()} · {e.kind} · {e.msg}
-          </li>
-        ))}
-      </ul>
-    </Panel>
+    <div className="flex flex-col gap-4">
+      <Panel title="System">
+        <p className="font-mono text-sm">
+          {SYSTEM_ID} · {connection} · {canAffect(connection) ? "paper route" : "observe only"} · status {status} · ticks {ticks} · relations {cells.length} · books {books.length}
+        </p>
+        <p className="mt-2 font-mono text-xs text-dim">
+          cycles {health.cycles} · ok {health.ok} · healed {health.healed}
+          {health.lastNote ? ` · ${health.lastNote}` : ""}
+        </p>
+        <p className="mt-2 font-mono text-xs text-dim">last quote {last ? new Date(last).toLocaleTimeString() : "—"}</p>
+        {error ? <p className="mt-2 text-ask">{error}</p> : <p className="mt-2 text-sm text-muted">A failed pull keeps the last good tape and retries. A bad book is repaired or dropped. Hour results stay the real book.</p>}
+        <ul className="mt-3 max-h-64 space-y-1 overflow-auto font-mono text-xs text-muted">
+          {events.map((e, i) => (
+            <li key={`${e.t}-${i}`}>
+              {new Date(e.t).toLocaleTimeString()} · {e.kind} · {e.msg}
+            </li>
+          ))}
+        </ul>
+      </Panel>
+      <Panel title="Coordination ledger">
+        <ul className="max-h-72 space-y-1 overflow-auto font-mono text-xs">
+          {coord.map((hit, i) => (
+            <li key={`${hit.t}-${i}`}>
+              {new Date(hit.t).toLocaleTimeString()} · {hit.action} · {hit.system}/{hit.connection}/{hit.type} · kept {hit.kept} · skipped {hit.skipped} · {hit.note}
+            </li>
+          ))}
+          {!coord.length ? <li className="text-muted">No coordination decisions yet.</li> : null}
+        </ul>
+      </Panel>
+    </div>
   );
 }
 
@@ -776,7 +1046,7 @@ export function SettingsPage() {
   return (
     <Panel title="CTS-A floors">
       <p className="mb-3 text-sm text-muted">
-        Short PF gates the GRID. Overall is the desk reference floor. Edits re-gate relations already scored. {allow ? "change_floors is allowed." : "change_floors is denied."}
+        Short PF gates the GRID. Overall is the desk reference floor. Edits re-gate relations already scored and rerun the stored 24h book. {allow ? "change_floors is allowed." : "change_floors is denied."}
       </p>
       <div className="grid gap-3 sm:grid-cols-2">
         {FLOOR_KEYS.map((k) => (
@@ -809,27 +1079,35 @@ export function ConnectionsPage() {
   const allow = useDesk((s) => s.allow.connect_exchange);
   const books = useDesk((s) => s.books);
   const last = useDesk((s) => s.lastTs);
+  const connection = useDesk((s) => s.connection);
+  const setConnection = useDesk((s) => s.setConnection);
+  const positions = useDesk((s) => s.positions);
+  const orders = useDesk((s) => s.orders);
   const age = last ? Math.max(0, Math.round((Date.now() - last) / 1000)) : null;
   return (
     <Panel title="Connections">
+      <p className="mb-3 text-sm text-muted">
+        Active scope is {SYSTEM_ID} · {connection} · position and order. Flatten, trail, adds, and new tickets affect that triple only. Intern scoring is not an exchange type. Feed {allow ? "allowed" : "denied"}. {books.length} books · {age == null ? "no print yet" : `${age}s since last pull`}.
+      </p>
       <div className="grid gap-3 sm:grid-cols-3">
-        <div className="rounded-md border border-line p-3">
-          <div className="font-mono">bingx-public</div>
-          <div className={status === "live" ? "text-bid" : "text-warn"}>{status === "live" ? "quotes live" : status}</div>
-          <p className="text-sm text-muted">
-            {books.length} books · {age == null ? "no print yet" : `${age}s since last pull`}. Tag CTSAV2_ on paper legs. Feed {allow ? "allowed" : "denied"} still reads public quotes.
-          </p>
-        </div>
-        <div className="rounded-md border border-line p-3">
-          <div className="font-mono">bingx-vst-02</div>
-          <div className="text-muted">no credentials</div>
-          <p className="text-sm text-muted">Paper stage does not call the order API.</p>
-        </div>
-        <div className="rounded-md border border-line p-3">
-          <div className="font-mono">bingx-x01</div>
-          <div className="text-muted">locked</div>
-          <p className="text-sm text-muted">Mainnet stays off. Allowing connect_exchange does not place real orders.</p>
-        </div>
+        {CONNECTIONS.map((c) => {
+          const on = connection === c.id;
+          const pos = positions.filter((p) => p.connection === c.id && p.system === SYSTEM_ID && p.type === "position").length;
+          const ords = orders.filter((o) => o.connection === c.id && o.system === SYSTEM_ID && o.type === "order").length;
+          return (
+            <button
+              key={c.id}
+              onClick={() => setConnection(c.id)}
+              className={`rounded-md border p-3 text-left ${on ? "border-accent bg-surface-2" : "border-line"}`}
+            >
+              <div className="font-mono">{c.id}</div>
+              <div className={c.route === "paper" ? "text-bid" : "text-muted"}>{c.route === "paper" ? (status === "live" ? "paper route · quotes live" : "paper route") : "no order route"}</div>
+              <p className="text-sm text-muted">
+                {c.label}. {pos} positions · {ords} orders. {c.route === "paper" ? "In-scope actions are applied here." : "Observed only. Nothing on this connection is amended."}
+              </p>
+            </button>
+          );
+        })}
       </div>
     </Panel>
   );

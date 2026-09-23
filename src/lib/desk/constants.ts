@@ -56,12 +56,12 @@ export const ACTION_COPY: Record<ActionId, string> = {
   axis_volume: "Size Axis 3.0× partials, depth 2, same 2.5× cap",
   protect_grid: "Keep one SL and one TP on each owned leg",
   trail_1_5: "Trail the stop 1.5% from peak",
-  flatten_own: "Flatten every owned CTSA leg",
-  flatten_losers: "Flatten owned legs that are underwater",
+  flatten_own: "Flatten positions whose system, connection, and type match the active scope",
+  flatten_losers: "Flatten in-scope positions that are underwater",
   change_floors: "Edit PF floors used by the gate",
   enable_dca: "Allow one extra clip when a leg is adverse (playbook still gates it)",
   enable_normal_live: "Let the unadjusted direction lane print live",
-  connect_exchange: "Arm the public BingX quote feed. Signed orders stay off — no keys",
+  connect_exchange: "Select the exchange connection. Only the active system, connection, and type are affected",
 };
 
 export const PREFERRED_SYMBOLS = [

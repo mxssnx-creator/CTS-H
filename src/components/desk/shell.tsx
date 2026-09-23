@@ -2,6 +2,7 @@ import { Link, useRouterState } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { DeskFeed } from "./feed";
 import { BOOK } from "@/lib/desk/constants";
+import { SYSTEM_ID } from "@/lib/desk/coord";
 import { greenHour } from "@/lib/desk/process";
 import { focusBook, liveHeadline, useDesk, useNet } from "@/lib/desk/store";
 
@@ -36,6 +37,7 @@ export function DeskShell({ children }: { children: ReactNode }) {
   const phase = useDesk((s) => s.phase);
   const net = useNet();
   const books = useDesk((s) => s.books);
+  const connection = useDesk((s) => s.connection);
   const liveFills = useDesk((s) => s.liveFills);
   const lastTs = useDesk((s) => s.lastTs);
   const peak = useDesk((s) => s.peak);
@@ -52,8 +54,10 @@ export function DeskShell({ children }: { children: ReactNode }) {
         <div className="font-mono text-sm tracking-widest">
           HELIX <span className="text-accent">× CTS-A</span>
         </div>
-        <span className="rounded-full border border-line px-2 py-1 font-mono text-xs text-warn">
-          {status === "live" ? "LIVE TAPE · BINGX" : status === "error" ? "FEED ERROR" : "CONNECTING"}
+        <span
+          className={`rounded-full border border-line px-2 py-1 font-mono text-xs ${status === "live" ? "text-bid" : status === "degraded" ? "text-warn" : "text-warn"}`}
+        >
+          {status === "live" ? "LIVE TAPE · BINGX" : status === "degraded" ? "RECOVERING" : status === "error" ? "FEED ERROR" : "CONNECTING"}
         </span>
         <div className="font-mono text-xs text-muted">
           <div className="text-dim">System net</div>
@@ -72,8 +76,11 @@ export function DeskShell({ children }: { children: ReactNode }) {
           <div>{dd.toFixed(2)}%</div>
         </div>
         <div className="font-mono text-xs text-muted">
-          <div className="text-dim">Phase</div>
-          <div>{phase}</div>
+          <div className="text-dim">Scope</div>
+          <div>
+            {SYSTEM_ID} · {connection}
+          </div>
+          <div className="text-dim">{phase}</div>
         </div>
         <div className="font-mono text-xs text-muted">
           <div className="text-dim">Headline</div>

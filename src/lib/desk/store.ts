@@ -1,5 +1,6 @@
 import { create } from "zustand";
-import { ACTIONS, BOOK, DEFAULT_FLOORS, TAG, type ActionId, type Floors } from "./constants";
+import { ACTIONS, BOOK, DEFAULT_FLOORS, LIVE_SHORT, MAX_LIVE_LEGS, TAG, type ActionId, type Floors } from "./constants";
+import { SYSTEM_ID, canAffect, controlOrders, coordHit, orderScope, partition, positionScope, type ConnectionId, type CoordHit, type WorkingOrder } from "./coord";
 import {
   atrSeries,
   barSignature,
@@ -10,17 +11,20 @@ import {
   headline,
   indicationBoard,
   markPositions,
+  mergeFills,
   openFromPerforming,
   rsiLast,
+  simulateSessions,
   syncBooks,
   systemNet,
   type Bar,
   type Cell,
   type LivePos,
+  type SessionReport,
   type TapeFill,
 } from "./process";
+import { EMPTY_HEALTH, healBooks, noteHealth, type Health } from "./heal";
 import { closePnl, comboId, positionNotional } from "./math";
-import { LIVE_SHORT } from "./constants";
 
 export type DeskEvent = { t: number; kind: string; msg: string };
 
@@ -46,13 +50,16 @@ export type SnapBook = {
 type Toggles = { normal: boolean; trailing: boolean; axis: boolean; block: boolean; dca: boolean; hedge: boolean };
 
 type DeskState = {
-  status: "loading" | "live" | "error";
+  status: "loading" | "live" | "degraded" | "error";
   error: string;
   focus: string;
   focusCombo: string;
   books: SnapBook[];
   cells: Cell[];
   positions: LivePos[];
+  orders: WorkingOrder[];
+  coord: CoordHit[];
+  connection: ConnectionId;
   internFills: TapeFill[];
   liveFills: TapeFill[];
   closedNet: number;
@@ -65,12 +72,16 @@ type DeskState = {
   peak: number;
   hour: number;
   barSig: string;
+  session: SessionReport | null;
+  health: Health;
   phase: "intern-pre" | "performing" | "halted";
   hydrated: boolean;
-  ingest: (books: SnapBook[], ts: number) => void;
+  ingest: (books: SnapBook[], ts: number, flags?: { stale?: boolean; note?: string }) => void;
   fail: (msg: string) => void;
+  degrade: (msg: string) => void;
   setFocus: (symbol: string) => void;
   setFocusCombo: (id: string) => void;
+  setConnection: (id: ConnectionId) => void;
   toggleAllow: (id: ActionId) => void;
   toggleStrat: (k: keyof Toggles) => void;
   setFloor: (k: keyof Floors, value: number) => void;
@@ -112,6 +123,9 @@ export const useDesk = create<DeskState>((set, get) => ({
   books: [],
   cells: [],
   positions: [],
+  orders: [],
+  coord: [],
+  connection: "bingx-public",
   internFills: [],
   liveFills: [],
   closedNet: 0,
@@ -124,11 +138,32 @@ export const useDesk = create<DeskState>((set, get) => ({
   peak: BOOK,
   hour: 0,
   barSig: "",
+  session: null,
+  health: EMPTY_HEALTH,
   phase: "intern-pre",
   hydrated: false,
   fail: (msg) => set({ status: "error", error: msg, events: log(get().events, "alert", msg) }),
+  degrade: (msg) =>
+    set((s) => ({
+      status: s.books.length ? "degraded" : "error",
+      error: msg,
+      health: noteHealth(s.health, [msg]),
+      events: log(s.events, "heal", msg),
+    })),
   setFocus: (symbol) => set({ focus: symbol }),
   setFocusCombo: (id) => set({ focusCombo: id }),
+  setConnection: (id) =>
+    set((s) => {
+      const scope = positionScope(id);
+      const hit = coordHit("connect", scope, canAffect(id) ? 1 : 0, canAffect(id) ? 0 : 1, canAffect(id) ? "paper route" : "no order route");
+      const next = { ...s, connection: id };
+      return {
+        connection: id,
+        orders: syncOrders(next, s.positions),
+        coord: [hit, ...s.coord].slice(0, 40),
+        events: log(s.events, "coord", `${scope.system} · ${id} · ${canAffect(id) ? "affect on" : "observe only"}`),
+      };
+    }),
   hydrate: () => {
     if (get().hydrated) return;
     const saved = readSession();
@@ -140,10 +175,14 @@ export const useDesk = create<DeskState>((set, get) => ({
     });
   },
   toggleAllow: (id) =>
-    set((s) => ({
-      allow: { ...s.allow, [id]: !s.allow[id] },
-      events: log(s.events, s.allow[id] ? "deny" : "allow", `${s.allow[id] ? "DENY" : "ALLOW"} ${id}`),
-    })),
+    set((s) => {
+      const allow = { ...s.allow, [id]: !s.allow[id] };
+      return {
+        allow,
+        orders: syncOrders({ ...s, allow }, s.positions),
+        events: log(s.events, s.allow[id] ? "deny" : "allow", `${s.allow[id] ? "DENY" : "ALLOW"} ${id}`),
+      };
+    }),
   toggleStrat: (k) =>
     set((s) => {
       const toggles = { ...s.toggles, [k]: !s.toggles[k] };
@@ -156,9 +195,17 @@ export const useDesk = create<DeskState>((set, get) => ({
       if (!Number.isFinite(value) || value <= 0 || value > 10) return s;
       const floors = { ...s.floors, [k]: value };
       writeSession(s.toggles, floors);
+      const session = s.books.length
+        ? simulateSessions(
+            s.books.map((b) => ({ symbol: b.symbol, bars: b.bars })),
+            BOOK,
+            floors,
+          )
+        : s.session;
       return {
         floors,
         cells: s.cells.length ? applyFloors(s.cells, floors) : s.cells,
+        session,
         events: log(s.events, "allow", `floor ${k} ${value}`),
       };
     }),
@@ -167,26 +214,35 @@ export const useDesk = create<DeskState>((set, get) => ({
       phase: s.phase === "halted" ? "performing" : "halted",
       events: log(s.events, "halt", s.phase === "halted" ? "entries resumed" : "entries halted"),
     })),
-  rewalk: () => set((s) => ({ cells: [], barSig: "", events: log(s.events, "bar", "rewalk armed — next closed bars rescore") })),
+  rewalk: () => set((s) => ({ cells: [], internFills: [], barSig: "", events: log(s.events, "bar", "rewalk armed — next closed bars rescore") })),
   flattenOwned: () =>
     set((s) => {
       if (!s.allow.flatten_own) return { events: log(s.events, "deny", "flatten_own denied") };
-      return closeSome(s, s.positions, "flat");
+      return affectPositions(s, s.positions, "flatten_own");
     }),
   flattenLosers: () =>
     set((s) => {
       if (!s.allow.flatten_losers) return { events: log(s.events, "deny", "flatten_losers denied") };
       const losers = s.positions.filter((p) => closePnl(p.side, p.entry, p.mark, p.qty) < 0);
-      return closeSome(s, losers, "loser");
+      return affectPositions(s, losers, "flatten_losers");
     }),
   manual: (side) =>
     set((s) => {
       if (!s.allow.live_paper_execute) return { events: log(s.events, "deny", "live_paper_execute denied") };
       if (s.phase === "halted") return { events: log(s.events, "deny", "entries halted") };
+      const scope = positionScope(s.connection);
+      if (!canAffect(s.connection)) {
+        const hit = coordHit("manual", scope, 0, 1, "connection has no order route");
+        return { coord: [hit, ...s.coord].slice(0, 40), events: log(s.events, "coord", `manual blocked · ${s.connection}`) };
+      }
       const book = s.books.find((b) => b.symbol === s.focus) ?? s.books[0];
       if (!book) return { events: log(s.events, "alert", "no book to arm") };
+      if (s.positions.length >= MAX_LIVE_LEGS) return { events: log(s.events, "alert", `live cap ${MAX_LIVE_LEGS}`) };
       const px = book.quote.last || book.bars.at(-1)?.c || 0;
       if (!(px > 0)) return s;
+      if (s.positions.some((p) => p.connection === s.connection && p.symbol === book.symbol && p.indication === "manual" && p.side === side)) {
+        return { events: log(s.events, "alert", "manual leg already open on this symbol") };
+      }
       const atr = atrSeries(book.bars).at(-1) ?? px * 0.001;
       const a = Math.max(atr, px * 0.0008);
       const base = positionNotional(BOOK);
@@ -209,18 +265,30 @@ export const useDesk = create<DeskState>((set, get) => ({
         hold: 0,
         dca: 0,
         openedAt: Date.now(),
+        system: SYSTEM_ID,
+        connection: s.connection,
+        type: "position",
       };
+      const positions = [...s.positions, pos];
+      const hit = coordHit("manual", scope, 1, 0, `${book.symbol} stamped`);
       return {
-        positions: [...s.positions, pos].slice(-24),
-        events: log(s.events, "open", `manual ${side > 0 ? "long" : "short"} ${book.symbol} @ ${px}`),
+        positions,
+        orders: syncOrders(s, positions),
+        coord: [hit, ...s.coord].slice(0, 40),
+        events: log(s.events, "open", `manual ${side > 0 ? "long" : "short"} ${book.symbol} @ ${px} · ${scope.system}/${scope.connection}`),
       };
     }),
-  ingest: (books, ts) => {
+  ingest: (books, ts, flags) => {
     const s = get();
-    if (!books.length) {
-      set({ status: "error", error: "BingX returned no books", events: log(s.events, "alert", "BingX returned no books") });
+    try {
+    const healed = healBooks(s.books, books);
+    const notes = [...healed.notes];
+    if (flags?.note) notes.push(flags.note);
+    if (!healed.books.length) {
+      get().degrade(flags?.note || "no usable books");
       return;
     }
+    books = healed.books;
     const prices: Record<string, number> = {};
     const marks: Record<string, { price: number; atr: number }> = {};
     for (const b of books) {
@@ -233,6 +301,8 @@ export const useDesk = create<DeskState>((set, get) => ({
     let cells = s.cells;
     let internFills = s.internFills;
     let events = s.events;
+    if (notes.length) events = log(events, "heal", notes.join(", "));
+    let session = s.session;
     let phase: DeskState["phase"] = s.phase === "halted" ? "halted" : "intern-pre";
     if (sig !== s.barSig) {
       if (s.allow.intern_arm && s.allow.intern_all_pre) {
@@ -243,8 +313,20 @@ export const useDesk = create<DeskState>((set, get) => ({
           s.floors,
         );
         cells = replay.cells;
-        if (replay.internFills.length) internFills = replay.internFills;
+        if (replay.internFills.length) internFills = mergeFills(internFills, replay.internFills);
+        session = simulateSessions(
+          books.map((b) => ({ symbol: b.symbol, bars: b.bars })),
+          BOOK,
+          s.floors,
+        );
         events = log(events, "bar", `closed bars ${replay.symbols} books · ${replay.closes} new intern closes`);
+        if (session.ready) {
+          events = log(
+            events,
+            "hour",
+            `pre ${session.greenBookPre}/24 ${session.bookNetPre.toFixed(2)} · live ${session.greenBookLive}/24 ${session.bookNetLive.toFixed(2)}`,
+          );
+        }
         if (s.allow.promote_real && phase !== "halted") {
           phase = "performing";
           events = log(events, "promote", `${replay.valid} performing relations`);
@@ -255,32 +337,64 @@ export const useDesk = create<DeskState>((set, get) => ({
     }
     if (phase !== "halted" && s.allow.promote_real && cells.length) phase = "performing";
     let positions = s.positions;
+    let coord = s.coord;
+    const scope = positionScope(s.connection);
     if (phase !== "halted" && s.allow.live_paper_execute && s.allow.promote_real && cells.length) {
-      const fresh = openFromPerforming(cells, marks, BOOK, {
-        block: s.allow.block_volume && s.toggles.block,
-        axis: s.allow.axis_volume && s.toggles.axis,
-        normalLive: s.allow.enable_normal_live && s.toggles.normal,
-        hedge: s.toggles.hedge,
-      });
-      const have = new Set(positions.map((p) => `${p.symbol}|${p.indication}`));
-      const room = Math.max(0, 12 - positions.length);
-      const add = fresh.filter((p) => !have.has(`${p.symbol}|${p.indication}`)).slice(0, room);
-      if (add.length) {
-        positions = [...positions, ...add];
-        events = log(events, "open", `live tape +${add.length} CTSA legs`);
-        if (s.allow.protect_grid) events = log(events, "protect", "SL+TP armed on new legs");
+      if (!canAffect(s.connection)) {
+        const hit = coordHit("open", scope, 0, 1, "connection has no order route");
+        if (s.coord[0]?.note !== hit.note || s.coord[0]?.connection !== hit.connection) {
+          coord = [hit, ...coord].slice(0, 40);
+          events = log(events, "coord", `open blocked · ${s.connection}`);
+        }
+      } else {
+        const fresh = openFromPerforming(
+          cells,
+          marks,
+          BOOK,
+          {
+            block: s.allow.block_volume && s.toggles.block,
+            axis: s.allow.axis_volume && s.toggles.axis,
+            normalLive: s.allow.enable_normal_live && s.toggles.normal,
+            hedge: s.toggles.hedge,
+          },
+          { system: SYSTEM_ID, connection: s.connection },
+        );
+        const have = new Set(positions.map((p) => `${p.connection}|${p.symbol}|${p.indication}`));
+        const room = Math.max(0, MAX_LIVE_LEGS - positions.length);
+        const add = fresh.filter((p) => !have.has(`${p.connection}|${p.symbol}|${p.indication}`)).slice(0, room);
+        if (add.length) {
+          positions = [...positions, ...add];
+          coord = [coordHit("open", scope, add.length, 0, "positions stamped to the active scope"), ...coord].slice(0, 40);
+          events = log(events, "open", `live tape +${add.length} ${scope.system}/${scope.connection}`);
+          if (s.allow.protect_grid) events = log(events, "protect", "SL+TP armed on owned legs");
+        }
       }
     }
     let closedNet = s.closedNet;
     let liveFills = s.liveFills;
-    if (positions.length && s.allow.live_paper_execute) {
-      const marked = markPositions(positions, prices, {
+    let asOf = 0;
+    for (const b of books) {
+      const closed = b.bars.length > 1 ? b.bars[b.bars.length - 2]!.t : 0;
+      if (closed > asOf) asOf = closed;
+    }
+    const split = partition(positions, scope);
+    if (split.owned.length && canAffect(s.connection)) {
+      const marked = markPositions(split.owned, prices, {
         trail: s.allow.trail_1_5 && s.toggles.trailing,
         dca: s.allow.enable_dca && s.toggles.dca,
         equity: BOOK,
+        asOf,
       });
-      positions = marked.open;
-      for (const d of marked.dca) events = log(events, "dca", `${d.symbol} add ${d.dca} @ ${d.mark}`);
+      const held = split.skipped.map((p) => ({ ...p, mark: prices[p.symbol] || p.mark }));
+      positions = [...marked.open, ...held];
+      if (marked.closed.length || marked.dca.length) {
+        coord = [coordHit("mark", scope, marked.closed.length + marked.dca.length, split.skipped.length, "closes and adds stay inside the scope"), ...coord].slice(0, 40);
+      }
+      const closedIds = new Set(marked.closed.map((c) => c.pos.id));
+      for (const d of marked.dca) {
+        if (closedIds.has(d.id)) continue;
+        events = log(events, "dca", `${d.symbol} add ${d.dca} @ ${d.mark}`);
+      }
       for (const c of marked.closed) {
         closedNet += c.pnl;
         liveFills = [
@@ -302,6 +416,12 @@ export const useDesk = create<DeskState>((set, get) => ({
     } else if (positions.length) {
       positions = positions.map((p) => ({ ...p, mark: prices[p.symbol] || p.mark }));
     }
+    const orders = syncOrders(s, positions);
+    const orderKey = (rows: WorkingOrder[]) => rows.map((o) => `${o.id}:${o.px}:${o.qty}`).join("|");
+    if (orderKey(orders) !== orderKey(s.orders)) {
+      const tracked = partition(orders, orderScope(s.connection));
+      coord = [coordHit("protect", orderScope(s.connection), tracked.owned.length, tracked.skipped.length, "SL/TP follow owned positions only"), ...coord].slice(0, 40);
+    }
     const hour = Math.floor(ts / 3_600_000);
     if (hour !== s.hour && s.hour !== 0) {
       const g = greenHour(liveFills, ts);
@@ -309,15 +429,19 @@ export const useDesk = create<DeskState>((set, get) => ({
     }
     const equity = BOOK + systemNet(closedNet, positions);
     set({
-      status: "live",
-      error: "",
+      status: flags?.stale ? "degraded" : "live",
+      error: flags?.stale ? flags.note || "last good tape" : "",
       books,
       cells,
       positions,
+      orders,
+      coord,
       internFills,
       liveFills,
       closedNet,
       events,
+      session,
+      health: noteHealth(s.health, flags?.stale ? [...notes, "stale tape"] : notes),
       phase,
       ticks: s.ticks + 1,
       lastTs: ts,
@@ -325,11 +449,25 @@ export const useDesk = create<DeskState>((set, get) => ({
       hour: s.hour === 0 ? hour : hour,
       barSig: sig,
     });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "engine fault";
+      const cur = get();
+      set({
+        status: cur.books.length ? "degraded" : "error",
+        error: msg,
+        health: noteHealth(cur.health, [`kept last books · ${msg}`]),
+        events: log(cur.events, "heal", `kept last books · ${msg}`),
+      });
+    }
   },
 }));
 
+function syncOrders(s: Pick<DeskState, "allow" | "connection">, positions: LivePos[]): WorkingOrder[] {
+  return controlOrders(positions, { protect: s.allow.protect_grid, connection: s.connection });
+}
+
 function closeSome(s: DeskState, rows: LivePos[], reason: string): Partial<DeskState> {
-  if (!rows.length) return { events: log(s.events, "flat", `no legs to ${reason}`) };
+  if (!rows.length) return { events: log(s.events, "flat", "nothing in scope to close") };
   const drop = new Set(rows.map((p) => p.id));
   let closed = s.closedNet;
   let live = s.liveFills;
@@ -351,11 +489,32 @@ function closeSome(s: DeskState, rows: LivePos[], reason: string): Partial<DeskS
       ...live,
     ];
   }
+  const positions = s.positions.filter((p) => !drop.has(p.id));
   return {
-    positions: s.positions.filter((p) => !drop.has(p.id)),
+    positions,
+    orders: syncOrders(s, positions),
     closedNet: closed,
     liveFills: live.slice(0, 200),
-    events: log(s.events, "flat", `${reason} ${rows.length} owned`),
+    events: log(s.events, "flat", `${reason} ${rows.length} in scope`),
+  };
+}
+
+function affectPositions(s: DeskState, rows: LivePos[], action: string): Partial<DeskState> {
+  const scope = positionScope(s.connection);
+  const { owned, skipped } = partition(rows, scope);
+  if (!canAffect(s.connection)) {
+    const hit = coordHit(action, scope, 0, rows.length, "connection has no order route");
+    return {
+      coord: [hit, ...s.coord].slice(0, 40),
+      events: log(s.events, "coord", `${action} blocked · ${s.connection} · skipped ${rows.length}`),
+    };
+  }
+  const hit = coordHit(action, scope, owned.length, skipped.length, skipped.length ? "other system, connection, or type left untouched" : "scope match");
+  const closed = closeSome(s, owned, action);
+  return {
+    ...closed,
+    coord: [hit, ...s.coord].slice(0, 40),
+    events: log(closed.events ?? s.events, "coord", `${action} kept ${owned.length} skipped ${skipped.length}`),
   };
 }
 
