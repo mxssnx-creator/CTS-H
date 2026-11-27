@@ -106,7 +106,10 @@ test("quote storm keeps size, stops, and control orders aligned", () => {
     for (const c of marked.closed) {
       assert.ok(Number.isFinite(c.pnl));
       assert.ok(c.px > 0);
-      if (c.reason === "sl") assert.equal(c.px, c.pos.sl);
+      if (c.reason === "sl") {
+        assert.equal(c.px, drift);
+        assert.ok(c.pos.side > 0 ? c.px <= c.pos.sl : c.px >= c.pos.sl);
+      }
       if (c.reason === "tp") assert.equal(c.px, c.pos.tp);
     }
     const orders = controlOrders(marked.open, { protect: true, connection: "bingx-public" });
@@ -127,10 +130,10 @@ test("quote storm keeps size, stops, and control orders aligned", () => {
   assert.ok(closed > 0);
 });
 
-test("a drop through the trail fills the stop instead of chasing price", () => {
+test("a drop through the trail fills at the observed quote", () => {
   const marked = markPositions([leg(100)], { "BTC-USDT": 97 }, { trail: true, dca: false, equity: 10_000, asOf: 0 });
   assert.equal(marked.closed[0]?.reason, "sl");
-  assert.ok(Math.abs((marked.closed[0]?.px ?? 0) - 98.5) < 1e-9);
+  assert.equal(marked.closed[0]?.px, 97);
 });
 
 test("replay of ten books stays finite on every range", () => {

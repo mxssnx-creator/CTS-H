@@ -15,6 +15,16 @@ export const DEFAULT_TRAILS: TrailSettings = {
   trailActivation: 0.55,
   trailDistance: 0.45,
 };
+
+export function targetDistance(
+  tpAtr: number,
+  atr: number,
+  price: number,
+  roundTripCost: number,
+  costMultiple = 0,
+) {
+  return Math.max(tpAtr * Math.max(atr, price * 0.0004), price * roundTripCost * costMultiple);
+}
 const LOSS_SIZE = 0.65;
 
 export function sizeAfterLosses(penultimate: number | undefined, last: number | undefined) {

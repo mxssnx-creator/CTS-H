@@ -1,0 +1,16 @@
+{
+  "minimumPf": 1,
+  "autoPf": true,
+  "autoPfRecent": true,
+  "autoPfSamples": 4,
+  "autoPfPenalty": 0.15,
+  "microTargetCosts": 1.5,
+  "microHoldMinutes": 240,
+  "microExtended": true,
+  "microReplayGate": false,
+  "microReselectHours": 0,
+  "axis": false,
+  "block": false,
+  "dca": false,
+  "relate": false
+}

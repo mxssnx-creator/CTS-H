@@ -18,6 +18,8 @@ npm run build
 
 The web desk opens at `http://localhost:8080`. The browser starts with public data and manual paper controls. Enable automatic paper entries in Settings for the active connection. Paper orders, fills, and active session state are scoped by connection. Paper positions stay in the open browser session. The selected connection receives updates. Preferences persist locally for each connection. Signed tickets persist separately in SQLite on the operator host.
 
+Paper stops execute at the first observed quote beyond the trigger, which can be worse than the stop price. Quote polling is not a reconstruction of every exchange trade, so paper fills remain approximations.
+
 | Connection     | Quote and candle source  | Operator credential variables               |
 | -------------- | ------------------------ | ------------------------------------------- |
 | `bingx-public` | BingX mainnet public API | None                                        |
@@ -37,7 +39,7 @@ Run validation from the local checkout. Load `desk-operating-model`, then ask th
 
 ## Replay
 
-The CLI defaults to 50 USDT perpetuals available on both BingX feeds. The web desk follows 16 markets and replays their hourly candles in a Web Worker.
+The CLI defaults to 60 USDT perpetuals available on both BingX feeds. The web desk's Settings choose the active market count: up to 32 markets on 1m and up to 60 on longer intervals. The 1m limit is sized to fit a REST candle refresh inside the interval at BingX's published rate; network delays or other clients sharing the IP can still make it late. Initial and renewed history downloads are paced, so a larger watchlist takes longer to load. Quotes for open paper positions remain monitored when the watchlist shrinks. The browser replays the selected candle interval in a Web Worker.
 
 ```sh
 npm run desk -- replay --connection both --hours 48 --profile all \
@@ -47,19 +49,30 @@ npm run desk -- replay --connection both --hours 168 --pre-hours 72 --interval 1
   --end 2026-11-27T08:00:00Z --profile all --html cts-h-weekly.html
 npm run desk -- replay --connection bingx-x02 --hours 168 --pre-hours 72 --interval 30m \
   --symbols BTC-USDT,ETH-USDT --indication break --range wide --strategies block
+npm run desk -- replay --connection both --hours 240 --pre-hours 72 --interval 15m \
+  --end 2026-11-27T08:00:00Z --selected-only --reselect-hours 24 \
+  --html cts-h-intraday.html --capture cts-h-15m-candles.json
+npm run desk -- replay --input cts-h-15m-candles.json --hours 240 --pre-hours 72 \
+  --indication all --strategies none --selected-only --independent-indications --reselect-hours 0
+npm run desk -- replay --connection both --hours 240 --pre-hours 72 --interval 1m \
+  --end 2026-11-27T08:00:00Z --indication all --strategies none \
+  --strategy-settings examples/intraday-study.json --selected-only --independent-indications \
+  --reselect-hours 0 --slip-bps 1 --html cts-h-minute-indications.html
 ```
 
-Use `--history-hours 1000` for a continuous capture that supports earlier cutoffs. BingX history requests are paced and captures exceeding 1,000 candles are paginated. The browser refreshes quotes independently of hourly candle downloads.
+Use `--history-hours 1000` for a continuous capture that supports earlier cutoffs. BingX history requests are paced and captures exceeding 1,000 candles are paginated. A 60-market, 1-minute capture takes substantially longer than coarser intervals. The browser refreshes quotes independently of candle downloads.
 
-The CLI accepts 1m, 5m, 15m, 30m, 1h and 4h candles. The engine warms indicators on 22 contiguous candles and selects one configuration per market using the pre window. Holdout entries use the next open, ambiguous stops and targets settle at the stop, and open positions close at the boundary. The maximum hold is 24 candles. Profitable periods use hourly equity on intervals up to 1h and four-hour equity on 4h candles. Drawdown uses candle equity. The CLI models the venue taker fee and configurable `--slip-bps` per fill. The browser uses a fixed 0.12% round-trip cost. Funding payments, depth-limited execution and liquidation are outside the model.
+The CLI and web desk accept 1m, 5m, 15m, 30m, 1h and 4h candles. Settings are retained independently per connection and interval, and open paper positions retain their original interval and hold limit. The engine warms indicators on 22 contiguous candles and selects one configuration per market using the pre window. Holdout entries use the next open, ambiguous stops and targets settle at the stop, and open positions close at the boundary. Coordinated intraday holds are configured in minutes; other cases use 24 candles. Profitable periods use hourly equity on intervals up to 1h and four-hour equity on 4h candles. Drawdown uses candle equity. The CLI models the venue taker fee and configurable `--slip-bps` per fill. The browser uses a fixed 0.12% round-trip cost. Funding payments, depth-limited execution and liquidation are outside the model.
 
 ### Configuration selection
 
 The default **coordinated** profile qualifies each enabled indication, bracket and stop mode independently. It ranks eligible candidates by profitable periods and uses realized P&L to break ties. It adds EMA pullback and range fade. The **filtered** profile adds 0.8–2.0 ATR targets with 0.5–1.5× stop-to-target ratios to the execution-eligible short grid. The **baseline** preserves the original grid. Filtered and coordinated sizing cap modeled stop risk plus costs at 0.8% of planned position notional. Coordinated sizing reduces entry size after two consecutive losses.
 
-The default coordinated candidate set uses range breakout, EMA cross and range fade. Settings can enable the other indications individually or enable the full set. The CLI offers the same broad comparison through `--indication all`.
+The 1m and 5m presets start with no indications enabled: none of the 14 individual candidates cleared PF 1 on both routes in their ten-day costed studies. The 15m preset uses MACD, wider targets, a 240-minute hold and a 1.35 minimum PF before the Auto PF margin. It also defaults to daily reselection in replay. These are research presets and their past performance does not establish future profitability. Settings can enable the other indications individually, including volume breakout, momentum pullback, compression breakout and RSI trend recovery. The CLI offers the full set through `--indication all`.
 
-Auto PF defaults to four closed trades and a 1.00 minimum with a 0.15 margin at four closes. The margin decreases with the square root of the sample size. The recent-close check is enabled by default and requires positive follow-through when the recent sample is large enough. Replay freezes the eligible selections before the holdout. Paper scoring rechecks its own recent and lifetime evidence. Use `--min-pf` and `--auto-pf on|off` for direct comparisons.
+Use `--independent-indications --strategies none` to show a separate portfolio for every enabled indication, with one qualified configuration selected per market and indication. The portfolios overlap and must not be added together. `--selected-only` avoids replaying nonselected configurations and preserves the selected portfolio result. `--reselect-hours 24` requalifies using only the preceding prehistory at each 24-hour boundary, and closes open replay positions at that boundary; `--reselect-hours 0` freezes the original preselection for the full replay. Daily reselection is a replay model: the paper desk reevaluates continuously and does not automatically flatten positions every 24 hours. Paper and exchange execution therefore need separate forward validation.
+
+Auto PF defaults to four closed trades and a 0.15 margin at four closes, above the configured minimum of 1.00 or 1.35 for the 15m preset. The margin decreases with the square root of the sample size. The recent-close check is enabled by default and requires positive follow-through when the recent sample is large enough. Replay preselection checks the later half of its prehistory; paper scoring uses recent closes and lifetime evidence, so the filters are not identical. Replay freezes eligible selections between reselection boundaries. Use `--min-pf` and `--auto-pf on|off` for direct comparisons.
 
 Published exclusions apply to calibrated 1h configurations on their own connection, symbol, indication and bracket. An exclusion required at least 24 closes, pooled PF no greater than 0.80, at least three losing periods with six or more closes each and zero adequately sampled winning periods. The rules take effect after the last calibration cutoff.
 
@@ -74,7 +87,9 @@ node scripts/cts-h-calibrate.ts --input cts-h-history.json \
 
 ### Strategy controls
 
-Settings stores indication and range selections, exit modes, volume factor and strategy settings per connection. The volume factor runs from 0.1× to 10× in 0.1× steps and defaults to 1×. It applies to paper entries and coordinated replay. Signed tickets use their approved quantities.
+Settings stores indication and range selections, exit modes, volume factor and strategy settings per connection and interval. The volume factor runs from 0.1× to 10× in 0.1× steps and defaults to 1×. It applies to paper entries and coordinated replay. Signed tickets use their approved quantities.
+
+The browser's open-paper-position limit defaults to 12 and can be adjusted in Settings from 1 to 500. It caps owned paper positions, not signed exchange positions; increasing it does not reserve exchange margin or establish execution capacity.
 
 | Strategy | Entry and position behavior                                                                                                                              |
 | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |

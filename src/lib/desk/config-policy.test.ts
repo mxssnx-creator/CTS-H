@@ -44,8 +44,8 @@ function book(end: number, symbol = "ETH-USDT") {
   return { symbol, bars };
 }
 
-test("the larger replay universe retains the watchlist and has fifty unique symbols", () => {
-  assert.equal(new Set(REPLAY_SYMBOLS).size, 50);
+test("the larger replay universe retains the watchlist and has sixty unique symbols", () => {
+  assert.equal(new Set(REPLAY_SYMBOLS).size, 60);
   assert.ok(PREFERRED_SYMBOLS.every((symbol) => REPLAY_SYMBOLS.includes(symbol)));
 });
 

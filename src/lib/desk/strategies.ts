@@ -1,6 +1,7 @@
 import { DEFAULT_TRAILS, type TrailSettings } from "./management.ts";
 import { INDICATIONS, MAX_MUL, MODEL_STOP_RISK, type Indication } from "./constants.ts";
 import { closePnl, profitFactor, stopCappedQty } from "./math.ts";
+import { isCandleInterval, type CandleInterval } from "./intervals.ts";
 
 export const STRATEGY_TYPES = ["axis", "block", "dca", "relate"] as const;
 export type StrategyType = (typeof STRATEGY_TYPES)[number];
@@ -12,10 +13,15 @@ export const STRATEGY_LABELS: Record<StrategyType, string> = {
 };
 
 export const STRATEGY_LIMITS = {
+  marketCount: [1, 60, 1],
+  maxPaperPositions: [1, 500, 1],
   volumeFactor: [0.1, 10, 0.1],
   minimumPf: [1, 4, 0.05],
   autoPfPenalty: [0, 2, 0.05],
   autoPfSamples: [4, 15, 1],
+  microTargetCosts: [0, 5, 0.1],
+  microHoldMinutes: [10, 480, 5],
+  microReselectHours: [0, 168, 1],
   trailActivation: [0.25, 0.85, 0.05],
   trailDistance: [0.2, 0.8, 0.05],
   axisRatio: [0, 0.5, 0.05],
@@ -48,16 +54,27 @@ export type StrategySettings = TrailSettings &
     wideRange: boolean;
     autoPf: boolean;
     autoPfRecent: boolean;
+    microExtended: boolean;
+    microReplayGate: boolean;
+    interval: CandleInterval;
   };
 
 export const DEFAULT_STRATEGIES: StrategySettings = {
   ...DEFAULT_TRAILS,
+  marketCount: 16,
+  maxPaperPositions: 12,
   volumeFactor: 1,
   minimumPf: 1,
   autoPf: true,
   autoPfRecent: true,
   autoPfPenalty: 0.15,
   autoPfSamples: 4,
+  microTargetCosts: 1.5,
+  microHoldMinutes: 120,
+  microReselectHours: 0,
+  microExtended: false,
+  microReplayGate: false,
+  interval: "1h",
   enabledIndications: ["break", "ema", "rangeFade"],
   shortRange: true,
   wideRange: true,
@@ -86,6 +103,25 @@ export const DEFAULT_STRATEGIES: StrategySettings = {
   relateScope: "symbol",
 };
 
+export function defaultForInterval(interval: CandleInterval): StrategySettings {
+  if (interval === "15m") {
+    return {
+      ...DEFAULT_STRATEGIES,
+      interval,
+      marketCount: 60,
+      enabledIndications: ["macd"],
+      minimumPf: 1.35,
+      microExtended: true,
+      microHoldMinutes: 240,
+      microReselectHours: 24,
+    };
+  }
+  if (interval === "1m" || interval === "5m")
+    return { ...DEFAULT_STRATEGIES, interval, marketCount: interval === "1m" ? 32 : 60,
+      enabledIndications: [] };
+  return { ...DEFAULT_STRATEGIES, interval };
+}
+
 export function normalizeStrategies(input?: Partial<StrategySettings>): StrategySettings {
   const config = { ...DEFAULT_STRATEGIES };
   if (!input) return config;
@@ -97,6 +133,8 @@ export function normalizeStrategies(input?: Partial<StrategySettings>): Strategy
     "wideRange",
     "autoPf",
     "autoPfRecent",
+    "microExtended",
+    "microReplayGate",
   ] as const) {
     const value = input[key];
     if (typeof value === "boolean") config[key] = value;
@@ -106,6 +144,8 @@ export function normalizeStrategies(input?: Partial<StrategySettings>): Strategy
       input.enabledIndications?.includes(kind),
     );
   }
+  if (typeof input.interval === "string" && isCandleInterval(input.interval))
+    config.interval = input.interval;
   for (const key of Object.keys(STRATEGY_LIMITS) as StrategyNumber[]) {
     const value = input[key];
     if (typeof value !== "number" || !Number.isFinite(value)) continue;
@@ -120,6 +160,7 @@ export function normalizeStrategies(input?: Partial<StrategySettings>): Strategy
   }
   if (config.axisSamples > config.axisLookback) config.axisSamples = config.axisLookback;
   if (config.relateSamples > config.relateLookback) config.relateSamples = config.relateLookback;
+  if (config.interval === "1m") config.marketCount = Math.min(config.marketCount, 32);
   if (input.blockMode === "additive" || input.blockMode === "shared")
     config.blockMode = input.blockMode;
   if (input.relateMode === "additive" || input.relateMode === "shared")
@@ -331,9 +372,15 @@ export class RelationLedger {
   }
 }
 
-export function relationKey(scope: StrategySettings["relateScope"], symbol: string, side: number) {
-  if (scope === "overall") return `direction|${side}`;
-  if (scope === "symbol") return `market|${symbol}|${side}`;
+export function relationKey(
+  scope: StrategySettings["relateScope"],
+  symbol: string,
+  side: number,
+  interval: CandleInterval = "1h",
+) {
+  const prefix = interval === "1h" ? "" : `${interval}|`;
+  if (scope === "overall") return `${prefix}direction|${side}`;
+  if (scope === "symbol") return `${prefix}market|${symbol}|${side}`;
   return "";
 }
 
@@ -343,8 +390,9 @@ export function recordRelationClose(
   symbol: string,
   side: number,
   pnl: number,
+  interval: CandleInterval = "1h",
 ) {
   ledger.record(`${exact}|${side}`, pnl);
-  ledger.record(relationKey("symbol", symbol, side), pnl);
-  ledger.record(relationKey("overall", symbol, side), pnl);
+  ledger.record(relationKey("symbol", symbol, side, interval), pnl);
+  ledger.record(relationKey("overall", symbol, side, interval), pnl);
 }
