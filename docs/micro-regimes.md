@@ -91,3 +91,15 @@ Rules, fixed before the run.
   - 30m, either gate: no set passes the minimum-PF eligibility in any window, so every window is flat.
 - Reading: more indications means more candidates that look profitable in training, and under pooled minimum-PF selection those candidates fail out of sample. The new indications don't add a validated edge.
 - The criteria are not met: pooled out-of-sample PF is below 1.10 everywhere, and the share of traded windows with positive net is 36 to 54%.
+
+## Experiment G: percent brackets (TP and SL 0.2% to 0.8%), 25 indications, minimum-PF validation (recorded)
+
+- The brief's micro grid, every TP and SL step from 0.2% to 0.8%, both directions, fixed and dynamic trails, two holds per timeframe, partial 0 or 0.5.
+- Out of sample, pooled PF, net, traded and flat windows:
+  - 4h, breadth gate: PF 0.66, net −190, 5 traded, 32 flat.
+  - 4h, no gate: PF 0.69, net −91, 6 traded, 31 flat.
+  - 1h, breadth gate: PF 0.81, net −51, 16 traded, 21 flat.
+  - 1h, no gate: PF 0.77, net −92, 12 traded, 25 flat.
+  - 30m, either gate: no set passes the minimum-PF eligibility in any window, so every window is flat.
+- Reading: the percent brackets do not produce a validated edge at any timeframe. The walk traded few windows, and the ones it traded lost.
+- Criteria: not met.
