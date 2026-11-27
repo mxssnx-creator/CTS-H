@@ -85,8 +85,9 @@ async function klines(symbol: string, startTime: number, endTime: number, limit:
 type Live = {
   symbol: string;
   bars: Bar[];
-  // Signals of the newest closed bar, delivered to every run when the next bar arrives.
+  // Signals of the newest closed bar, and its ATR, delivered to every run when the next bar arrives.
   pending: Record<Indication, Side | 0>;
+  pendingAtr: number;
   runs: MicroRun[];
   tradeFrom: number;
   gaps: number;
@@ -116,12 +117,13 @@ function sinkFor(symbol: string, set: MicroSet): (fill: Fill) => void {
   };
 }
 
-function signalsOf(bars: Bar[]): Record<Indication, Side | 0> {
+// The signals and the ATR of the newest closed bar. The ATR is the one the batch simulator reads at the signal bar.
+function signalsOf(bars: Bar[]): { signals: Record<Indication, Side | 0>; atr: number } {
   const series = buildSeries(bars);
   const last = bars.length - 1;
-  const out = {} as Record<Indication, Side | 0>;
-  for (const indication of INDICATIONS) out[indication] = signalAt(indication, bars, series, last);
-  return out;
+  const signals = {} as Record<Indication, Side | 0>;
+  for (const indication of INDICATIONS) signals[indication] = signalAt(indication, bars, series, last);
+  return { signals, atr: series.atr[last] ?? Number.NaN };
 }
 
 // Feeds one closed candle. Each run sees the signal of the previous candle, then the new candle's signals are computed
@@ -132,9 +134,11 @@ function feed(live: Live, bar: Bar): void {
   const index = live.bars.length - 1;
   for (const run of live.runs) {
     const set = run.state.set;
-    run.step(bar, index, live.pending[set.indication] ?? 0, false, null, liveAcc.get(set.id)!, undefined);
+    run.step(bar, index, live.pending[set.indication] ?? 0, false, null, liveAcc.get(set.id)!, undefined, live.pendingAtr);
   }
-  live.pending = signalsOf(live.bars);
+  const next = signalsOf(live.bars);
+  live.pending = next.signals;
+  live.pendingAtr = next.atr;
 }
 
 function openCount(lives: Live[]): number {
@@ -158,9 +162,11 @@ async function main(): Promise<void> {
         errors.push(`${symbol}: only ${bars.length} history candles`);
         continue;
       }
-      const live: Live = { symbol, bars: [], pending: {} as Record<Indication, Side | 0>, runs: [], tradeFrom: 0, gaps: 0 };
+      const live: Live = { symbol, bars: [], pending: {} as Record<Indication, Side | 0>, pendingAtr: Number.NaN, runs: [], tradeFrom: 0, gaps: 0 };
       live.bars.push(...bars);
-      live.pending = signalsOf(live.bars);
+      const first = signalsOf(live.bars);
+      live.pending = first.signals;
+      live.pendingAtr = first.atr;
       live.tradeFrom = live.bars.length;
       live.runs = sets.map((set) => new MicroRun(set, interval, { notional, cost: POSITION_RT_COST_PCT, sink: sinkFor(symbol, set) }));
       lives.push(live);

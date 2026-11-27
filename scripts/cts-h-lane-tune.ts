@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { BOOK, DEFAULT_FLOORS, INDICATIONS } from "../src/lib/desk/constants.ts";
+import { profitFactor } from "../src/lib/desk/math.ts";
 import { HOUR_MS } from "../src/lib/desk/intervals.ts";
 import { buildPlan, DEFAULT_LANE_POLICY } from "../src/lib/desk/lanes.ts";
 import { simulateSessions, summarizeReplay, type Bar } from "../src/lib/desk/process.ts";
@@ -83,7 +84,7 @@ function search(outPath: string, captureA: Capture, captureB: Capture) {
   writeFileSync(outPath, JSON.stringify({ floors, research: best, log }, null, 1));
   console.log(log.join("\n"));
   console.log(`final floors: ${JSON.stringify(floors)}`);
-  console.log(`research net ${best.net.toFixed(2)} PF ${(best.gp / best.gl).toFixed(3)} orders ${best.orders} maxDD ${best.drawdown.toFixed(2)} green ${best.green.toFixed(1)}% positive ${best.positive}/${best.windows}`);
+  console.log(`research net ${best.net.toFixed(2)} PF ${profitFactor(best.gp, best.gl).toFixed(3)} orders ${best.orders} maxDD ${best.drawdown.toFixed(2)} green ${best.green.toFixed(1)}% positive ${best.positive}/${best.windows}`);
 }
 
 function validate(floorsPath: string, capture: Capture) {
@@ -100,7 +101,7 @@ function validate(floorsPath: string, capture: Capture) {
     "staged, tuned floors": runWindows(windows, floors),
   };
   for (const [name, result] of Object.entries(rows)) {
-    console.log(`${name.padEnd(26)} net ${result.net.toFixed(2)} PF ${(result.gp / result.gl).toFixed(3)} orders ${result.orders} maxDD ${result.drawdown.toFixed(2)} green ${result.green.toFixed(1)}% positive ${result.positive}/${result.windows}`);
+    console.log(`${name.padEnd(26)} net ${result.net.toFixed(2)} PF ${profitFactor(result.gp, result.gl).toFixed(3)} orders ${result.orders} maxDD ${result.drawdown.toFixed(2)} green ${result.green.toFixed(1)}% positive ${result.positive}/${result.windows}`);
   }
   console.log(JSON.stringify({ floors, rows }, null, 1));
 }

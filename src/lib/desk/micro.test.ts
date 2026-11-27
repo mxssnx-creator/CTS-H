@@ -328,3 +328,50 @@ test("an ATR bracket does not enter without an ATR value", () => {
   assert.equal(trace.length, 0);
   assert.equal(acc.positions, 0);
 });
+
+test("a fixed partial leaves no second target: the rest runs to the window end at break-even protection", () => {
+  // Entry 100; the target 100.32 is touched on bar 2 (partial) and again on bar 3, which must not close anything.
+  const bars = [
+    bar(0, 100, 100, 100, 100),
+    bar(1, 100, 100.1, 99.9, 100),
+    bar(2, 100, 100.5, 99.95, 100.4),
+    bar(3, 100.4, 100.6, 100.1, 100.5),
+  ];
+  const { acc, trace } = run(bookWith(bars, 0, 1), setOf({ partial: 0.5 }), 4);
+  assert.deepEqual(trace.map((item) => item.reason), ["partial", "end"]);
+  assert.deepEqual(trace.map((item) => item.fraction), [0.5, 0.5]);
+  assert.equal(trace[1]!.price, 100.5);
+  assert.equal(acc.positions, 1);
+});
+
+test("a dynamic partial takes its share at the target, then the trail protects the rest from the peak", () => {
+  // Entry 100, target 100.32. Bar 2 takes the partial and the peak 100.5 sets the stop at 100.25 (retrace 0.5 of 0.5).
+  // Bar 3 trades through 100.25, so the rest exits there.
+  const bars = [
+    bar(0, 100, 100, 100, 100),
+    bar(1, 100, 100.1, 99.9, 100),
+    bar(2, 100, 100.5, 99.95, 100.4),
+    bar(3, 100.3, 100.4, 100.2, 100.3),
+  ];
+  const { acc, trace } = run(bookWith(bars, 0, 1), setOf({ partial: 0.5, trail: { kind: "dynamic", retrace: 0.5 }, holdMinutes: 60 }), 4);
+  assert.deepEqual(trace.map((item) => item.reason), ["partial", "sl"]);
+  assert.deepEqual(trace.map((item) => item.fraction), [0.5, 0.5]);
+  assert.ok(Math.abs(trace[0]!.price - 100.32) < 1e-12);
+  assert.ok(Math.abs(trace[1]!.price - 100.25) < 1e-12);
+  // Partial 0.5 x (0.32 - cost) plus rest 0.5 x (0.25 - cost), with the cost on each leg's own quantity.
+  const net = 0.5 * (0.32 - (100 + 100.32) / 2 * POSITION_RT_COST_PCT) + 0.5 * (0.25 - (100 + 100.25) / 2 * POSITION_RT_COST_PCT);
+  assert.ok(Math.abs(acc.net - net) < 1e-9, `net ${acc.net} vs ${net}`);
+  assert.equal(acc.positions, 1);
+});
+
+test("an hour whose equity moves up and back down is active, not dropped from the hourly success", () => {
+  const acc = newMicroAcc(0, MINUTE, 120);
+  // Hour 0 moves up by 5 and back down by 5, so it ends where it began: active, not green.
+  acc.slotDelta[10] = 5;
+  acc.slotDelta[20] = -5;
+  // Hour 1 rises.
+  acc.slotDelta[70] = 2;
+  const summary = summarizeMicro(acc);
+  assert.equal(summary.activeHours, 2);
+  assert.equal(summary.hourlySuccess, 50);
+});

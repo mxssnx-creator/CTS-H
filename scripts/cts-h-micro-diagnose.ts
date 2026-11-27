@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/intervals.ts";
+import { profitFactor } from "../src/lib/desk/math.ts";
 import {
   aggregateBars,
   barIndexAt,
@@ -85,8 +86,10 @@ function summarize(group: Group) {
     legs: group.legs,
     netPnl: Number(group.net.toFixed(4)),
     costPaid: Number(group.cost.toFixed(4)),
-    netPf: group.netLoss > 0 ? Number((group.netWin / group.netLoss).toFixed(4)) : null,
-    grossPf: group.grossLoss > 0 ? Number((group.grossWin / group.grossLoss).toFixed(4)) : null,
+    // Both use the shared convention: no losses reads PF_NO_LOSS, and no P&L at all reads the neutral 1.00.
+    netPf: Number(profitFactor(group.netWin, group.netLoss).toFixed(4)),
+    // Before costs: the gross move of each leg, cost added back.
+    grossPf: Number(profitFactor(group.grossWin, group.grossLoss).toFixed(4)),
     avgNetPerLeg: group.legs ? Number((group.net / group.legs).toFixed(6)) : null,
     avgCostPerLeg: group.legs ? Number((group.cost / group.legs).toFixed(6)) : null,
   };

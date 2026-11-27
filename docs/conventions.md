@@ -29,6 +29,12 @@ Every profit factor, net and cost in the desk follows these rules. The audit sui
 - ATR brackets: target and stop are multiples of the ATR at the signal bar, plus the cost on the same side.
 - Sets that never trade have net 0 and PF 1.00. Their IDs carry an `atr` token only on ATR brackets.
 
+## Micro statistics
+- Partial and rest: a partial close is a leg, not a position. Net and PF are over booked legs, so a partial close and the rest of its position are counted separately. Win rate is over positions, and a position wins when its total net is positive. Net equals the sum of leg P&L, and the equity at the window end equals net.
+- ATR: the Wilder ATR14 from `atrSeries`, the same series the desk uses. ATR brackets read it at the signal bar, and the vol gate reads it as a percent of the close.
+- Drawdown: the largest peak-to-trough fall of bar-close equity, starting from zero. It includes open marks.
+- Hourly success: buckets are one hour, or one bar when the bar is longer. A bucket is active when equity moved inside it, even if it ended where it began. It is green when it ended higher.
+
 ## Where each number is shown
 - Replay and staged reports: "net" is closed-trade net; equity and drawdown are shown separately.
 - Period tables: net is closed-trade; drawdown and positive hours use equity.

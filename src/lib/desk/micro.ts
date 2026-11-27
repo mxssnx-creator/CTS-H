@@ -557,6 +557,7 @@ export function summarizeMicro(acc: MicroAcc, bucketMs = Math.max(acc.stepMs, HO
   let peak = 0;
   let maxDrawdown = 0;
   let bucketSum = 0;
+  let bucketMoved = false;
   let active = 0;
   let green = 0;
   for (let s = 0; s < slots; s++) {
@@ -565,12 +566,15 @@ export function summarizeMicro(acc: MicroAcc, bucketMs = Math.max(acc.stepMs, HO
     if (equity > peak) peak = equity;
     if (peak - equity > maxDrawdown) maxDrawdown = peak - equity;
     bucketSum += delta;
+    if (Math.abs(delta) > 1e-12) bucketMoved = true;
     if ((s + 1) % perBucket === 0 || s === slots - 1) {
-      if (Math.abs(bucketSum) > 1e-12) {
+      // Active: the equity moved inside the bucket, even when it ended where it began. Green: it ended higher.
+      if (bucketMoved) {
         active += 1;
-        if (bucketSum > 0) green += 1;
+        if (bucketSum > 1e-12) green += 1;
       }
       bucketSum = 0;
+      bucketMoved = false;
     }
   }
   return {

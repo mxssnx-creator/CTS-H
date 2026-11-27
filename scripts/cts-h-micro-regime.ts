@@ -217,7 +217,7 @@ for (let k = FIRST_TEST; k < K; k++) {
       continue;
     }
     if (p < MIN_POSITIONS || l <= 0 || n <= 0) continue;
-    const pf = g / l;
+    const pf = profitFactor(g, l);
     if (pf < 1) continue;
     if ((posWin[at]! - posWin[at0]!) / k < MIN_POSITIVE_SHARE) continue;
     eligible += 1;

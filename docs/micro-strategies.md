@@ -6,15 +6,16 @@ A micro set is one indication on one timeframe, traded in both directions, with 
 
 Set = indication × timeframe × direction × target × stop × trail × hold × partial.
 
-- Indications: the 19 in `INDICATIONS`.
+- Indications: the 25 in `INDICATIONS`: the original 19, plus PSAR flip, Keltner band breakout, engulfing, pin bar, internal bar strength reversion and money flow reversal.
 - Timeframes: 1m, 5m, 15m, 30m, 1h, 4h. Shorter timeframes are aggregated from one-minute candles, and only whole candles are kept.
 - Direction: `both` for the main search, as the brief asks. `long` and `short` are diagnostics for chosen sets.
 - Target and stop: 0.2% to 0.8% in steps of 0.1%.
 - Trail: `fixed`, or `dyn` with a retracement of 0.3, 0.4, 0.5 or 0.6.
 - Hold: two time stops per timeframe, from `MICRO_HOLDS`.
 - Partial: 0 or 0.5.
+- Bracket: `percent` for the main search (target and stop are percent of the entry). `atr` is the variant in which target and stop are multiples of the Wilder ATR14 at the signal bar. Both add the round-trip cost on their own side.
 
-The full grid is 19 × 7 × 7 × 5 × 2 × 2 = 18,620 sets per timeframe, or 111,720 across six timeframes.
+The grid is 25 × 7 × 7 × 5 × 2 × 2 = 24,500 sets per timeframe and bracket: 147,000 per bracket across six timeframes, and 294,000 with both brackets.
 
 ## Price rules
 
@@ -37,8 +38,10 @@ The full grid is 19 × 7 × 7 × 5 × 2 × 2 = 18,620 sets per timeframe, or 111
 - the exit arithmetic matches the rules, by hand
 - a gap, a tie, a dynamic trail, a partial, a time stop and a window end each behave as described
 - a blocked entry is a shadow: not booked, but its close is evidence
-- the indicator signals of each of the 19 indications on a prefix equal the signals on the full history, so no signal reads a later bar
+- the indicator signals of each of the 25 indications on a prefix equal the signals on the full history, so no signal reads a later bar
 - the streamed fills equal the batch fills on the same random bars
+
+`src/lib/desk/micro-reference.test.ts` checks every set of both brackets, in all six timeframes, against a separate reference model written from this document and sharing no code with `micro.ts` except the cost constant. For each set on the same random bars it compares every fill (reason, bar, price, partial share, cost, P&L), the legs of each closed position summing to one whole position, the summary (positions, net, PF, win rate, drawdown, equity, hourly success), and the streamed run against the batch run. A separate scenario test for each partial path is in `micro.test.ts`.
 
 The forward runner also re-runs the batch simulator on the candles it stored, and compares every fill.
 

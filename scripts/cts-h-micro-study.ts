@@ -285,7 +285,8 @@ function gated(dirs: string[], outDir: string, interval: CandleInterval, topN: n
   const slots = WINDOW_MS / step;
   const books = markets.map((market) => bookFor(market, interval));
   const ranges = books.map((book) => windows.map((window) => ({ from: barIndexAt(book.bars, window.start), to: barIndexAt(book.bars, window.end) })));
-  const atrs = books.map((book) => atrPctOf(book.bars));
+  // ATR as a percent of price, read from the book: the same Wilder ATR the ATR brackets use, at the signal bar.
+  const atrs = books.map((book) => Float64Array.from(book.atr, (value, i) => value / book.bars[i]!.c));
   const finalLanes = buildPlan(2, DEFAULT_LANE_POLICY).at(-1)!.lanes;
   const settings = normalizeStrategies();
   const gateName = process.env.GATE ?? "validated";
@@ -339,24 +340,6 @@ function gated(dirs: string[], outDir: string, interval: CandleInterval, topN: n
   }
   writeFileSync(join(outDir, `${interval}-gated-${gateName}.csv`), `${rows.join("\n")}\n`);
   console.log(`${interval} gated ${gateName}: wrote ${rows.length - 1} rows in ${((Date.now() - started) / 1000).toFixed(0)}s`);
-}
-
-// ATR as a percent of price, causal: entry i uses the bars up to the last closed bar. Simple mean of true range over 14 bars.
-function atrPctOf(bars: Bar[], period = 14): Float64Array {
-  const tr = new Float64Array(bars.length);
-  for (let i = 0; i < bars.length; i++) {
-    const b = bars[i]!;
-    const previousClose = i > 0 ? bars[i - 1]!.c : b.o;
-    tr[i] = Math.max(b.h - b.l, Math.abs(b.h - previousClose), Math.abs(b.l - previousClose));
-  }
-  const out = new Float64Array(bars.length);
-  let sum = 0;
-  for (let i = 0; i < bars.length; i++) {
-    sum += tr[i]!;
-    if (i >= period) sum -= tr[i - period]!;
-    if (i >= period - 1) out[i] = sum / period / bars[i]!.c;
-  }
-  return out;
 }
 
 function merge(outDir: string, interval: CandleInterval): void {
