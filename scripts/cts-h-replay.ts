@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import { Bingx, requireRows } from "../src/lib/desk/bingx.server.ts";
 import { type ConnectionId, requireConnection } from "../src/lib/desk/connections.ts";
+import {
+  CALIBRATION_CUTOFFS,
+  CALIBRATION_END,
+  CALIBRATION_EVIDENCE,
+} from "../src/lib/desk/calibration.ts";
+import type { ReplayProfile } from "../src/lib/desk/config-policy.ts";
 import { BOOK, DEFAULT_FLOORS, POSITION_RT_COST_PCT } from "../src/lib/desk/constants.ts";
 import { HOUR_MS, loadKlines } from "../src/lib/desk/market.server.ts";
 import { positionNotional } from "../src/lib/desk/math.ts";
@@ -27,6 +33,7 @@ export async function captureReplay(
   connection: ConnectionId,
   symbols: string[],
   endOverride?: number,
+  historyHours = 132,
 ): Promise<Capture> {
   const client = new Bingx(requireConnection(connection));
   const { serverTime } = await client.publicGet<{ serverTime: number }>(
@@ -39,7 +46,7 @@ export async function captureReplay(
     throw new Error("Replay end must be a past, closed UTC hour.");
   const began = performance.now();
   const built = await Promise.all([
-    Promise.allSettled(symbols.map((symbol) => loadKlines(client, symbol, 132, end))),
+    Promise.allSettled(symbols.map((symbol) => loadKlines(client, symbol, historyHours, end))),
     client.publicGet<unknown>("/openApi/swap/v2/quote/contracts"),
   ]);
   const books = built[0].map((item, i) => ({
@@ -67,7 +74,7 @@ export async function captureReplay(
 
 const SIZES: ReplaySize[] = ["base", "axis", "block", "both"];
 
-export function runReplay(capture: Capture, hours: 12 | 24 | 48, slipBps: number) {
+export function replayCosts(capture: Capture, slipBps: number) {
   const rates = new Map(
     capture.contracts.map((row) => [row.symbol, Number(row.takerFeeRate ?? row.feeRate)]),
   );
@@ -82,11 +89,23 @@ export function runReplay(capture: Capture, hours: 12 | 24 | 48, slipBps: number
       costs[book.symbol] = (fee + slipBps / 10_000) * 2;
     }
   }
+  return { costs, feesEstimated };
+}
+
+export function runReplay(
+  capture: Capture,
+  hours: 12 | 24 | 48,
+  slipBps: number,
+  profile: ReplayProfile = "filtered",
+) {
+  const { costs, feesEstimated } = replayCosts(capture, slipBps);
   const began = performance.now();
   const report = simulateSessions(capture.books, BOOK, DEFAULT_FLOORS, {
     hours,
     end: capture.end,
     costs,
+    connection: capture.connection,
+    profile,
     size: "base",
   });
   const elapsed = performance.now() - began;
@@ -111,6 +130,7 @@ export function runReplay(capture: Capture, hours: 12 | 24 | 48, slipBps: number
     .digest("hex");
   return {
     connection: capture.connection,
+    profile,
     origin: capture.origin,
     end: capture.end,
     requested: capture.books.length,
@@ -154,11 +174,56 @@ const pf = (grossProfit: number, grossLoss: number) =>
   grossLoss > 0 ? fmt(grossProfit / grossLoss) : grossProfit > 0 ? "No losses" : "—";
 
 export function renderReplay(runs: ReplayRun[]): string {
+  const filtered = runs.filter((run) => run.profile === "filtered");
+  const comparisons = filtered
+    .flatMap((after) => {
+      const before = runs.find(
+        (run) =>
+          run.profile === "baseline" &&
+          run.connection === after.connection &&
+          run.end === after.end &&
+          run.evidence === after.evidence,
+      );
+      if (!before) return [];
+      const base = before.variants[0]!.replay;
+      const next = after.variants[0]!.replay;
+      return row([
+        iso(after.end),
+        after.connection,
+        after.report.symbols,
+        pf(base.grossProfit, base.grossLoss),
+        pf(next.grossProfit, next.grossLoss),
+        base.net,
+        next.net,
+        base.samples,
+        next.samples,
+        base.drawdown,
+        next.drawdown,
+        `${base.green}/${after.hours}`,
+        `${next.green}/${after.hours}`,
+      ]);
+    })
+    .join("");
+  const calibration = Object.entries(CALIBRATION_EVIDENCE)
+    .map(
+      ([connection, items]) =>
+        `<details><summary>${esc(connection)} · ${items.length} excluded configurations</summary>` +
+        table(
+          ["Market, indication and bracket", "Calibration closes", "Pooled PF", "Losing windows"],
+          items
+            .map(({ key, samples, pf, losingWindows }) => row([key, samples, pf, losingWindows]))
+            .join(""),
+        ) +
+        "</details>",
+    )
+    .join("");
   const variants = runs
     .flatMap((run) =>
       run.variants.map((v) =>
         row([
+          iso(run.end),
           run.connection,
+          run.profile,
           v.size,
           `${fmt(v.scale)}×`,
           v.pre.samples,
@@ -214,10 +279,11 @@ export function renderReplay(runs: ReplayRun[]): string {
             `<div class="bar" title="${iso(h.t)} · ${fmt(h.net)}"><i class="${h.net < 0 ? "down" : "up"}" style="--h:${fmt((Math.abs(h.net) / scale) * 48)}%"></i></div>`,
         )
         .join("");
-      return `<section><h2>${esc(run.connection)}</h2>
+      return `<section><h2>${esc(run.connection)} · ${esc(run.profile)} · ${iso(run.end)}</h2>
       <p>${esc(run.origin)} · ${raw.symbols}/${run.requested} symbols with complete coverage · ${raw.proven} configurations cleared preselection · ${raw.selected.length} selected for replay</p>
+      <p>${fmt(raw.evaluatedConfigs)} market configurations scored. ${raw.disabledConfigs} market-specific configurations excluded by the published calibration.</p>
       <p>Pre window starts ${iso(run.end - run.hours * 2 * HOUR_MS)}. Replay starts ${iso(run.end - run.hours * HOUR_MS)} and ends ${iso(run.end)}.</p>
-      <p>Public requests ${fmt(run.captureMs / 1000)} s. Full grid calculation ${fmt(run.replayMs)} ms. Fill win rate ${base.samples ? fmt((base.wins * 100) / base.samples) + "%" : "—"}.</p>
+      <p>Replay calculation ${fmt(run.replayMs)} ms. Fill win rate ${base.samples ? fmt((base.wins * 100) / base.samples) + "%" : "—"}.</p>
       ${raw.unavailable.length ? `<p>Missing contiguous data for ${esc(raw.unavailable.join(", "))}.</p>` : ""}
       ${run.feesEstimated.length ? `<p>Fee fallback applied to ${esc(run.feesEstimated.join(", "))}.</p>` : ""}
       <h3>Hourly holdout P&amp;L · base size</h3><div class="chart" role="img" aria-label="Hourly net profit and loss">${bars}</div>
@@ -232,13 +298,18 @@ export function renderReplay(runs: ReplayRun[]): string {
   :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#10151e;color:#e9f1fb;font:16px/1.5 system-ui,sans-serif}
   main{max-width:1160px;margin:auto;padding:clamp(1rem,4vw,3rem)}header{border-bottom:2px solid #57d7bf;margin-bottom:2rem}
   h1{font-size:clamp(2rem,5vw,3.3rem);margin:0}h2{margin:.2rem 0 1rem}h3{margin-top:2rem}p{color:#a7b6ca}
-  section{padding:1.25rem;margin:1.5rem 0;background:#151d2b;border:1px solid #2a3649;border-radius:14px}.scroll{overflow:auto}
+  summary{cursor:pointer;margin:.8rem 0}section{padding:1.25rem;margin:1.5rem 0;background:#151d2b;border:1px solid #2a3649;border-radius:14px}.scroll{overflow:auto}
   table{width:100%;border-collapse:collapse;white-space:nowrap;font:13px/1.4 ui-monospace,monospace}
   td,th{text-align:right;padding:.6rem .5rem;border-bottom:1px solid #263247}th{color:#72dec9}td:first-child,th:first-child{text-align:left}
   .chart{height:130px;display:flex;gap:3px;background:linear-gradient(transparent 49.5%,#43536b 50%,transparent 50.5%);margin:1rem 0}
   .bar{position:relative;flex:1}.bar i{position:absolute;inset-inline:0;height:var(--h);border-radius:2px}.up{bottom:50%;background:#57d7bf}.down{top:50%;background:#f37c94}.hash{font-size:.8rem;overflow-wrap:anywhere}
   </style></head><body><main><header><h1>CTS-H · BingX replay</h1><p>Walk-forward result on closed one-hour USDT perpetual candles.</p></header>
-  <section><h2>Holdout results</h2>${table(["Connection", "Sizing", "Scale", "Pre closes", "Pre PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD", "Green hours"], variants)}
-  <p>PF uses realized gains and losses after costs. Drawdown and green hours use hourly portfolio equity. Axis and Block are the desk's sizing multipliers, so they preserve fill count and PF for the same book. P&amp;L and drawdown are in settlement units.</p>
-  <p>Selection used one configuration per symbol from the pre window. Holdout orders start flat, enter at the next candle open, favor the stop on ambiguous candles and flatten at the last close. The model uses taker fees plus ${runs[0]?.slipBps ?? 0} bp slippage per fill. Funding, depth-limited execution and liquidation are outside the model.</p></section>${detail}</main></body></html>`;
+  ${comparisons ? `<section><h2>Matched holdouts · base sizing</h2>${table(["End", "Connection", "Symbols", "Baseline PF", "Filtered PF", "Baseline net", "Filtered net", "Baseline closes", "Filtered closes", "Baseline drawdown", "Filtered drawdown", "Baseline green", "Filtered green"], comparisons)}</section>` : ""}
+  <section><h2>Holdout results by sizing</h2>${table(["End", "Connection", "Profile", "Sizing", "Scale", "Pre closes", "Pre PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD", "Green hours"], variants)}
+  <p>The baseline uses the existing short-grid qualification. The filtered profile adds 0.8–2.0 ATR profit targets and 0.5–1.5× stop-to-target ratios. Position sizing caps modeled stop distance plus costs at 0.8% of planned notional per setup. It omits recurring losers calibrated through ${iso(CALIBRATION_END)} and walks the holdout for eligible pre-window candidates. PF uses realized gains and losses after costs. Drawdown and green hours use hourly portfolio equity. Axis and Block are the desk's sizing multipliers, so they preserve fill count and PF for the same book. P&amp;L and drawdown are in settlement units.</p>
+  <p>Selection used one configuration per symbol from the pre window. Holdout orders start flat, enter at the next candle open, favor the stop on ambiguous candles and flatten at the last close. The model uses taker fees plus ${runs[0]?.slipBps ?? 0} bp slippage per fill. Funding, depth-limited execution and liquidation are outside the model.</p></section>
+  <section><h2>Exclusion evidence</h2>
+  <p>Historical calibration cutoffs ${CALIBRATION_CUTOFFS.map(iso).join(" · ")}.</p>
+  <p>Each exclusion applies to one connection, symbol, indication and bracket. It required at least 24 closes, at least three losing periods with six or more closes each, zero adequately sampled winning periods and pooled PF no greater than 0.80. Alternate grid configurations share market data and their fills can be correlated.</p>
+  ${calibration}</section>${detail}</main></body></html>`;
 }

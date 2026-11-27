@@ -26,6 +26,9 @@ export const SHORT_SL = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5];
 export const TAG = "CTSH_";
 export const BOOK = 10_000;
 export const MAX_HOLD = 24;
+export const MODEL_STOP_RISK = 0.008;
+export const WIDE_TP_ATR = [0.8, 1, 1.2, 1.4, 1.6, 1.8, 2];
+export const WIDE_SL_OF_TP = [0.5, 0.75, 1, 1.25, 1.5];
 export const MAX_LIVE_LEGS = 12;
 
 export const ACTIONS = [
@@ -48,8 +51,8 @@ export const ACTIONS = [
 export type ActionId = (typeof ACTIONS)[number];
 
 export const ACTION_COPY: Record<ActionId, string> = {
-  intern_arm: "Arm intern scoring of every indication × short-GRID cell",
-  intern_all_pre: "Walk closed 1h bars through the 14×9 short GRID",
+  intern_arm: "Arm scoring for eligible short-grid configurations",
+  intern_all_pre: "Walk closed 1h bars through the enabled paper configurations",
   promote_real: "Promote last-N valid cells onto the performing set",
   live_paper_execute: "Open gated paper legs tagged CTS-H on the live tape",
   block_volume: "Size Block additive 0.2 on N=1,3,4,5,6 (skip 2), cap 2.5×",
@@ -75,6 +78,51 @@ export const PREFERRED_SYMBOLS = [
   "BNB-USDT",
   "ARB-USDT",
   "SUI-USDT",
+];
+
+// Liquid USDT perpetuals listed on both CTS-H BingX routes.
+export const REPLAY_SYMBOLS = [
+  ...PREFERRED_SYMBOLS,
+  "BCH-USDT",
+  "LTC-USDT",
+  "ADA-USDT",
+  "HBAR-USDT",
+  "DOT-USDT",
+  "NEAR-USDT",
+  "AAVE-USDT",
+  "UNI-USDT",
+  "ATOM-USDT",
+  "FIL-USDT",
+  "INJ-USDT",
+  "OP-USDT",
+  "ETC-USDT",
+  "APT-USDT",
+  "SEI-USDT",
+  "WLD-USDT",
+  "ALGO-USDT",
+  "XLM-USDT",
+  "TRX-USDT",
+  "FET-USDT",
+  "GRT-USDT",
+  "STX-USDT",
+  "RUNE-USDT",
+  "TIA-USDT",
+  "JUP-USDT",
+  "ONDO-USDT",
+  "VET-USDT",
+  "IMX-USDT",
+  "ENS-USDT",
+  "LDO-USDT",
+  "SAND-USDT",
+  "MANA-USDT",
+  "DYDX-USDT",
+  "CRV-USDT",
+  "ZEC-USDT",
+  "DASH-USDT",
+  "PENDLE-USDT",
+  "COMP-USDT",
+  "ZRX-USDT",
+  "NEO-USDT",
 ];
 
 export const INDICATIONS = ["direction", "move", "break", "rsi", "macd", "bollinger", "ema", "active"] as const;

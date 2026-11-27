@@ -14,6 +14,8 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { CandleChart, EquityChart } from "./chart";
 import { Panel, Stat } from "./shell";
 import { ACTION_COPY, ACTIONS, BOOK, MAX_LIVE_LEGS, type Floors } from "@/lib/desk/constants";
+import { CALIBRATED_EXCLUSIONS } from "@/lib/desk/calibration";
+import type { ReplayProfile } from "@/lib/desk/config-policy";
 import { CONNECTIONS } from "@/lib/desk/connections";
 import { closePnl } from "@/lib/desk/math";
 import {
@@ -648,6 +650,10 @@ export function IndicationsPage() {
 }
 
 const REPLAY_HOURS = [12, 24, 48] as const;
+const REPLAY_PROFILES: Record<ReplayProfile, string> = {
+  filtered: "Filtered",
+  baseline: "Baseline",
+};
 const REPLAY_SIZING: { size: ReplaySize; label: string }[] = [
   { size: "base", label: "Base" },
   { size: "axis", label: "Axis" },
@@ -661,6 +667,7 @@ export function ReplayPage() {
   const connection = useDesk((s) => s.connection);
   const [hours, setHours] = useState<(typeof REPLAY_HOURS)[number]>(48);
   const [size, setSize] = useState<ReplaySize>("base");
+  const [profile, setProfile] = useState<ReplayProfile>("filtered");
   const [report, setReport] = useState<SessionReport | null>(null);
   const [error, setError] = useState("");
   const sig = barSignature(books);
@@ -677,9 +684,9 @@ export function ReplayPage() {
     };
     worker.onerror = () => setError("Replay worker failed.");
     const source = useDesk.getState().books.map(({ symbol, bars }) => ({ symbol, bars }));
-    worker.postMessage({ books: source, floors, opts: { hours, size } });
+    worker.postMessage({ books: source, floors, opts: { hours, size, connection, profile } });
     return () => worker.terminate();
-  }, [sig, floors, hours, size, connection]);
+  }, [sig, floors, hours, size, connection, profile]);
   const pre = report?.ready ? summarizeReplay(report.bookPre) : null;
   const replay = report?.ready ? summarizeReplay(report.bookLive) : null;
   return (
@@ -696,6 +703,20 @@ export function ReplayPage() {
               {REPLAY_HOURS.map((n) => (
                 <button key={n} onClick={() => setHours(n)} aria-pressed={hours === n}>
                   {n}h + {n}h
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <span>Configuration selection</span>
+            <div className="segmented">
+              {(Object.keys(REPLAY_PROFILES) as ReplayProfile[]).map((choice) => (
+                <button
+                  key={choice}
+                  onClick={() => setProfile(choice)}
+                  aria-pressed={profile === choice}
+                >
+                  {REPLAY_PROFILES[choice]}
                 </button>
               ))}
             </div>
@@ -741,6 +762,10 @@ export function ReplayPage() {
             <EquityChart hours={report.bookLive} />
             <p className="muted detail-copy">
               {report.note} Paper replay applies the desk’s 0.12% round-trip cost.
+            </p>
+            <p className="muted detail-copy">
+              {num.format(report.evaluatedConfigs)} market configurations scored.{" "}
+              {report.disabledConfigs} calibrated market configurations excluded.
             </p>
             {report.unavailable.length ? (
               <p className="warn detail-copy">
@@ -880,6 +905,14 @@ export function SettingsPage() {
           </div>
         </Panel>
       </div>
+      <Panel title="Configuration exclusions">
+        <p className="muted detail-copy">
+          Automatic paper entries exclude{" "}
+          {CALIBRATED_EXCLUSIONS[connection === "bingx-x02" ? "bingx-x02" : "bingx-x01"].length}{" "}
+          market configurations with recurring losses after costs. The Replay page offers a baseline
+          comparison.
+        </p>
+      </Panel>
       <Panel title="Paper permissions">
         <div className="option-list">
           {ACTIONS.filter((key) => key !== "connect_exchange").map((key) => (
