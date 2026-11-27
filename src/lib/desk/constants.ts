@@ -165,6 +165,12 @@ export const NEW_INDICATIONS = [
   "vwapReclaim",
   "adxDi",
   "stochRsi",
+  "psar",
+  "keltnerBreak",
+  "engulf",
+  "pinBar",
+  "ibsRevert",
+  "mfiReversal",
 ] as const;
 export const INDICATIONS = [...LEGACY_INDICATIONS, ...NEW_INDICATIONS] as const;
 export type Indication = (typeof INDICATIONS)[number];
@@ -188,6 +194,12 @@ export const INDICATION_LABELS: Record<Indication, string> = {
   vwapReclaim: "VWAP reclaim with Stochastic RSI",
   adxDi: "ADX with DI cross",
   stochRsi: "Stochastic RSI cross",
+  psar: "Parabolic SAR flip (trend start)",
+  keltnerBreak: "Keltner band breakout (2 ATR around EMA 20)",
+  engulf: "Engulfing candle reversal",
+  pinBar: "Pin bar reversal (long wick)",
+  ibsRevert: "Internal bar strength reversion (close at the range extreme)",
+  mfiReversal: "Money flow index reversal (leaves the 20 or 80 zone)",
 };
 
 export type Floors = {

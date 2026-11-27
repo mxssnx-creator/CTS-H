@@ -172,6 +172,9 @@ export type Series = {
   st: Array<Side | 0>;
   stoch: number[];
   vwap: number[];
+  psarDir: Array<Side | 0>;
+  mfi: number[];
+  ema20: number[];
 };
 
 export type TradeLeg = {
@@ -452,6 +455,67 @@ function stochRsiSeries(rsi: number[], n = 14): number[] {
   return out;
 }
 
+// Parabolic SAR, Wilder's standard form (step 0.02, cap 0.2). Returns the trend after each bar: +1 up, -1 down.
+function psarSeries(bars: Bar[]): Array<Side | 0> {
+  const out = new Array<Side | 0>(bars.length).fill(0);
+  if (bars.length < 2) return out;
+  const step = 0.02;
+  const cap = 0.2;
+  let up = bars[1]!.c >= bars[0]!.c;
+  let af = step;
+  let ep = up ? bars[0]!.h : bars[0]!.l;
+  let sar = up ? bars[0]!.l : bars[0]!.h;
+  out[0] = up ? 1 : -1;
+  for (let i = 1; i < bars.length; i++) {
+    const b = bars[i]!;
+    const prev = bars[i - 1]!;
+    const prev2 = bars[i - 2] ?? prev;
+    sar = sar + af * (ep - sar);
+    if (up) {
+      sar = Math.min(sar, prev.l, prev2.l);
+      if (b.l < sar) {
+        up = false;
+        sar = ep;
+        ep = b.l;
+        af = step;
+      } else if (b.h > ep) {
+        ep = b.h;
+        af = Math.min(af + step, cap);
+      }
+    } else {
+      sar = Math.max(sar, prev.h, prev2.h);
+      if (b.h > sar) {
+        up = true;
+        sar = ep;
+        ep = b.h;
+        af = step;
+      } else if (b.l < ep) {
+        ep = b.l;
+        af = Math.min(af + step, cap);
+      }
+    }
+    out[i] = up ? 1 : -1;
+  }
+  return out;
+}
+
+// Money flow index over `n` bars: volume-weighted typical price, positive against negative flow.
+function mfiSeries(bars: Bar[], n = 14): number[] {
+  const out = new Array<number>(bars.length).fill(50);
+  const typical = bars.map((b) => (b.h + b.l + b.c) / 3);
+  for (let i = n; i < bars.length; i++) {
+    let pos = 0;
+    let neg = 0;
+    for (let k = i - n + 1; k <= i; k++) {
+      const flow = typical[k]! * bars[k]!.v;
+      if (typical[k]! > typical[k - 1]!) pos += flow;
+      else if (typical[k]! < typical[k - 1]!) neg += flow;
+    }
+    out[i] = pos + neg > 0 ? (100 * pos) / (pos + neg) : 50;
+  }
+  return out;
+}
+
 export function buildSeries(bars: Bar[]): Series {
   const { mid, sd } = bbSeries(bars);
   const atr = atrSeries(bars);
@@ -464,6 +528,9 @@ export function buildSeries(bars: Bar[]): Series {
     st: supertrendSeries(bars, atrSeries(bars, 10)),
     stoch: stochRsiSeries(rsi),
     vwap: vwapSeries(bars),
+    psarDir: psarSeries(bars),
+    mfi: mfiSeries(bars),
+    ema20: emaSeries(bars, 20),
     atr,
     ema9: emaSeries(bars, 9),
     ema12: emaSeries(bars, 12),
@@ -493,6 +560,59 @@ export function signalAt(ind: Indication, bars: Bar[], s: Series, i: number): Si
   const a = Math.max(s.atr[i] ?? 0, b.c * 0.0004);
   const impulse = (b.c - b.o) / a;
   switch (ind) {
+    case "psar": {
+      // A flip of the SAR trend fires on the bar that flips it.
+      const prev = s.psarDir[i - 1] ?? 0;
+      const cur = s.psarDir[i] ?? 0;
+      if (cur === 1 && prev === -1) return 1;
+      if (cur === -1 && prev === 1) return -1;
+      return 0;
+    }
+    case "keltnerBreak": {
+      // The first close beyond the 2 ATR band around EMA 20 (the band is also used by the trend-following sets).
+      const upper = s.ema20[i]! + 2 * s.atr[i]!;
+      const lower = s.ema20[i]! - 2 * s.atr[i]!;
+      const priorUpper = s.ema20[i - 1]! + 2 * s.atr[i - 1]!;
+      const priorLower = s.ema20[i - 1]! - 2 * s.atr[i - 1]!;
+      if (b.c > upper && bars[i - 1]!.c <= priorUpper) return 1;
+      if (b.c < lower && bars[i - 1]!.c >= priorLower) return -1;
+      return 0;
+    }
+    case "engulf": {
+      // The body of this bar covers the prior bar's body and opposes it.
+      const p = bars[i - 1]!;
+      const bull = b.c > b.o && p.c < p.o && b.o <= p.c && b.c >= p.o;
+      const bear = b.c < b.o && p.c > p.o && b.o >= p.c && b.c <= p.o;
+      return bull ? 1 : bear ? -1 : 0;
+    }
+    case "pinBar": {
+      // A long lower wick at least twice the body and 60% of the range is a rejection of lows (and the mirror for highs).
+      const range = b.h - b.l;
+      if (range <= 0) return 0;
+      const body = Math.abs(b.c - b.o);
+      const lower = Math.min(b.o, b.c) - b.l;
+      const upper = b.h - Math.max(b.o, b.c);
+      if (lower >= 2 * body && lower >= 0.6 * range) return 1;
+      if (upper >= 2 * body && upper >= 0.6 * range) return -1;
+      return 0;
+    }
+    case "ibsRevert": {
+      // Internal bar strength: a close in the bottom fifth of its range reverts up, a close in the top fifth reverts down.
+      const range = b.h - b.l;
+      if (range <= 0) return 0;
+      const ibs = (b.c - b.l) / range;
+      if (ibs <= 0.2) return 1;
+      if (ibs >= 0.8) return -1;
+      return 0;
+    }
+    case "mfiReversal": {
+      // The money flow index leaves an extreme zone: up through 20, or down through 80.
+      const cur = s.mfi[i]!;
+      const prev = s.mfi[i - 1]!;
+      if (prev <= 20 && cur > 20) return 1;
+      if (prev >= 80 && cur < 80) return -1;
+      return 0;
+    }
     case "volumeBreak":
     case "squeezeBreak": {
       let high = -Infinity;

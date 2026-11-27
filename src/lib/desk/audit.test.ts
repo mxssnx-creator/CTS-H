@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_FLOORS, PF_NO_LOSS } from "./constants.ts";
+import { DEFAULT_FLOORS, INDICATIONS, PF_NO_LOSS } from "./constants.ts";
 import { HOUR_MS } from "./intervals.ts";
 import { closePnl, NEUTRAL_PF, pfFromPnls, positionRtCost, profitFactor } from "./math.ts";
 import { laneRequiredPf, laneValue, makeLane } from "./lanes.ts";
@@ -148,7 +148,7 @@ test("micro accounting: net is booked P&L, gross profit minus gross loss, PF on 
 
 test("micro sets: the grid counts, unique IDs, and the ATR token only on ATR brackets", () => {
   const all = enumerateMicroSets(MICRO_GRID);
-  assert.equal(all.length, 6 * 19 * 7 * 7 * 5 * 2 * 2);
+  assert.equal(all.length, 6 * INDICATIONS.length * 7 * 7 * 5 * 2 * 2);
   assert.equal(new Set(all.map((set) => set.id)).size, all.length);
   for (const set of all.slice(0, 500)) {
     assert.ok(!set.id.endsWith("|atr"), "percent sets carry no ATR token");
@@ -156,7 +156,7 @@ test("micro sets: the grid counts, unique IDs, and the ATR token only on ATR bra
   }
   const atrGrid = enumerateMicroSets({ ...MICRO_GRID, brackets: ["atr"], tp: [0.5, 1, 1.5, 2, 3], sl: [0.5, 1, 1.5, 2] });
   assert.ok(atrGrid.every((set) => set.id.endsWith("|atr")));
-  assert.equal(atrGrid.length, 6 * 19 * 5 * 4 * 5 * 2 * 2);
+  assert.equal(atrGrid.length, 6 * INDICATIONS.length * 5 * 4 * 5 * 2 * 2);
 });
 
 test("PF over pooled closes equals the helper on the same closes", () => {
