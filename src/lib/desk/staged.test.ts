@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { BOOK, DEFAULT_FLOORS } from "./constants.ts";
 import { HOUR_MS } from "./intervals.ts";
-import { hourAccumulator, REPLAY_WARMUP_BARS, replayWindow, buildSeries, signalAt, type Bar, type LanedReplay } from "./process.ts";
+import { hourAccumulator, REPLAY_WARMUP_BARS, replayWindow, buildSeries, signalAt, summarizeReplay, type Bar, type LanedReplay } from "./process.ts";
 import { simulateStaged } from "./staged.ts";
 import { defaultForInterval, normalizeStrategies } from "./strategies.ts";
 
@@ -126,4 +126,11 @@ test("the legacy run is deterministic", () => {
   const b = simulateStaged(books, BOOK, DEFAULT_FLOORS, { hours: HOLD, preHours: PRE, end: END, strategies: preferences, progression: false });
   assert.deepEqual(a.staged, b.staged);
   assert.deepEqual(a.bookLive, b.bookLive);
+});
+
+test("the staged book's net is closed-trade P&L: gross profit minus gross loss, with open marks left to equity", () => {
+  const report = simulateStaged(books, BOOK, DEFAULT_FLOORS, { hours: HOLD, preHours: PRE, end: END, strategies: preferences });
+  const summary = summarizeReplay(report.bookLive);
+  assert.ok(Math.abs(summary.net - (summary.grossProfit - summary.grossLoss)) < 1e-6, "net equals gross profit minus gross loss");
+  assert.ok(Math.abs(summary.equity - (summary.net + summary.openPnl)) < 1e-9, "equity is net plus open marks");
 });

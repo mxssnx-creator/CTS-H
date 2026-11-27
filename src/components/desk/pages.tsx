@@ -54,7 +54,7 @@ const sign = (n: number, digits = 2) => `${n > 0 ? "+" : ""}${n.toFixed(digits)}
 const tone = (n: number): "positive" | "negative" => (n >= 0 ? "positive" : "negative");
 // PF 1.00 is neutral: net zero, including a window with no trades.
 const PFText = (win: number, loss: number) =>
-  loss > 0 ? (win / loss).toFixed(2) : win > 0 ? "No losses" : "1.00";
+  loss > 1e-12 ? (win / loss).toFixed(2) : win > 1e-12 ? "No losses" : "1.00";
 
 function Heading({
   title,

@@ -1,3 +1,4 @@
+import { profitFactor } from "../src/lib/desk/math.ts";
 import { readFile, writeFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
@@ -131,7 +132,7 @@ async function main() {
         .map((row) => ({
           key: row.marketKey,
           samples: row.samples,
-          pf: Number((row.grossProfit / row.grossLoss).toFixed(4)),
+          pf: Number(profitFactor(row.grossProfit, row.grossLoss).toFixed(4)),
           losingWindows: row.losingWindows,
         })),
     ]),

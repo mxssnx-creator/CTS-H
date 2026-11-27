@@ -1,5 +1,4 @@
-import { PF_NO_LOSS } from "./constants.ts";
-import { NEUTRAL_PF, profitFactor } from "./math.ts";
+import { profitFactor } from "./math.ts";
 
 // Position-history lanes. Each lane evaluates the last N closes of one cell independently.
 // Pure functions only: no replay state, so every rule here can be tested on its own.
@@ -325,7 +324,7 @@ export function scanStage(
         if (pnl > 0) gp += pnl;
         else gl -= pnl;
       }
-      const pf = gl < 1e-12 ? (gp > 1e-12 ? PF_NO_LOSS : NEUTRAL_PF) : gp / gl;
+      const pf = profitFactor(gp, gl);
       const costRatio = gl > 1e-12 ? cost / gl : 0;
       const tally = tallies[l]!;
       tally.evidence += 1;

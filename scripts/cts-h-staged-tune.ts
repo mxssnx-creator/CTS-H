@@ -1,3 +1,4 @@
+import { profitFactor } from "../src/lib/desk/math.ts";
 import { readFileSync, writeFileSync } from "node:fs";
 import { BOOK, DEFAULT_FLOORS, INDICATIONS } from "../src/lib/desk/constants.ts";
 import { HOUR_MS } from "../src/lib/desk/intervals.ts";
@@ -94,7 +95,7 @@ const summary = [...byVariant].map(([name, list]) => {
   return {
     name,
     net,
-    pf: gl > 0 ? gp / gl : 0,
+    pf: profitFactor(gp, gl),
     closes: list.reduce((total, row) => total + row.closes, 0),
     drawdown: Math.max(...list.map((row) => row.drawdown)),
     green: hours ? (list.reduce((total, row) => total + row.green, 0) / hours) * 100 : 0,

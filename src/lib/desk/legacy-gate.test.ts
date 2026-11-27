@@ -16,8 +16,8 @@ test("gateStateOf keeps the closes, net, PF and the last fifty closes of a cell"
   assert.equal(long.n, 60);
   assert.equal(long.lastN.length, 50);
   assert.equal(gateStateOf([-1, -1]).pf, 0);
-  // A record with neither gains nor losses has no PF: the cell convention reads it as 0 (no gains), as pushPnl does.
-  assert.equal(gateStateOf([]).pf, 0);
+  // A record with neither gains nor losses is neutral: PF 1.00, the same as every other record.
+  assert.equal(gateStateOf([]).pf, 1);
 });
 
 test("a cell with a winning record and clean recent closes is valid and disabled is false", () => {

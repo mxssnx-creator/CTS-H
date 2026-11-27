@@ -1,3 +1,4 @@
+import { profitFactor } from "../src/lib/desk/math.ts";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/intervals.ts";
@@ -212,7 +213,7 @@ for (let k = FIRST_TEST; k < K; k++) {
   let test: Record<string, number> | null = null;
   if (best >= 0) {
     const base = (best * K + k) * FIELDS;
-    test = { positions: stats[base]!, net: stats[base + 1]!, pf: stats[base + 3]! > 0 ? stats[base + 2]! / stats[base + 3]! : 1, maxDD: stats[base + 4]! };
+    test = { positions: stats[base]!, net: stats[base + 1]!, pf: profitFactor(stats[base + 2]!, stats[base + 3]!), maxDD: stats[base + 4]! };
     tally.gp += stats[base + 2]!;
     tally.gl += stats[base + 3]!;
     tally.net += stats[base + 1]!;
@@ -238,7 +239,7 @@ for (let k = FIRST_TEST; k < K; k++) {
     selected: best >= 0 ? sets[best]!.id : null,
     trainingPf: best >= 0 ? Number(bestScore.toFixed(4)) : null,
     test,
-    population: { pf: popGl > 0 ? Number((popGp / popGl).toFixed(4)) : null, netPerSet: Number((popNet / S).toFixed(4)) },
+    population: { pf: Number(profitFactor(popGp, popGl).toFixed(4)), netPerSet: Number((popNet / S).toFixed(4)) },
   });
 }
 
@@ -268,14 +269,14 @@ const result = {
   oosByRegime: Object.fromEntries(
     [...oosByRegime.entries()].map(([regime, t]) => [
       regime,
-      { tradedWindows: t.traded, flatWindows: t.flat, positions: t.positions, pf: t.gl > 0 ? Number((t.gp / t.gl).toFixed(4)) : null, net: Number(t.net.toFixed(2)) },
+      { tradedWindows: t.traded, flatWindows: t.flat, positions: t.positions, pf: Number(profitFactor(t.gp, t.gl).toFixed(4)), net: Number(t.net.toFixed(2)) },
     ]),
   ),
   oosPooled: (() => {
     const t = [...oosByRegime.values()].reduce((a, b) => ({ gp: a.gp + b.gp, gl: a.gl + b.gl, net: a.net + b.net, traded: a.traded + b.traded, flat: a.flat + b.flat, positions: a.positions + b.positions }), { gp: 0, gl: 0, net: 0, traded: 0, flat: 0, positions: 0 });
-    return { tradedWindows: t.traded, flatWindows: t.flat, positions: t.positions, pf: t.gl > 0 ? Number((t.gp / t.gl).toFixed(4)) : null, net: Number(t.net.toFixed(2)) };
+    return { tradedWindows: t.traded, flatWindows: t.flat, positions: t.positions, pf: Number(profitFactor(t.gp, t.gl).toFixed(4)), net: Number(t.net.toFixed(2)) };
   })(),
-  directionByRegime: Object.fromEntries([...direction.entries()].map(([regime, t]) => [regime, { windows: t.n, longPf: t.longGl > 0 ? Number((t.longGp / t.longGl).toFixed(4)) : null, shortPf: t.shortGl > 0 ? Number((t.shortGp / t.shortGl).toFixed(4)) : null }])),
+  directionByRegime: Object.fromEntries([...direction.entries()].map(([regime, t]) => [regime, { windows: t.n, longPf: Number(profitFactor(t.longGp, t.longGl).toFixed(4)), shortPf: Number(profitFactor(t.shortGp, t.shortGl).toFixed(4)) }])),
   windowsDetail: windows,
   walk,
   seconds: Math.round((Date.now() - started) / 1000),

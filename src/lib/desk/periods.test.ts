@@ -53,7 +53,8 @@ test("totals, profit factor, win rate and cumulative net add up", () => {
   assert.equal(first!.wins, 2);
   assert.equal(first!.losses, 2);
   assert.equal(first!.winRate, 0.5);
-  assert.ok(Math.abs(first!.net - (3 - 1 + 0.5 - 0.25 + 2)) < 1e-12);
+  // Net is closed-trade P&L after costs: 3 - 1 + 2. The open marks (0.5 - 0.25) are equity, not net.
+  assert.ok(Math.abs(first!.net - (3 - 1 + 2)) < 1e-12);
   assert.ok(Math.abs(first!.pf - 7 / 3) < 1e-12);
   assert.equal(first!.positiveHours, 2);
   assert.equal(first!.openLegsEnd, 0);

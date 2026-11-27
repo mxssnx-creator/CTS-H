@@ -57,7 +57,7 @@ export function periodRows(
       losses += row.losses;
       realized += row.realized;
       mtm += row.mtm;
-      net += row.net;
+      net += row.realized;
       grossProfit += row.grossProfit;
       grossLoss += row.grossLoss;
       if (row.net > 1e-9) positiveHours += 1;

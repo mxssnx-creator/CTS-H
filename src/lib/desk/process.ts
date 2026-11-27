@@ -772,7 +772,7 @@ function pushPnl(cell: Cell, pnl: number) {
     cell.wins += 1;
     cell.gw += pnl;
   } else cell.gl += Math.abs(pnl);
-  cell.pf = cell.gl < 1e-12 ? (cell.gw > 1e-12 ? 4 : 0) : cell.gw / cell.gl;
+  cell.pf = profitFactor(cell.gw, cell.gl);
 }
 
 // The legacy per-cell gate, used by the coordinated engine and by staged runs with stage progression off. A cell is
@@ -838,7 +838,7 @@ export function gateStateOf(pnls: readonly number[], liveFloor = true): GateStat
     if (pnl >= 0) gw += pnl;
     else gl += Math.abs(pnl);
   }
-  const pf = gl < 1e-12 ? (gw > 1e-12 ? 4 : 0) : gw / gl;
+  const pf = profitFactor(gw, gl);
   return { lastN: pnls.slice(-LASTN.eval), n: pnls.length, net, pf, liveFloor };
 }
 
@@ -1422,7 +1422,11 @@ type IndicationSummary = ReplaySummary & {
 };
 
 type ReplaySummary = {
+  // Closed-trade net P&L after costs: the basis of the profit factor, so net equals grossProfit - grossLoss.
   net: number;
+  // Mark-to-market of positions still open at the end of the window; equity is net + openPnl.
+  openPnl: number;
+  equity: number;
   samples: number;
   wins: number;
   green: number;
@@ -1561,7 +1565,10 @@ function seal(rows: HourAcc[]): HourPoint[] {
 }
 
 export function summarizeReplay(rows: HourPoint[]): ReplaySummary {
+  // Net is closed-trade P&L after costs, so it agrees with grossProfit - grossLoss and with the profit factor.
+  // Drawdown and the green count follow equity, which also carries the marks of open positions.
   let net = 0;
+  let equity = 0;
   let grossProfit = 0;
   let grossLoss = 0;
   let samples = 0;
@@ -1570,17 +1577,20 @@ export function summarizeReplay(rows: HourPoint[]): ReplaySummary {
   let peak = 0;
   let drawdown = 0;
   for (const row of rows) {
-    net += row.net;
+    net += row.realized;
+    equity += row.net;
     samples += row.trades;
     wins += row.wins;
     grossProfit += row.grossProfit;
     grossLoss += row.grossLoss;
     if (row.net > 1e-9) green += 1;
-    peak = Math.max(peak, net);
-    drawdown = Math.max(drawdown, peak - net);
+    peak = Math.max(peak, equity);
+    drawdown = Math.max(drawdown, peak - equity);
   }
   return {
     net,
+    openPnl: equity - net,
+    equity,
     samples,
     wins,
     green,

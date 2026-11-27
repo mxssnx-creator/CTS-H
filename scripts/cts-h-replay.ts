@@ -254,7 +254,7 @@ const table = (head: string[], body: string) =>
   `<div class="scroll"><table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`;
 // PF 1.00 is neutral: net zero, including a window with no trades.
 const pf = (grossProfit: number, grossLoss: number) =>
-  grossLoss > 0 ? fmt(grossProfit / grossLoss) : grossProfit > 0 ? "No losses" : "1.00";
+  grossLoss > 1e-12 ? fmt(grossProfit / grossLoss) : grossProfit > 1e-12 ? "No losses" : "1.00";
 
 function profileName(run: ReplayRun) {
   const label = [run.profile, ...run.strategies.map((key) => STRATEGY_LABELS[key])].join(" + ");

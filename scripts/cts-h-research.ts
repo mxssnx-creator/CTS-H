@@ -1,3 +1,4 @@
+import { profitFactor } from "../src/lib/desk/math.ts";
 import { readFileSync, writeFileSync } from "node:fs";
 import { BOOK, DEFAULT_FLOORS, INDICATIONS, SHORT_SL, SHORT_TP, WIDE_SL_OF_TP, WIDE_TP_ATR, type Indication } from "../src/lib/desk/constants.ts";
 import { HOUR_MS } from "../src/lib/desk/intervals.ts";
@@ -79,7 +80,7 @@ for (const window of windows.filter((w) => w.role === "research")) {
 }
 const bracketRows = [...brackets].map(([key, b]) => {
   const [indication, range, tp, sl, coordination] = key.split("|");
-  return { indication, range, tp: Number(tp), sl: Number(sl), coordination, ...b, pf: b.gl > 0 ? b.gp / b.gl : null };
+  return { indication, range, tp: Number(tp), sl: Number(sl), coordination, ...b, pf: profitFactor(b.gp, b.gl) };
 });
 
 writeFileSync(`${outDir}/research-sweep.json`, JSON.stringify(sweep, null, 1));

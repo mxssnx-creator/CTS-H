@@ -505,7 +505,7 @@ function simulateStagedWindow(
     bookNetLive: liveSum.net,
     bookDrawdownPre: preSum.drawdown,
     bookDrawdownLive: liveSum.drawdown,
-    bookEquityLive: { net: liveSum.net, peak, trough, drawdown: liveSum.drawdown },
+    bookEquityLive: { net: liveSum.equity, peak, trough, drawdown: liveSum.drawdown },
     greenBookPre: preSum.green,
     greenBookLive: liveSum.green,
     bookNames: selected.map((item) => item.name),

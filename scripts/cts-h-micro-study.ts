@@ -1,3 +1,4 @@
+import { profitFactor } from "../src/lib/desk/math.ts";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_FLOORS } from "../src/lib/desk/constants.ts";
@@ -444,7 +445,7 @@ function walk(outDir: string, interval: CandleInterval, suffix: string): void {
     outOfSample: {
       windowsTraded: traded.length,
       windowsFlat: results.length - traded.length,
-      pf: gl > 0 ? gp / gl : 1,
+      pf: profitFactor(gp, gl),
       net: traded.reduce((total, item) => total + item.test!.net, 0),
       positions: traded.reduce((total, item) => total + item.test!.positions, 0),
       worstTestDrawdown: Math.max(0, ...traded.map((item) => item.test!.maxDD)),
