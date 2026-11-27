@@ -36,7 +36,8 @@ import {
   normalizeStrategies,
   type StrategySettings,
 } from "../src/lib/desk/strategies.ts";
-import { captureReplay, renderReplay, runReplay, type Capture } from "./cts-h-replay.ts";
+import { captureReplay, renderMarkdown, renderReplay, runReplay, type Capture } from "./cts-h-replay.ts";
+import type { LanePolicy } from "../src/lib/desk/lanes.ts";
 
 const HELP = `CTS-H BingX Trading Desk
   brief [--connection bingx-x02] [--symbol ETH-USDT]
@@ -44,7 +45,10 @@ const HELP = `CTS-H BingX Trading Desk
          [--symbols BTC-USDT,ETH-USDT] [--end ISO] [--history-hours 132] [--input candles.json] [--capture candles.json]
          [--profile coordinated|filtered|baseline|both|all] [--indication NAME|all] [--range short|wide]
          [--strategies none|axis,block,dca,relate] [--min-pf 1.0] [--auto-pf on|off]
-         [--strategy-settings config.json] [--volume-factor 1.0] [--selected-only] [--independent-indications] [--reselect-hours 24] [--html report.html]
+         [--strategy-settings config.json] [--volume-factor 1.0] [--independent-indications] [--reselect-hours 24]
+         [--period-hours 4] [--html report.html] [--markdown report.md]
+         [--profile staged --per-symbol 1 --thins 2 --min-closes 6 --min-pf 1.05 --auto-penalty 0.15 --require-net on|off]
+         [--stages on|off]   stage progression (default on); off runs the legacy per-cell last-N logistics
   doctor
   account --connection bingx-x02
   propose --connection bingx-x02 --symbol ETH-USDT --side long --qty N --stop N --target N --why TEXT
@@ -60,6 +64,13 @@ const HELP = `CTS-H BingX Trading Desk
   clear-controls TICKET --confirm TICKET
   review TICKET --why TEXT
   show TICKET`;
+
+// Strict on/off switch: a typo fails loudly instead of silently taking the default.
+function onOff(value: string, name: string): boolean {
+  if (value === "on") return true;
+  if (value === "off") return false;
+  throw new Error(`Use --${name} on or --${name} off.`);
+}
 
 function envCredentials(connection: PrivateConnection): Credentials | null {
   const prefix = `BINGX_${connection.slot}`;
@@ -134,9 +145,18 @@ async function main() {
       "strategy-settings": { type: "string" },
       "volume-factor": { type: "string" },
       "selected-only": { type: "boolean" },
+      "period-hours": { type: "string" },
+      "per-symbol": { type: "string" },
+      thins: { type: "string" },
+      "min-closes": { type: "string" },
+      "auto-penalty": { type: "string" },
+      "require-net": { type: "string" },
+      stages: { type: "string" },
+      markdown: { type: "string" },
       "independent-indications": { type: "boolean" },
       "reselect-hours": { type: "string" },
       "min-pf": { type: "string" },
+      "lane-settings": { type: "string" },
       "auto-pf": { type: "string" },
       "control-mode": { type: "string" },
       "history-hours": { type: "string" },
@@ -217,8 +237,8 @@ async function main() {
     if (!Number.isInteger((history * HOUR_MS) / step))
       throw new Error("History must span a whole number of candles.");
     const profile = values.profile ?? "coordinated";
-    if (!["baseline", "filtered", "coordinated", "both", "all"].includes(profile))
-      throw new Error("Choose coordinated, filtered, baseline, both or all.");
+    if (!["baseline", "filtered", "coordinated", "staged", "both", "all"].includes(profile))
+      throw new Error("Choose coordinated, staged, filtered, baseline, both or all.");
     const profiles: ReplayProfile[] =
       profile === "both"
         ? ["baseline", "filtered"]
@@ -260,6 +280,8 @@ async function main() {
       ...(volume === undefined ? {} : { volumeFactor: number(volume, "volume factor", [0.1, 10]) }),
       ...(minimumPf === undefined ? {} : { minimumPf: number(minimumPf, "minimum PF", [1, 4]) }),
       ...(autoPf === undefined ? {} : { autoPf: autoPf === "on" }),
+      ...(values.stages === undefined ? {} : { stageProgression: onOff(values.stages, "stages") }),
+      ...(profile === "staged" ? { extendedTargets: true, enabledIndications: INDICATIONS } : {}),
       ...(values.indication === "all" ? { enabledIndications: INDICATIONS } : {}),
     };
     const slip = number(values["slip-bps"] ?? "1", "slippage basis points", [0, 200]);
@@ -303,6 +325,17 @@ async function main() {
       if (!books.length) throw new Error("No requested markets exist in the capture.");
       return { ...capture, end: cutoff, books };
     });
+    const periodHours = number(values["period-hours"] ?? "4", "period hours", [1, 336]);
+    if (!Number.isInteger(periodHours)) throw new Error("Period hours must be a whole number.");
+    // Lane settings: per-relation PF floors, cost multiple, auto PF and net requirement.
+    const laneFile = values["lane-settings"]
+      ? (JSON.parse(await readFile(values["lane-settings"], "utf8")) as Partial<LanePolicy>)
+      : {};
+    const laneSettings: Partial<LanePolicy> = {
+      ...laneFile,
+      ...(values["auto-penalty"] === undefined ? {} : { autoPenalty: number(values["auto-penalty"], "auto PF penalty", [0, 1]) }),
+      ...(values["require-net"] === undefined ? {} : { requireNet: values["require-net"] !== "off" }),
+    };
     const runs = replayInput.flatMap((capture) => {
       const strategies = normalizeStrategies({
         ...defaultForInterval(capture.interval ?? "1h"),
@@ -313,14 +346,25 @@ async function main() {
           preHours,
           indication: indication as Indication | undefined,
           range,
-          selectedOnly: values["selected-only"],
+          // Portfolio outcomes match the full candidate replay; only selected cells are replayed.
+          selectedOnly: true,
           independentIndications: values["independent-indications"],
           reselectHours,
+          staged: {
+            perSymbol: number(values["per-symbol"] ?? "1", "cells per market", [1, 10]),
+            minPf: values["min-pf"] === undefined ? undefined : number(values["min-pf"], "minimum PF", [0.1, 4]),
+            policy: laneSettings,
+            thins: number(values.thins ?? "2", "thin stages", [0, 4]),
+            minCloses: number(values["min-closes"] ?? "6", "minimum closes", [1, 200]),
+            // Stage progression is on by default; --stages off runs the legacy per-cell last-N logistics.
+            progression: values.stages === undefined ? undefined : onOff(values.stages, "stages"),
+          },
         }),
       );
     });
     if (values.capture) await writeFile(values.capture, JSON.stringify(captures), { flag: "wx" });
-    if (values.html) await writeFile(values.html, renderReplay(runs), { flag: "wx" });
+    if (values.html) await writeFile(values.html, renderReplay(runs, "", periodHours), { flag: "wx" });
+    if (values.markdown) await writeFile(values.markdown, renderMarkdown(runs, periodHours), { flag: "wx" });
     print(
       runs.map(({ report, ...run }) => ({
         ...run,

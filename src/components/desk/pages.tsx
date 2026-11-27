@@ -52,8 +52,9 @@ const hour = new Intl.DateTimeFormat("en-GB", {
 });
 const sign = (n: number, digits = 2) => `${n > 0 ? "+" : ""}${n.toFixed(digits)}`;
 const tone = (n: number): "positive" | "negative" => (n >= 0 ? "positive" : "negative");
+// PF 1.00 is neutral: net zero, including a window with no trades.
 const PFText = (win: number, loss: number) =>
-  loss > 0 ? (win / loss).toFixed(2) : win > 0 ? "No losses" : "—";
+  loss > 1e-12 ? (win / loss).toFixed(2) : win > 1e-12 ? "No losses" : "1.00";
 
 function Heading({
   title,
@@ -761,6 +762,7 @@ const REPLAY_PROFILES: Record<ReplayProfile, string> = {
   coordinated: "Coordinated",
   filtered: "Filtered",
   baseline: "Baseline",
+  staged: "Staged lanes",
 };
 const REPLAY_SIZING: { size: ReplaySize; label: string }[] = [
   { size: "base", label: "Base" },
@@ -934,6 +936,93 @@ export function ReplayPage() {
               </div>
             </Panel>
           )}
+          {report.staged ? (
+            <Panel title="Staged lanes" aside={<span className="muted mono">{report.staged.logistics === "legacy" ? "Legacy logistics" : report.staged.plan.join(" → ")}</span>}>
+              {report.staged.logistics === "legacy" ? (
+                <p className="muted">
+                  Stage progression is off. Each cell is validated once by the per-cell last-N gate (last 50 closes, recent window 15,
+                  suspension 12, auto PF), and that gate decides every holdout entry from the cell's own closes. PF is net of costs, so 1.00 is neutral.
+                </p>
+              ) : (
+                <p className="muted">
+                  PF is net of round-trip costs, so 1.00 is neutral. Each lane needs PF ≥ max(its floor, 1 + {report.staged.policy.costMultiple} × costs / gross loss),
+                  with auto PF {report.staged.policy.autoPenalty} over {report.staged.policy.autoSamples} closes and positive net{" "}
+                  {report.staged.policy.requireNet ? "required" : "optional"}.
+                </p>
+              )}
+              <p className="muted">
+                {num.format(report.staged.pool)} candidate cells, {num.format(report.staged.validatedFinal)} validated by the final stage,
+                {" "}{num.format(report.staged.chosen)} chosen (up to {report.staged.perSymbol} per market). {num.format(report.staged.bookedCloses)} booked closes;
+                {" "}{num.format(report.staged.shadows)} entries blocked and tracked as shadows (shadow PF {report.staged.shadowPf.toFixed(2)}).
+              </p>
+              {report.staged.logistics === "legacy" ? null : (
+              <div className="table-scroll">
+                <table className="desk-table">
+                  <thead>
+                    <tr>
+                      <th>Stage</th>
+                      <th>Input</th>
+                      <th>Validated</th>
+                      <th>Vetoed</th>
+                      <th>Retained</th>
+                      <th>Median PF in</th>
+                      <th>Median PF out</th>
+                      <th>Relation out/in</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.staged.stages.map((stage) => (
+                      <tr key={stage.id}>
+                        <td>{stage.name}</td>
+                        <td>{num.format(stage.input)}</td>
+                        <td>{num.format(stage.validated)}</td>
+                        <td>{num.format(stage.vetoed)}</td>
+                        <td>{(stage.retained * 100).toFixed(1)}%</td>
+                        <td>{stage.medianPfIn.toFixed(2)}</td>
+                        <td>{stage.medianPfOut.toFixed(2)}</td>
+                        <td>{stage.relation.toFixed(2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              )}
+              {report.staged.cells.length ? (
+                <div className="table-scroll">
+                  <table className="desk-table">
+                    <thead>
+                      <tr>
+                        <th>Cell</th>
+                        <th>Closes pre</th>
+                        <th>PF pre</th>
+                        <th>Closes holdout</th>
+                        <th>PF holdout</th>
+                        <th>Net holdout</th>
+                        <th>Shadows</th>
+                        <th>Shadow PF</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {report.staged.cells.map((cell) => (
+                        <tr key={cell.name}>
+                          <td>{cell.name}</td>
+                          <td>{cell.closesPre}</td>
+                          <td>{cell.pfPre.toFixed(2)}</td>
+                          <td>{cell.closesHoldout}</td>
+                          <td>{cell.pfHoldout.toFixed(2)}</td>
+                          <td className={tone(cell.netHoldout)}>{sign(cell.netHoldout)}</td>
+                          <td>{cell.shadows}</td>
+                          <td>{cell.shadowPf.toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <Empty>No cell validated through every stage.</Empty>
+              )}
+            </Panel>
+          ) : null}
           <div className="columns-even">
             <Panel title="Selected configurations">
               {report.selected.length ? (
@@ -1240,6 +1329,15 @@ export function SettingsPage() {
               checked={strategies.autoPfRecent}
               disabled={!allow.change_floors || !strategies.autoPf}
               onChange={(event) => setStrategies({ autoPfRecent: event.currentTarget.checked })}
+            />
+          </label>
+          <label>
+            <span>Stage progression (Base, Main, thin lanes)</span>
+            <input
+              type="checkbox"
+              checked={strategies.stageProgression}
+              disabled={!allow.change_floors}
+              onChange={(event) => setStrategies({ stageProgression: event.currentTarget.checked })}
             />
           </label>
         </div>

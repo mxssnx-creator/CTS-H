@@ -7,15 +7,19 @@ import {
   CALIBRATION_EVIDENCE,
 } from "../src/lib/desk/calibration.ts";
 import type { ReplayProfile } from "../src/lib/desk/config-policy.ts";
-import { BOOK, DEFAULT_FLOORS, POSITION_RT_COST_PCT } from "../src/lib/desk/constants.ts";
+import { BOOK, DEFAULT_FLOORS, LASTN, POSITION_RT_COST_PCT } from "../src/lib/desk/constants.ts";
 import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/intervals.ts";
 import { loadKlines } from "../src/lib/desk/market.server.ts";
 import { positionNotional } from "../src/lib/desk/math.ts";
+import { periodRows, type PeriodRow } from "../src/lib/desk/periods.ts";
+import type { LanePolicy, StagedSummary } from "../src/lib/desk/lanes.ts";
+import { simulateStaged } from "../src/lib/desk/staged.ts";
 import {
   simulateSessions,
   sizedNotional,
   summarizeReplay,
   type Bar,
+  type CoverageRow,
   type ReplayOpts,
   type ReplaySize,
   type SessionReport,
@@ -100,7 +104,7 @@ export async function captureReplay(
 const SIZES: ReplaySize[] = ["base", "axis", "block", "both"];
 type ReplayScope = Pick<
   ReplayOpts, "preHours" | "indication" | "range" | "trailing" | "selectedOnly" | "reselectHours" | "independentIndications"
->;
+> & { staged?: { perSymbol: number; minPf?: number; thins: number; minCloses: number; policy?: Partial<LanePolicy>; progression?: boolean } };
 const fingerprints = new WeakMap<Capture, Map<number, string>>();
 
 export function replayCosts(capture: Capture, slipBps: number) {
@@ -132,20 +136,39 @@ export function runReplay(
   const strategies = preferences ?? defaultForInterval(capture.interval ?? "1h");
   const { costs, feesEstimated } = replayCosts(capture, slipBps);
   const began = performance.now();
-  const report = simulateSessions(capture.books, BOOK, DEFAULT_FLOORS, {
-    ...scope,
+  const { staged, ...engineScope } = scope;
+  const common = {
     hours,
     end: capture.end,
     costs,
     connection: capture.connection,
-    profile,
     interval: capture.interval ?? "1h",
-    size: "base",
     strategies,
-  });
+  };
+  const report =
+    profile === "staged"
+      ? simulateStaged(capture.books, BOOK, DEFAULT_FLOORS, {
+          ...common,
+          preHours: scope.preHours ?? hours,
+          indication: scope.indication,
+          range: scope.range,
+          perSymbol: staged?.perSymbol,
+          minPf: staged?.minPf,
+          thins: staged?.thins,
+          minCloses: staged?.minCloses,
+          policy: staged?.policy,
+          progression: staged?.progression,
+          reselectHours: scope.reselectHours,
+        })
+      : simulateSessions(capture.books, BOOK, DEFAULT_FLOORS, {
+          ...engineScope,
+          ...common,
+          profile,
+          size: "base",
+        });
   const elapsed = performance.now() - began;
   const base = positionNotional(BOOK);
-  const variants = (profile === "coordinated" ? SIZES.slice(0, 1) : SIZES).map((size) => {
+  const variants = (profile === "coordinated" || profile === "staged" ? SIZES.slice(0, 1) : SIZES).map((size) => {
     const scale =
       sizedNotional(base, {
         axis: size === "axis" || size === "both",
@@ -229,15 +252,230 @@ const cell = (v: string | number) => `<td>${esc(typeof v === "number" ? fmt(v) :
 const row = (values: (string | number)[]) => `<tr>${values.map(cell).join("")}</tr>`;
 const table = (head: string[], body: string) =>
   `<div class="scroll"><table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`;
+// PF 1.00 is neutral: net zero, including a window with no trades.
 const pf = (grossProfit: number, grossLoss: number) =>
-  grossLoss > 0 ? fmt(grossProfit / grossLoss) : grossProfit > 0 ? "No losses" : "—";
+  grossLoss > 1e-12 ? fmt(grossProfit / grossLoss) : grossProfit > 1e-12 ? "No losses" : "1.00";
 
 function profileName(run: ReplayRun) {
   const label = [run.profile, ...run.strategies.map((key) => STRATEGY_LABELS[key])].join(" + ");
   return run.strategySettings?.autoPf ? `${label} · Auto PF` : label;
 }
 
-export function renderReplay(runs: ReplayRun[], introduction = ""): string {
+const PERIOD_HEAD = [
+  "UTC period start", "UTC period end", "Hours", "Closes", "Wins", "Losses", "Win rate",
+  "Realized", "MTM change", "Net", "Cumulative net", "Gross profit", "Gross loss", "Trade PF",
+  "Positive hours", "Period drawdown", "Open legs at end",
+];
+const periodCells = (row: PeriodRow): (string | number)[] => [
+  iso(row.start), iso(row.end), row.hours, row.trades, row.wins, row.losses,
+  row.winRate === null ? "—" : `${fmt(row.winRate * 100)}%`,
+  row.realized, row.mtm, row.net, row.cumulative, row.grossProfit, row.grossLoss,
+  pf(row.grossProfit, row.grossLoss), row.positiveHours, row.drawdown, row.openLegsEnd,
+];
+
+export function minimumCloses(run: { strategySettings: StrategySettings | null }) {
+  return run.strategySettings?.autoPf ? run.strategySettings.autoPfSamples : LASTN.minSamples;
+}
+
+export function coverageStatus(row: CoverageRow, minSamples: number): string {
+  if (row.configs === 0) return "Every configuration excluded by published calibration";
+  if (row.selected) return `Selected on ${row.selected} symbol${row.selected === 1 ? "" : "s"}`;
+  if (row.passed) return "Passed the gates but was not the best configuration on any symbol";
+  if (row.reachedSamples) return "Reached the closes minimum; PF, net or follow-through gate failed";
+  if (row.withCloses) return `Below the ${minSamples}-close minimum in the prehistory`;
+  if (row.signalsPre) return "Signals in the prehistory produced no closes";
+  return "No signals in the prehistory";
+}
+
+function coverageDetail(run: ReplayRun) {
+  const minSamples = minimumCloses(run);
+  return run.report.coverage.map((row) => {
+    const picks = run.report.selected.filter(
+      (item) => item.indication === row.indication && item.range === row.range,
+    );
+    const gp = picks.reduce((total, item) => total + item.replay.grossProfit, 0);
+    const gl = picks.reduce((total, item) => total + item.replay.grossLoss, 0);
+    return {
+      row,
+      closes: picks.reduce((total, item) => total + item.replay.samples, 0),
+      gp,
+      gl,
+      net: picks.reduce((total, item) => total + item.replay.net, 0),
+      status: coverageStatus(row, minSamples),
+    };
+  });
+}
+
+const COVERAGE_HEAD = [
+  "Indication", "Range", "Configurations", "Excluded", "With prehistory closes",
+  "At closes minimum", "Best prehistory PF at minimum", "Passed gates", "Selected symbols", "Prehistory signals",
+  "Holdout signals", "Selected holdout closes", "Selected PF", "Selected net", "Status",
+];
+function coverageTable(run: ReplayRun) {
+  return table(
+    COVERAGE_HEAD,
+    coverageDetail(run)
+      .map(({ row, closes, gp, gl, net, status }) =>
+        `<tr><td>${esc(row.indication)}</td><td>${esc(row.range)}</td>${[
+          row.configs, row.excluded, row.withCloses, row.reachedSamples,
+          row.reachedSamples ? fmt(row.bestPf) : "—", row.passed,
+          row.selected, row.signalsPre, row.signalsReplay, closes, pf(gp, gl), net,
+        ].map(cell).join("")}<td>${esc(status)}</td></tr>`,
+      )
+      .join(""),
+  );
+}
+
+// Accepts the per-period rows produced by `periodRows` for one run.
+function periodTable(rows: PeriodRow[]) {
+  return table(PERIOD_HEAD, rows.map((row) => `<tr>${periodCells(row).map((v, i) => i < 2 ? `<td>${esc(String(v))}</td>` : cell(v)).join("")}</tr>`).join(""));
+}
+
+function markdownTable(head: string[], body: (string | number)[][]) {
+  const text = (v: string | number) => (typeof v === "number" ? fmt(v) : v).replace(/\|/g, "\\|");
+  return [
+    `| ${head.join(" | ")} |`,
+    `| ${head.map(() => "---").join(" | ")} |`,
+    ...body.map((values) => `| ${values.map(text).join(" | ")} |`),
+  ].join("\n");
+}
+
+const pct = (value: number) => `${fmt(value * 100)}%`;
+
+// Policy in one line: PF is net of costs (1.00 is neutral) and every lane needs its cost floor.
+export function policyText(policy: LanePolicy): string {
+  const tuned = Object.keys(policy.laneMinPf ?? {}).length;
+  return `Policy: PF is net of round-trip costs, so 1.00 is neutral. Each lane needs PF ≥ max(lane floor, 1 + ${policy.costMultiple} × costs/gross loss), plus auto PF ${policy.autoPenalty} over ${policy.autoSamples} closes; net positive ${policy.requireNet ? "required" : "not required"}; ratchet ${policy.ratchetStep} per thin stage; ${tuned} per-relation floors set (others ${policy.minPf}).`;
+}
+
+// Staged lanes: stage table, lane table, summary and per-market cells, as HTML.
+function stagedHtml(run: ReplayRun): string {
+  const staged = run.report.staged;
+  if (!staged) return "";
+  const stageRows = staged.stages.map((stage) =>
+    row([stage.name, stage.input, stage.validated, stage.vetoed, pct(stage.retained), stage.medianPfIn, stage.medianPfOut, stage.relation]),
+  ).join("");
+  const laneRows = staged.stages.flatMap((stage) =>
+    stage.lanes.map((lane) =>
+      row([stage.name, lane.id, lane.window, lane.mode, lane.floor, lane.evidence, lane.confirmed, lane.vetoed, lane.netPositive, lane.medianPf]),
+    ),
+  ).join("");
+  const cellRows = staged.cells.map((cell) =>
+    row([cell.name, cell.closesPre, cell.pfPre, cell.closesHoldout, cell.pfHoldout, cell.netHoldout, cell.shadows, cell.shadowPf]),
+  ).join("");
+  const legacy = staged.logistics === "legacy";
+  return `<h3>Staged lanes${legacy ? " (legacy logistics)" : ""}</h3>
+      <p>${esc(legacy ? "Stage progression is off: each cell is validated by the per-cell last-N gate, and that gate decides every holdout entry. The lane policy is not used." : policyText(staged.policy))}</p>
+      <p>${esc(legacy ? "Legacy logistics" : staged.plan.join(" → "))}. ${fmt(staged.pool)} candidate cells in the prehistory pool; ${fmt(staged.validatedFinal)} validated by the final stage; ${fmt(staged.chosen)} chosen for the holdout (up to ${staged.perSymbol} per market). ${fmt(staged.bookedCloses)} booked closes, ${fmt(staged.shadows)} entries blocked by the lanes and tracked as shadows (shadow PF ${fmt(staged.shadowPf)}).</p>
+      ${legacy ? "" : table(["Stage", "Input cells", "Validated", "Vetoed", "Retained", "Median PF in", "Median PF out", "Relation out/in"], stageRows)}
+      ${legacy ? "" : table(["Stage", "Lane", "Window", "Mode", "Floor (before cost and auto PF)", "Evidence", "Confirmed", "Vetoed", "Net positive", "Median PF"], laneRows)}
+      ${table(["Cell", "Closes prehistory", "PF prehistory", "Closes holdout", "PF holdout", "Net holdout", "Shadow entries", "Shadow PF"], cellRows)}`;
+}
+
+function legacyStagedMarkdown(staged: StagedSummary): string[] {
+  return [
+    "### Staged lanes (legacy logistics)",
+    "",
+    `Stage progression is off: each cell is validated by the per-cell last-N gate (last 50 closes, recent window 15, suspension 12, auto PF), and that gate decides every holdout entry from the cell's own closes. ${fmt(staged.pool)} candidate cells; ${fmt(staged.validatedFinal)} validated; ${fmt(staged.chosen)} chosen (up to ${staged.perSymbol} per market). ${fmt(staged.bookedCloses)} booked closes; ${fmt(staged.shadows)} blocked entries tracked as shadows (shadow PF ${fmt(staged.shadowPf)}).`,
+    "",
+    markdownTable(
+      ["Cell", "Closes prehistory", "PF prehistory", "Closes holdout", "PF holdout", "Net holdout", "Shadow entries", "Shadow PF"],
+      staged.cells.map((cell) => [cell.name, cell.closesPre, cell.pfPre, cell.closesHoldout, cell.pfHoldout, cell.netHoldout, cell.shadows, cell.shadowPf]),
+    ),
+  ];
+}
+
+function stagedMarkdown(run: ReplayRun): string[] {
+  const staged = run.report.staged;
+  if (!staged) return [];
+  if (staged.logistics === "legacy") return legacyStagedMarkdown(staged);
+  return [
+    "### Staged lanes",
+    "",
+    policyText(staged.policy),
+    "",
+    `${staged.plan.join(" → ")}. ${fmt(staged.pool)} candidate cells; ${fmt(staged.validatedFinal)} validated by the final stage; ${fmt(staged.chosen)} chosen (up to ${staged.perSymbol} per market). ${fmt(staged.bookedCloses)} booked closes; ${fmt(staged.shadows)} blocked entries tracked as shadows (shadow PF ${fmt(staged.shadowPf)}).`,
+    "",
+    markdownTable(
+      ["Stage", "Input cells", "Validated", "Vetoed", "Retained", "Median PF in", "Median PF out", "Relation out/in"],
+      staged.stages.map((stage) => [stage.name, stage.input, stage.validated, stage.vetoed, pct(stage.retained), stage.medianPfIn, stage.medianPfOut, stage.relation]),
+    ),
+    "",
+    markdownTable(
+      ["Stage", "Lane", "Window", "Mode", "Floor (before cost and auto PF)", "Evidence", "Confirmed", "Vetoed", "Net positive", "Median PF"],
+      staged.stages.flatMap((stage) => stage.lanes.map((lane) => [stage.name, lane.id, lane.window, lane.mode, lane.floor, lane.evidence, lane.confirmed, lane.vetoed, lane.netPositive, lane.medianPf])),
+    ),
+    "",
+    markdownTable(
+      ["Cell", "Closes prehistory", "PF prehistory", "Closes holdout", "PF holdout", "Net holdout", "Shadow entries", "Shadow PF"],
+      staged.cells.map((cell) => [cell.name, cell.closesPre, cell.pfPre, cell.closesHoldout, cell.pfHoldout, cell.netHoldout, cell.shadows, cell.shadowPf]),
+    ),
+    "",
+  ];
+}
+
+
+export function renderMarkdown(runs: ReplayRun[], periodHours = 4): string {
+  const sections = runs.map((run) => {
+    const holdoutStart = run.end - run.hours * HOUR_MS;
+    const holdout = periodRows(run.report.bookLive, periodHours, holdoutStart);
+    const prehistory = periodRows(run.report.bookPre, periodHours, holdoutStart - run.preHours * HOUR_MS);
+    const base = run.variants[0]!;
+    const coverage = coverageDetail(run);
+    const selected = run.report.selected.map((item) => [
+      item.name, item.indication, item.range, `${fmt(run.costs[item.symbol]! * 100)}%`,
+      item.pre.samples, pf(item.pre.grossProfit, item.pre.grossLoss), item.requiredPf,
+      item.replay.samples, pf(item.replay.grossProfit, item.replay.grossLoss),
+      item.replay.net, item.replay.drawdown, item.replay.green,
+    ]);
+    return [
+      `## ${run.connection} · ${run.interval} · ${profileName(run)} · ${iso(run.end)}`,
+      "",
+      `- Source: ${run.origin}`,
+      `- Symbols with complete coverage: ${run.report.symbols} of ${run.requested}`,
+      `- Holdout: ${run.hours}h starting ${iso(run.end - run.hours * HOUR_MS)}; prehistory: ${run.preHours}h starting ${iso(run.end - (run.hours + run.preHours) * HOUR_MS)}`,
+      `- Holdout result: ${fmt(base.replay.net)} net, ${base.replay.samples} closes, PF ${pf(base.replay.grossProfit, base.replay.grossLoss)}, ${base.replay.green} of ${run.report.bookLive.length} periods positive, drawdown ${fmt(base.replay.drawdown)}`,
+      `- Configurations scored: ${fmt(run.report.evaluatedConfigs)}; failed preselection: ${fmt(run.report.rejectedPf)}; excluded by calibration: ${run.report.disabledConfigs}`,
+      `- Strategy actions: ${STRATEGY_TYPES.map((kind) => `${STRATEGY_LABELS[kind]} ${run.report.strategyActions[kind]}`).join(", ")}`,
+      `- Slippage: ${run.slipBps} bp per fill; costs and fee fallbacks: ${run.feesEstimated.length ? run.feesEstimated.join(", ") : "none"}`,
+      `- Capture and cost SHA-256: ${run.evidence}`,
+      "",
+      `### Holdout by ${periodHours}-hour period (UTC, from ${iso(holdoutStart)})`,
+      "",
+      markdownTable(PERIOD_HEAD, holdout.map(periodCells)),
+      "",
+      `### Prehistory by ${periodHours}-hour period (UTC, from ${iso(holdoutStart - run.preHours * HOUR_MS)})`,
+      "",
+      markdownTable(PERIOD_HEAD, prehistory.map(periodCells)),
+      "",
+      ...stagedMarkdown(run),
+      "### Indication and range coverage",
+      "",
+      markdownTable(
+        COVERAGE_HEAD,
+        coverage.map(({ row, closes, gp, gl, net, status }) => [
+          row.indication, row.range, row.configs, row.excluded, row.withCloses,
+          row.reachedSamples, row.reachedSamples ? row.bestPf : "—", row.passed, row.selected,
+          row.signalsPre, row.signalsReplay,
+          closes, pf(gp, gl), net, status,
+        ]),
+      ),
+      "",
+      "### Selections by symbol",
+      "",
+      markdownTable(
+        ["Symbol and configuration", "Indication", "Range", "Costs", "Prehistory closes",
+          "Prehistory PF", "Required PF", "Holdout closes", "Holdout PF", "Holdout net",
+          "Holdout drawdown", "Positive periods"],
+        selected,
+      ),
+      "",
+    ].join("\n");
+  });
+  return ["# CTS-H replay · period report", "", ...sections].join("\n");
+}
+
+export function renderReplay(runs: ReplayRun[], introduction = "", periodHours = 4): string {
   const comparisons = runs
     .filter((run) => run.profile !== "baseline")
     .flatMap((after) => {
@@ -383,6 +621,14 @@ export function renderReplay(runs: ReplayRun[], introduction = ""): string {
       ${run.feesEstimated.length ? `<p>Fee fallback applied to ${esc(run.feesEstimated.join(", "))}.</p>` : ""}
       <h3>Holdout P&amp;L</h3><div class="chart" role="img" aria-label="Net profit and loss per reporting period">${bars}</div>
       ${table(["UTC period", "Closes", "Wins", "Losses", "Realized", "MTM change", "Net", "Trade PF", "Open"], hourly)}
+      <h3>Holdout by ${periodHours}-hour period (UTC, from the window start)</h3>
+      ${periodTable(periodRows(raw.bookLive, periodHours, run.end - run.hours * HOUR_MS))}
+      <h3>Prehistory by ${periodHours}-hour period (UTC, from the window start)</h3>
+      ${periodTable(periodRows(raw.bookPre, periodHours, run.end - (run.hours + run.preHours) * HOUR_MS))}
+      ${stagedHtml(run)}
+      <h3>Indication and range coverage</h3>
+      <p>Every indication and range is evaluated on each symbol. A cell without a selection shows the gate that stopped it.</p>
+      ${coverageTable(run)}
       ${independent ? `<h3>Independent indications</h3><p>Each indication selects its own qualifying configuration per market and period. These portfolios overlap and are not additive.</p>${table(["Indication", "Selections", "Closes", "PF", "Net", "Drawdown", "Positive hours"], independent)}` : ""}
       <h3>Selections by period</h3>
       ${table(["Symbol and configuration", "Costs", "Pre closes", "Pre PF", "Required PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD"], selected)}

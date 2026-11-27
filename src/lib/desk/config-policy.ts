@@ -4,7 +4,7 @@ import type { ConnectionId } from "./connections.ts";
 import type { Coordination } from "./management.ts";
 import type { Indication } from "./constants.ts";
 
-export type ReplayProfile = "baseline" | "filtered" | "coordinated";
+export type ReplayProfile = "baseline" | "filtered" | "coordinated" | "staged";
 export type CalibratedConnection = "bingx-x01" | "bingx-x02";
 
 export function configurationKey(

@@ -64,6 +64,62 @@ Use `--history-hours 1000` for a continuous capture that supports earlier cutoff
 
 The CLI and web desk accept 1m, 5m, 15m, 30m, 1h and 4h candles. Settings are retained independently per connection and interval, and open paper positions retain their original interval and hold limit. The engine warms indicators on 22 contiguous candles and selects one configuration per market using the pre window. Holdout entries use the next open, ambiguous stops and targets settle at the stop, and open positions close at the boundary. Coordinated intraday holds are configured in minutes; other cases use 24 candles. Profitable periods use hourly equity on intervals up to 1h and four-hour equity on 4h candles. Drawdown uses candle equity. The CLI models the venue taker fee and configurable `--slip-bps` per fill. The browser uses a fixed 0.12% round-trip cost. Funding payments, depth-limited execution and liquidation are outside the model.
 
+### Staged lanes
+
+`--profile staged` evaluates each candidate cell (market × configuration) on its own position history. Each lane (relation) looks at the last N closed positions of that cell. Stages recurse: Base, then Main, then thinner stages. Each stage evaluates only the cells validated before it.
+
+- **PF is net of round-trip costs.** PF 1.00 is neutral, including a window with no trades.
+- **Cost floor.** Each lane needs PF ≥ max(its floor, 1 + costMultiple × costs / gross loss). With the default costMultiple of 1.0, a PF of 1.1 equals one round trip of costs whenever costs are 10% of gross loss. On the research windows the measured ratio is about 0.10.
+- **Per-relation floors.** Each lane has its own tuned floor (defaults in `TUNED_LANE_MIN_PF`). Lanes without one use `minPf` (1.00).
+- **Auto PF and net.** Short evidence faces the engine's auto PF term. Lanes and whole-history validation need positive net.
+- **Evidence floor:** a lane gives evidence only once the cell has at least 4 closes. Thin stages raise every floor by 0.05 each.
+- **Validation:** no lane vetoes and at least one lane confirms. A cell's full history must also be net positive.
+- **Holdout:** the top `--per-symbol` validated cells per market (default 1, ranked by net P&L) trade. The final stage's lanes gate every entry. A blocked entry becomes a shadow position: tracked so the lanes can recover, but not booked.
+
+Settings: `--min-pf`, `--auto-penalty`, `--require-net on|off`, and `--lane-settings file.json` for the per-relation floors, cost multiple and ratchet. [reports/staged-lanes-policy](reports/staged-lanes-policy/README.md) has the tuning trace, the floors and the validation outputs. The design is in [docs/staged-lanes.md](docs/staged-lanes.md).
+
+The result is a limit on losses, not a profit. Against the coordinated engine on the same windows, the staged profile loses far less and draws down less, but it is not net positive in any validation window and does not reach PF 1 with confidence. It is not a recommended profile.
+
+```sh
+node scripts/cts-h.ts replay --connection bingx-x01 --symbols <markets> \
+  --hours 240 --pre-hours 72 --history-hours 1440 --interval 1h --profile staged \
+  --per-symbol 1 --thins 2 --min-closes 6 --lane-settings reports/staged-lanes-policy/tuned-floors.json \
+  --html staged.html --markdown staged.md
+```
+
+### Period reports and coverage
+
+`--html` writes the full report. `--markdown` writes the same results as text, and `--period-hours` (default 4) sets the period length. Periods start at the beginning of each window, so a 120-hour holdout with 4-hour periods has exactly 30 full lines, and the 72-hour prehistory has 18. Each run also includes a coverage table with one row per indication and range. The table shows how many configurations were evaluated, how many reached the closes minimum, how many passed the gates, which symbols selected them, and the signal counts in each window. The status column explains each empty row. Low-frequency indications can clear every gate with a longer prehistory, so a short window can leave them with no qualifying configuration even when their signals are sound.
+
+The replay evaluates only the selected configuration for each market in the holdout. Candidate configurations are still scored in the prehistory. Portfolio results match the full candidate replay, and the run is much faster. `--selected-only` is accepted for compatibility and no longer changes the output.
+
+The command below reproduces the five-day, 30-market run. The bingx-x01 candles are captured and written to the same folder as the report.
+
+```sh
+node scripts/cts-h.ts replay --connection bingx-x01 \
+  --symbols BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,AVAX-USDT,LINK-USDT,BNB-USDT,ARB-USDT,SUI-USDT,BCH-USDT,LTC-USDT,ADA-USDT,HBAR-USDT,DOT-USDT,NEAR-USDT,AAVE-USDT,UNI-USDT,ATOM-USDT,FIL-USDT,INJ-USDT,OP-USDT,ETC-USDT,APT-USDT,SEI-USDT,WLD-USDT,ALGO-USDT,XLM-USDT,TRX-USDT,FET-USDT \
+  --hours 120 --pre-hours 72 --interval 1h --profile coordinated \
+  --indication all --strategies axis,block,dca,relate \
+  --capture reports/coordinated-5d-3d-30-markets-1h/capture.json \
+  --html reports/coordinated-5d-3d-30-markets-1h/cts-h-replay.html \
+  --markdown reports/coordinated-5d-3d-30-markets-1h/cts-h-replay.md
+```
+
+Use `npm run --silent desk -- replay …` when you need JSON on stdout, because `npm run` otherwise prints its own header.
+
+### Walk-forward research
+
+`scripts/cts-h-research.ts` runs an indication-by-range sweep and a trade-level loss analysis on four research windows, and reports a fifth window as the test. `scripts/cts-h-fixed.ts` replays one bracket on every market without prehistory selection. Results, the BTC relation experiment and the conclusions are in [reports/research-1h-60d-30-markets](reports/research-1h-60d-30-markets/README.md).
+
+Indications added in this round are `donchian`, `supertrend`, `vwapReclaim`, `adxDi` and `stochRsi`. Coordinated replays can also use longer 2.5–4 ATR targets with `"extendedTargets": true` in a `--strategy-settings` file. Signals are causal: a test checks that truncating later bars never changes an earlier signal.
+
+```sh
+node scripts/cts-h.ts replay --connection bingx-x01 --symbols <30 markets> \
+  --history-hours 1440 --hours 120 --pre-hours 72 --interval 1h --capture capture-1440.json
+node scripts/cts-h-research.ts capture-1440.json <outDir>
+node scripts/cts-h-fixed.ts capture-1440.json
+```
+
 ### Configuration selection
 
 The default **coordinated** profile qualifies each enabled indication, bracket and stop mode independently. It ranks eligible candidates by profitable periods and uses realized P&L to break ties. It adds EMA pullback and range fade. The **filtered** profile adds 0.8–2.0 ATR targets with 0.5–1.5× stop-to-target ratios to the execution-eligible short grid. The **baseline** preserves the original grid. Filtered and coordinated sizing cap modeled stop risk plus costs at 0.8% of planned position notional. Coordinated sizing reduces entry size after two consecutive losses.

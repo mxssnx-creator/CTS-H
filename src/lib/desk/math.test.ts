@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { allShortCombos, clampAxisPartial, clampBlockVol, closePnl, liveShortOk, profitFactor, sanitizeBlockCounts } from "./math.ts";
 
+test("profit factor is neutral at 1.0 when gross profit and loss are both zero", () => {
+  assert.equal(profitFactor(0, 0), 1);
+  assert.equal(profitFactor(2, 2), 1);
+  assert.equal(profitFactor(0, 3), 0);
+});
+
 test("126 short combos", () => {
   assert.equal(allShortCombos().length, 126);
 });

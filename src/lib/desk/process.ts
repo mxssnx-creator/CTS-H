@@ -1,4 +1,6 @@
 import {
+  EXTENDED_SL_OF_TP,
+  EXTENDED_TP_ATR,
   INDICATIONS,
   LEGACY_INDICATIONS,
   NEW_INDICATIONS,
@@ -17,6 +19,7 @@ import {
   type Indication,
 } from "./constants.ts";
 import { configurationKey, excludedConfigurations, type ReplayProfile } from "./config-policy.ts";
+import type { StagedSummary } from "./lanes.ts";
 import type { ConnectionId } from "./connections.ts";
 import { saneBars } from "./heal.ts";
 import { CANDLE_INTERVALS, HOUR_MS as REPLAY_HOUR, type CandleInterval } from "./intervals.ts";
@@ -30,6 +33,7 @@ import {
   liveShortOk,
   pfFromPnls,
   positionNotional,
+  positionRtCost,
   profitFactor,
   stopCappedQty,
 } from "./math.ts";
@@ -162,6 +166,28 @@ export type Series = {
   mid: number[];
   sd: number[];
   vol: number[];
+  adx: number[];
+  pdi: number[];
+  mdi: number[];
+  st: Array<Side | 0>;
+  stoch: number[];
+  vwap: number[];
+  psarDir: Array<Side | 0>;
+  mfi: number[];
+  ema20: number[];
+};
+
+export type TradeLeg = {
+  t: number;
+  side: Side;
+  entry: number;
+  exit: number;
+  // Net P&L after round-trip costs; PF 1.0 means net zero.
+  pnl: number;
+  // Round-trip cost in settlement units, already included in pnl.
+  cost: number;
+  reason: "tp" | "sl" | "time" | "end";
+  hold: number;
 };
 
 const PF_NO_LOSS_NEAR = 3.999;
@@ -209,6 +235,14 @@ const COORDINATED_CONFIGS = [
   COORDINATIONS.map((mode) => settings(indication, tpAtr, slOfTp, true, mode)),
 );
 
+const EXTENDED_COORDINATED_CONFIGS = ([...LEGACY_INDICATIONS, ...NEW_INDICATIONS] as Indication[]).flatMap((indication) =>
+  EXTENDED_TP_ATR.flatMap((tpAtr) =>
+    EXTENDED_SL_OF_TP.flatMap((slOfTp) =>
+      COORDINATIONS.map((mode) => settings(indication, tpAtr, slOfTp, true, mode)),
+    ),
+  ),
+);
+
 const MICRO_EXTRA_CONFIGS = INDICATIONS.flatMap((indication) =>
   [2.5, 3, 4, 6].flatMap((tpAtr) =>
     WIDE_SL_OF_TP.flatMap((slOfTp) =>
@@ -217,11 +251,12 @@ const MICRO_EXTRA_CONFIGS = INDICATIONS.flatMap((indication) =>
   ),
 );
 
-function coordinatedConfigs(trailing: boolean, preferences?: StrategySettings, step = REPLAY_HOUR) {
-  const candidates =
+export function coordinatedConfigs(trailing: boolean, preferences?: StrategySettings, step = REPLAY_HOUR) {
+  const base =
     step <= 15 * 60_000 && preferences?.microExtended
       ? [...COORDINATED_CONFIGS, ...MICRO_EXTRA_CONFIGS]
       : COORDINATED_CONFIGS;
+  const candidates = preferences?.extendedTargets ? [...base, ...EXTENDED_COORDINATED_CONFIGS] : base;
   if (
     trailing &&
     (!preferences ||
@@ -322,15 +357,186 @@ function bbSeries(bars: Bar[], n = 20): { mid: number[]; sd: number[] } {
   return { mid, sd };
 }
 
+// Wilder ADX with +DI and -DI, causal: each value uses only bars up to its index.
+function adxSeries(bars: Bar[], n = 14) {
+  const len = bars.length;
+  const adx = new Array<number>(len).fill(0);
+  const pdi = new Array<number>(len).fill(0);
+  const mdi = new Array<number>(len).fill(0);
+  let sPlus = 0;
+  let sMinus = 0;
+  let sTr = 0;
+  let dxAvg = 0;
+  for (let i = 1; i < len; i++) {
+    const b = bars[i]!;
+    const p = bars[i - 1]!;
+    const up = b.h - p.h;
+    const down = p.l - b.l;
+    const plus = up > down && up > 0 ? up : 0;
+    const minus = down > up && down > 0 ? down : 0;
+    const tr = Math.max(b.h - b.l, Math.abs(b.h - p.c), Math.abs(b.l - p.c));
+    if (i <= n) {
+      sPlus += plus;
+      sMinus += minus;
+      sTr += tr;
+      if (i < n) continue;
+    } else {
+      sPlus = sPlus - sPlus / n + plus;
+      sMinus = sMinus - sMinus / n + minus;
+      sTr = sTr - sTr / n + tr;
+    }
+    const plusDi = sTr > 0 ? (100 * sPlus) / sTr : 0;
+    const minusDi = sTr > 0 ? (100 * sMinus) / sTr : 0;
+    const sum = plusDi + minusDi;
+    const dx = sum > 0 ? (100 * Math.abs(plusDi - minusDi)) / sum : 0;
+    dxAvg = i === n ? dx : (dxAvg * (n - 1) + dx) / n;
+    pdi[i] = plusDi;
+    mdi[i] = minusDi;
+    adx[i] = dxAvg;
+  }
+  return { adx, pdi, mdi };
+}
+
+// Supertrend direction (1 up, -1 down) using ATR bands; causal.
+function supertrendSeries(bars: Bar[], atr: number[], mult = 3): Array<Side | 0> {
+  const out = new Array<Side | 0>(bars.length).fill(0);
+  let upper = 0;
+  let lower = 0;
+  let dir: Side = 1;
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i]!;
+    const hl2 = (b.h + b.l) / 2;
+    const basicUpper = hl2 + mult * (atr[i] ?? 0);
+    const basicLower = hl2 - mult * (atr[i] ?? 0);
+    if (i === 0) {
+      upper = basicUpper;
+      lower = basicLower;
+    } else {
+      const prevClose = bars[i - 1]!.c;
+      upper = basicUpper < upper || prevClose > upper ? basicUpper : upper;
+      lower = basicLower > lower || prevClose < lower ? basicLower : lower;
+      if (dir === 1 && b.c < lower) dir = -1;
+      else if (dir === -1 && b.c > upper) dir = 1;
+    }
+    out[i] = dir;
+  }
+  return out;
+}
+
+// Rolling VWAP over the trailing n bars using typical price and volume.
+function vwapSeries(bars: Bar[], n = 24): number[] {
+  const out = new Array<number>(bars.length).fill(0);
+  for (let i = 0; i < bars.length; i++) {
+    let pv = 0;
+    let v = 0;
+    for (let k = Math.max(0, i - n + 1); k <= i; k++) {
+      const b = bars[k]!;
+      const volume = b.v > 0 ? b.v : 0;
+      pv += ((b.h + b.l + b.c) / 3) * volume;
+      v += volume;
+    }
+    out[i] = v > 0 ? pv / v : bars[i]!.c;
+  }
+  return out;
+}
+
+// Stochastic of RSI over the trailing n RSI values, scaled 0 to 100.
+function stochRsiSeries(rsi: number[], n = 14): number[] {
+  const out = new Array<number>(rsi.length).fill(50);
+  for (let i = 0; i < rsi.length; i++) {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let k = Math.max(0, i - n + 1); k <= i; k++) {
+      lo = Math.min(lo, rsi[k]!);
+      hi = Math.max(hi, rsi[k]!);
+    }
+    out[i] = hi - lo > 1e-9 ? (100 * (rsi[i]! - lo)) / (hi - lo) : 50;
+  }
+  return out;
+}
+
+// Parabolic SAR, Wilder's standard form (step 0.02, cap 0.2). Returns the trend after each bar: +1 up, -1 down.
+function psarSeries(bars: Bar[]): Array<Side | 0> {
+  const out = new Array<Side | 0>(bars.length).fill(0);
+  if (bars.length < 2) return out;
+  const step = 0.02;
+  const cap = 0.2;
+  let up = bars[1]!.c >= bars[0]!.c;
+  let af = step;
+  let ep = up ? bars[0]!.h : bars[0]!.l;
+  let sar = up ? bars[0]!.l : bars[0]!.h;
+  out[0] = up ? 1 : -1;
+  for (let i = 1; i < bars.length; i++) {
+    const b = bars[i]!;
+    const prev = bars[i - 1]!;
+    const prev2 = bars[i - 2] ?? prev;
+    sar = sar + af * (ep - sar);
+    if (up) {
+      sar = Math.min(sar, prev.l, prev2.l);
+      if (b.l < sar) {
+        up = false;
+        sar = ep;
+        ep = b.l;
+        af = step;
+      } else if (b.h > ep) {
+        ep = b.h;
+        af = Math.min(af + step, cap);
+      }
+    } else {
+      sar = Math.max(sar, prev.h, prev2.h);
+      if (b.h > sar) {
+        up = true;
+        sar = ep;
+        ep = b.h;
+        af = step;
+      } else if (b.l < ep) {
+        ep = b.l;
+        af = Math.min(af + step, cap);
+      }
+    }
+    out[i] = up ? 1 : -1;
+  }
+  return out;
+}
+
+// Money flow index over `n` bars: volume-weighted typical price, positive against negative flow.
+function mfiSeries(bars: Bar[], n = 14): number[] {
+  const out = new Array<number>(bars.length).fill(50);
+  const typical = bars.map((b) => (b.h + b.l + b.c) / 3);
+  for (let i = n; i < bars.length; i++) {
+    let pos = 0;
+    let neg = 0;
+    for (let k = i - n + 1; k <= i; k++) {
+      const flow = typical[k]! * bars[k]!.v;
+      if (typical[k]! > typical[k - 1]!) pos += flow;
+      else if (typical[k]! < typical[k - 1]!) neg += flow;
+    }
+    out[i] = pos + neg > 0 ? (100 * pos) / (pos + neg) : 50;
+  }
+  return out;
+}
+
 export function buildSeries(bars: Bar[]): Series {
   const { mid, sd } = bbSeries(bars);
+  const atr = atrSeries(bars);
+  const rsi = rsiSeries(bars);
+  const { adx, pdi, mdi } = adxSeries(bars);
   return {
-    atr: atrSeries(bars),
+    adx,
+    pdi,
+    mdi,
+    st: supertrendSeries(bars, atrSeries(bars, 10)),
+    stoch: stochRsiSeries(rsi),
+    vwap: vwapSeries(bars),
+    psarDir: psarSeries(bars),
+    mfi: mfiSeries(bars),
+    ema20: emaSeries(bars, 20),
+    atr,
     ema9: emaSeries(bars, 9),
     ema12: emaSeries(bars, 12),
     ema21: emaSeries(bars, 21),
     ema26: emaSeries(bars, 26),
-    rsi: rsiSeries(bars),
+    rsi,
     mid,
     sd,
     vol: emaSeries(
@@ -354,6 +560,59 @@ export function signalAt(ind: Indication, bars: Bar[], s: Series, i: number): Si
   const a = Math.max(s.atr[i] ?? 0, b.c * 0.0004);
   const impulse = (b.c - b.o) / a;
   switch (ind) {
+    case "psar": {
+      // A flip of the SAR trend fires on the bar that flips it.
+      const prev = s.psarDir[i - 1] ?? 0;
+      const cur = s.psarDir[i] ?? 0;
+      if (cur === 1 && prev === -1) return 1;
+      if (cur === -1 && prev === 1) return -1;
+      return 0;
+    }
+    case "keltnerBreak": {
+      // The first close beyond the 2 ATR band around EMA 20 (the band is also used by the trend-following sets).
+      const upper = s.ema20[i]! + 2 * s.atr[i]!;
+      const lower = s.ema20[i]! - 2 * s.atr[i]!;
+      const priorUpper = s.ema20[i - 1]! + 2 * s.atr[i - 1]!;
+      const priorLower = s.ema20[i - 1]! - 2 * s.atr[i - 1]!;
+      if (b.c > upper && bars[i - 1]!.c <= priorUpper) return 1;
+      if (b.c < lower && bars[i - 1]!.c >= priorLower) return -1;
+      return 0;
+    }
+    case "engulf": {
+      // The body of this bar covers the prior bar's body and opposes it.
+      const p = bars[i - 1]!;
+      const bull = b.c > b.o && p.c < p.o && b.o <= p.c && b.c >= p.o;
+      const bear = b.c < b.o && p.c > p.o && b.o >= p.c && b.c <= p.o;
+      return bull ? 1 : bear ? -1 : 0;
+    }
+    case "pinBar": {
+      // A long lower wick at least twice the body and 60% of the range is a rejection of lows (and the mirror for highs).
+      const range = b.h - b.l;
+      if (range <= 0) return 0;
+      const body = Math.abs(b.c - b.o);
+      const lower = Math.min(b.o, b.c) - b.l;
+      const upper = b.h - Math.max(b.o, b.c);
+      if (lower >= 2 * body && lower >= 0.6 * range) return 1;
+      if (upper >= 2 * body && upper >= 0.6 * range) return -1;
+      return 0;
+    }
+    case "ibsRevert": {
+      // Internal bar strength: a close in the bottom fifth of its range reverts up, a close in the top fifth reverts down.
+      const range = b.h - b.l;
+      if (range <= 0) return 0;
+      const ibs = (b.c - b.l) / range;
+      if (ibs <= 0.2) return 1;
+      if (ibs >= 0.8) return -1;
+      return 0;
+    }
+    case "mfiReversal": {
+      // The money flow index leaves an extreme zone: up through 20, or down through 80.
+      const cur = s.mfi[i]!;
+      const prev = s.mfi[i - 1]!;
+      if (prev <= 20 && cur > 20) return 1;
+      if (prev >= 80 && cur < 80) return -1;
+      return 0;
+    }
     case "volumeBreak":
     case "squeezeBreak": {
       let high = -Infinity;
@@ -384,6 +643,49 @@ export function signalAt(ind: Indication, bars: Bar[], s: Series, i: number): Si
           impulse > 0.12 && s.rsi[i]! > 50 && s.rsi[i]! < 75) return 1;
       if (trend < -0.12 * a && fast < previous && b.h >= fast && b.c < fast &&
           impulse < -0.12 && s.rsi[i]! < 50 && s.rsi[i]! > 25) return -1;
+      return 0;
+    }
+    case "donchian": {
+      // Breakout of the prior 20-bar range while ADX shows a trend; fires on the first close outside the range.
+      const [hi, lo] = priorRange(bars, i, 20);
+      const [prevHi, prevLo] = priorRange(bars, i - 1, 20);
+      if (s.adx[i]! < 18) return 0;
+      if (b.c > hi && bars[i - 1]!.c <= prevHi) return 1;
+      if (b.c < lo && bars[i - 1]!.c >= prevLo) return -1;
+      return 0;
+    }
+    case "supertrend": {
+      const now = s.st[i];
+      const prev = s.st[i - 1];
+      if (now === 1 && prev === -1) return 1;
+      if (now === -1 && prev === 1) return -1;
+      return 0;
+    }
+    case "vwapReclaim": {
+      // Close crosses the rolling VWAP while Stochastic RSI turns in the same direction.
+      const prev = bars[i - 1]!;
+      const vwap = s.vwap[i]!;
+      const vwapPrev = s.vwap[i - 1]!;
+      const k = s.stoch[i]!;
+      const kPrev = s.stoch[i - 1]!;
+      if (prev.c <= vwapPrev && b.c > vwap && k > 20 && k > kPrev) return 1;
+      if (prev.c >= vwapPrev && b.c < vwap && k < 80 && k < kPrev) return -1;
+      return 0;
+    }
+    case "adxDi": {
+      // Directional line cross, accepted only when ADX confirms a trend.
+      if (s.adx[i]! < 20) return 0;
+      const now = s.pdi[i]! - s.mdi[i]!;
+      const prior = s.pdi[i - 1]! - s.mdi[i - 1]!;
+      if (prior <= 0 && now > 0) return 1;
+      if (prior >= 0 && now < 0) return -1;
+      return 0;
+    }
+    case "stochRsi": {
+      const k = s.stoch[i]!;
+      const kPrev = s.stoch[i - 1]!;
+      if (kPrev < 20 && k >= 20) return 1;
+      if (kPrev > 80 && k <= 80) return -1;
       return 0;
     }
     case "rsiRecovery": {
@@ -487,6 +789,16 @@ export function signalAt(ind: Indication, bars: Bar[], s: Series, i: number): Si
   }
 }
 
+function priorRange(bars: Bar[], i: number, n: number): [number, number] {
+  let hi = -Infinity;
+  let lo = Infinity;
+  for (let k = Math.max(0, i - n); k < i; k++) {
+    hi = Math.max(hi, bars[k]!.h);
+    lo = Math.min(lo, bars[k]!.l);
+  }
+  return [hi, lo];
+}
+
 export type IndicationRow = {
   name: Indication;
   side: Side | 0;
@@ -529,6 +841,16 @@ export function indicationBoard(bars: Bar[]): IndicationRow[] {
                       ? `EMA9 / EMA21 ${(series.ema9[i]! / series.ema21[i]!).toFixed(3)}`
                       : name === "rangeFade"
                         ? `Band deviation ${z.toFixed(2)} · RSI ${series.rsi[i]!.toFixed(1)}`
+                        : name === "donchian"
+                          ? `ADX ${series.adx[i]!.toFixed(1)} · 20-bar range`
+                        : name === "supertrend"
+                          ? `Supertrend ${series.st[i] === 1 ? "up" : "down"}`
+                        : name === "vwapReclaim"
+                          ? `Close vs VWAP ${((b.c / (series.vwap[i] || b.c) - 1) * 100).toFixed(3)}% · StochRSI ${series.stoch[i]!.toFixed(1)}`
+                        : name === "adxDi"
+                          ? `ADX ${series.adx[i]!.toFixed(1)} · +DI ${series.pdi[i]!.toFixed(1)} / -DI ${series.mdi[i]!.toFixed(1)}`
+                        : name === "stochRsi"
+                          ? `StochRSI ${series.stoch[i]!.toFixed(1)}`
                         : name === "volumeBreak" || name === "squeezeBreak"
                           ? `Volume ${b.v.toFixed(2)} · range and volatility filter`
                           : name === "momentumPullback" || name === "rsiRecovery"
@@ -545,7 +867,7 @@ export function lastClosedBar(bars: Bar[]): Bar | undefined {
     : last;
 }
 
-function closedBars(bars: Bar[]): Bar[] {
+export function closedBars(bars: Bar[]): Bar[] {
   return lastClosedBar(bars) === bars.at(-1) ? bars : bars.slice(0, -1);
 }
 
@@ -570,20 +892,26 @@ function pushPnl(cell: Cell, pnl: number) {
     cell.wins += 1;
     cell.gw += pnl;
   } else cell.gl += Math.abs(pnl);
-  cell.pf = cell.gl < 1e-12 ? (cell.gw > 1e-12 ? 4 : 0) : cell.gw / cell.gl;
+  cell.pf = profitFactor(cell.gw, cell.gl);
 }
 
-export function gateCell(cell: Cell, floors: Floors, settings?: PfSettings) {
-  const recent = Math.max(0, cell.lastN.length - LASTN.valid);
-  const suspension = Math.max(0, cell.lastN.length - LASTN.disable);
+// The legacy per-cell gate, used by the coordinated engine and by staged runs with stage progression off. A cell is
+// valid when its last N closes clear the auto PF requirement with non-negative net, it follows through after a
+// suspension, and once it has six or more closes its lifetime record is proven.
+export type GateState = { lastN: readonly number[]; n: number; net: number; pf: number; liveFloor: boolean };
+export type GateResult = { validExec: boolean; disabled: boolean; requiredRecentPf: number };
+
+export function gateState(state: GateState, floors: Floors, settings?: PfSettings): GateResult {
+  const recent = Math.max(0, state.lastN.length - LASTN.valid);
+  const suspension = Math.max(0, state.lastN.length - LASTN.disable);
   let gains = 0;
   let losses = 0;
   let net = 0;
   let suspensionNet = 0;
   let recentGains = 0;
   let recentLosses = 0;
-  for (let i = recent; i < cell.lastN.length; i++) {
-    const pnl = cell.lastN[i]!;
+  for (let i = recent; i < state.lastN.length; i++) {
+    const pnl = state.lastN[i]!;
     net += pnl;
     if (pnl > 0) gains += pnl;
     else if (pnl < 0) losses -= pnl;
@@ -593,26 +921,45 @@ export function gateCell(cell: Cell, floors: Floors, settings?: PfSettings) {
       else if (pnl < 0) recentLosses -= pnl;
     }
   }
-  const samples = cell.lastN.length - recent;
+  const samples = state.lastN.length - recent;
   const required = settings?.autoPf ? settings.autoPfSamples : LASTN.minSamples;
   const recentFloor = requiredPf(floors.short, samples, settings);
-  cell.requiredRecentPf = recentFloor;
   const pass = samples >= required && profitFactor(gains, losses) >= recentFloor && net >= 0;
-  const lifetimeFloor = requiredPf(Math.max(floors.base, floors.overall), cell.n, settings);
+  const lifetimeFloor = requiredPf(Math.max(floors.base, floors.overall), state.n, settings);
   const proven =
-    cell.n >= 6 &&
-    cell.pf >= lifetimeFloor &&
-    cell.net > 0 &&
-    !(cell.pf >= PF_NO_LOSS_NEAR && cell.net <= 1e-6);
+    state.n >= 6 &&
+    state.pf >= lifetimeFloor &&
+    state.net > 0 &&
+    !(state.pf >= PF_NO_LOSS_NEAR && state.net <= 1e-6);
   const followThrough =
     !settings?.autoPf ||
     !settings.autoPfRecent ||
-    cell.lastN.length - suspension < Math.max(3, Math.ceil(required / 2)) ||
-    (suspensionNet > 0 &&
-      profitFactor(recentGains, recentLosses) >= Math.max(floors.base, floors.short, 1));
-  cell.validExec = cell.liveFloor && pass && followThrough && (cell.n < 6 || proven);
-  cell.disabled =
-    !cell.validExec && cell.lastN.length - suspension >= LASTN.minSamples && suspensionNet < 0;
+    state.lastN.length - suspension < Math.max(3, Math.ceil(required / 2)) ||
+    (suspensionNet > 0 && profitFactor(recentGains, recentLosses) >= Math.max(floors.base, floors.short, 1));
+  const validExec = state.liveFloor && pass && followThrough && (state.n < 6 || proven);
+  const disabled = !validExec && state.lastN.length - suspension >= LASTN.minSamples && suspensionNet < 0;
+  return { validExec, disabled, requiredRecentPf: recentFloor };
+}
+
+export function gateCell(cell: Cell, floors: Floors, settings?: PfSettings) {
+  const result = gateState(cell, floors, settings);
+  cell.requiredRecentPf = result.requiredRecentPf;
+  cell.validExec = result.validExec;
+  cell.disabled = result.disabled;
+}
+
+// Gate state of a cell built from its closes alone, in the order they closed. The same statistics pushPnl keeps on a cell.
+export function gateStateOf(pnls: readonly number[], liveFloor = true): GateState {
+  let net = 0;
+  let gw = 0;
+  let gl = 0;
+  for (const pnl of pnls) {
+    net += pnl;
+    if (pnl >= 0) gw += pnl;
+    else gl += Math.abs(pnl);
+  }
+  const pf = profitFactor(gw, gl);
+  return { lastN: pnls.slice(-LASTN.eval), n: pnls.length, net, pf, liveFloor };
 }
 
 function blankCell(
@@ -1185,7 +1532,7 @@ export type HourPoint = {
   openLegs: number;
 };
 
-type HourAcc = Omit<HourPoint, "net" | "pf">;
+export type HourAcc = Omit<HourPoint, "net" | "pf">;
 type ReplayGate = { cell: Cell; floors: Floors; settings: StrategySettings };
 type EquityStats = { net: number; peak: number; trough: number; drawdown: number };
 type IndicationSummary = ReplaySummary & {
@@ -1195,7 +1542,11 @@ type IndicationSummary = ReplaySummary & {
 };
 
 type ReplaySummary = {
+  // Closed-trade net P&L after costs: the basis of the profit factor, so net equals grossProfit - grossLoss.
   net: number;
+  // Mark-to-market of positions still open at the end of the window; equity is net + openPnl.
+  openPnl: number;
+  equity: number;
   samples: number;
   wins: number;
   green: number;
@@ -1245,13 +1596,39 @@ export type SessionReport = {
   greenBookPre: number;
   greenBookLive: number;
   bookNames: string[];
+  coverage: CoverageRow[];
+  staged?: StagedSummary;
   selected: {
     name: string;
     symbol: string;
+    indication: Indication;
+    range: "short" | "wide";
     requiredPf: number;
     pre: ReplaySummary;
     replay: ReplaySummary;
   }[];
+};
+
+export type CoverageRow = {
+  indication: Indication;
+  range: "short" | "wide";
+  // Configurations of this indication and range considered for each symbol.
+  configs: number;
+  // Configurations skipped by the published calibration exclusions.
+  excluded: number;
+  // Configurations that closed at least one trade in the prehistory.
+  withCloses: number;
+  // Configurations with the minimum closes required for qualification.
+  reachedSamples: number;
+  // Configurations passing the PF, sample and follow-through gates.
+  passed: number;
+  // Highest prehistory PF among configurations that reached the closes minimum.
+  bestPf: number;
+  // Symbols whose selected configuration uses this indication and range.
+  selected: number;
+  // Raw indication signals on the closed candles of each window.
+  signalsPre: number;
+  signalsReplay: number;
 };
 
 export type ReplaySize = "base" | "block" | "axis" | "both";
@@ -1281,9 +1658,11 @@ export type ReplayOpts = {
   selectedOnly?: boolean;
   reselectHours?: number;
   independentIndications?: boolean;
+  // Replays one bracket on every market without prehistory selection; isolates the signal and exits.
+  fixed?: { indication: Indication; tpAtr: number; slOfTp: number; coordination?: Coordination };
 };
 
-function hourAccumulator(t: number): HourAcc {
+export function hourAccumulator(t: number): HourAcc {
   return {
     t,
     trades: 0,
@@ -1306,7 +1685,10 @@ function seal(rows: HourAcc[]): HourPoint[] {
 }
 
 export function summarizeReplay(rows: HourPoint[]): ReplaySummary {
+  // Net is closed-trade P&L after costs, so it agrees with grossProfit - grossLoss and with the profit factor.
+  // Drawdown and the green count follow equity, which also carries the marks of open positions.
   let net = 0;
+  let equity = 0;
   let grossProfit = 0;
   let grossLoss = 0;
   let samples = 0;
@@ -1315,17 +1697,20 @@ export function summarizeReplay(rows: HourPoint[]): ReplaySummary {
   let peak = 0;
   let drawdown = 0;
   for (const row of rows) {
-    net += row.net;
+    net += row.realized;
+    equity += row.net;
     samples += row.trades;
     wins += row.wins;
     grossProfit += row.grossProfit;
     grossLoss += row.grossLoss;
     if (row.net > 1e-9) green += 1;
-    peak = Math.max(peak, net);
-    drawdown = Math.max(drawdown, peak - net);
+    peak = Math.max(peak, equity);
+    drawdown = Math.max(drawdown, peak - equity);
   }
   return {
     net,
+    openPnl: equity - net,
+    equity,
     samples,
     wins,
     green,
@@ -1336,8 +1721,12 @@ export function summarizeReplay(rows: HourPoint[]): ReplaySummary {
   };
 }
 
-function addHours(dst: HourAcc[], src: readonly HourAcc[], scale = 1) {
-  for (const [index, row] of src.entries()) {
+export function addHours(dst: HourAcc[], src: readonly HourAcc[], scale = 1) {
+  const count = src.length;
+  for (let index = 0; index < count; index++) {
+    const row = src[index]!;
+    // Idle hours contribute nothing; most candidate configurations are idle in most hours.
+    if (!row.trades && !row.realized && !row.mtm && !row.openLegs) continue;
     const out = dst[index]!;
     out.trades += row.trades;
     out.wins += row.wins;
@@ -1350,7 +1739,7 @@ function addHours(dst: HourAcc[], src: readonly HourAcc[], scale = 1) {
   }
 }
 
-function clockHours(rows: HourAcc[], step: number) {
+export function clockHours(rows: HourAcc[], step: number) {
   if (step >= REPLAY_HOUR) return seal(rows);
   const hourly: HourAcc[] = [];
   for (const row of rows) {
@@ -1405,7 +1794,17 @@ function replayGate(
   return { cell, floors, settings };
 }
 
-function replayWindow(
+// Lane gate for position-history evaluation. Closes are evidence; `allow` decides whether a new
+// entry books or opens a shadow position that is tracked but not booked.
+export type LanedReplay = {
+  closes: number[];
+  costs: number[];
+  allow: (replay: LanedReplay) => boolean;
+  shadows: number;
+  shadowPnl: number[];
+};
+
+export function replayWindow(
   bars: Bar[],
   atr: number[],
   signals: (Side | 0)[],
@@ -1422,11 +1821,17 @@ function replayWindow(
   interval: CandleInterval,
   gate?: ReplayGate,
   gateAtBar?: boolean[],
+  ledger?: TradeLeg[],
+  laned?: LanedReplay,
 ) {
   let leg: OpenLeg | null = null;
   let priorMark = 0;
   let priorPnl: number | undefined;
   let earlierPnl: number | undefined;
+  const micro = CANDLE_INTERVALS[interval] <= 15 * 60_000;
+  const maxHold = micro && trailRules
+    ? Math.ceil(trailRules.microHoldMinutes * 60_000 / CANDLE_INTERVALS[interval])
+    : MAX_HOLD;
   for (let offset = 0; offset < slots.length; offset++) {
     const row = slots[offset]!;
     if (gateAtBar) gateAtBar[offset] = gate?.cell.validExec ?? true;
@@ -1444,12 +1849,14 @@ function replayWindow(
     const side = signals[i - 1];
     if (!leg && offset > 0 && side) {
       const dist = targetDistance(tpAtr, atr[i - 1] ?? 0, bar.o, cost,
-        CANDLE_INTERVALS[interval] <= 15 * 60_000 ? trailRules?.microTargetCosts : 0);
+        micro ? trailRules?.microTargetCosts : 0);
       const stopDistance = dist * slOfTp;
       const planned = throttle ? notional * sizeAfterLosses(earlierPnl, priorPnl) : notional;
       const tp = bar.o + side * dist;
       const sl = bar.o - side * stopDistance;
       if (tp > 0 && sl > 0) {
+        const active = laned ? laned.allow(laned) : (gate?.cell.validExec ?? true);
+        if (laned && !active) laned.shadows += 1;
         leg = {
           side,
           entry: bar.o,
@@ -1459,17 +1866,31 @@ function replayWindow(
             ? stopCappedQty(planned, bar.o, stopDistance, cost, throttle ? side : 0)
             : notional / bar.o,
           hold: 0,
-          active: gate?.cell.validExec ?? true,
+          active,
         };
       }
     }
     if (leg) {
-      const maxHold = CANDLE_INTERVALS[interval] <= 15 * 60_000 && trailRules
-        ? Math.ceil(trailRules.microHoldMinutes * 60_000 / CANDLE_INTERVALS[interval])
-        : MAX_HOLD;
       const hit = exitOnBar(leg.side, leg.tp, leg.sl, bar, ++leg.hold, maxHold);
       if (hit || offset === slots.length - 1) {
-        const pnl = closePnl(leg.side, leg.entry, hit?.exit ?? bar.c, leg.qty, cost);
+        const exitPrice = hit?.exit ?? bar.c;
+        const pnl = closePnl(leg.side, leg.entry, exitPrice, leg.qty, cost);
+        const roundTripCost = positionRtCost(leg.entry, exitPrice, leg.qty, cost);
+        if (laned) {
+          laned.closes.push(pnl);
+          laned.costs.push(roundTripCost);
+          if (leg.active === false) laned.shadowPnl.push(pnl);
+        }
+        ledger?.push({
+          t: bar.t,
+          side: leg.side,
+          entry: leg.entry,
+          exit: exitPrice,
+          pnl,
+          cost: roundTripCost,
+          reason: hit?.reason ?? "end",
+          hold: leg.hold,
+        });
         earlierPnl = priorPnl;
         priorPnl = pnl;
         if (leg.active !== false) {
@@ -1513,6 +1934,8 @@ function rankPre(rows: HourAcc[], byHour = false, checkRecent = false) {
   let recentSamples = 0;
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!;
+    // Idle hours add nothing to the sums or green count; a later active hour still closes the prior one.
+    if (!row.trades && !row.realized && !row.mtm) continue;
     gp += row.grossProfit;
     gl += row.grossLoss;
     n += row.trades;
@@ -1644,6 +2067,31 @@ function managedHoldout(
   return states.map((state) => state.rows);
 }
 
+// Replays one configuration over closed bars and returns every trade, for loss analysis.
+export function traceTrades(
+  bars: Bar[],
+  indication: Indication,
+  tpAtr: number,
+  slOfTp: number,
+  coordination: Coordination = "fixed",
+  interval: CandleInterval = "1h",
+  trailRules?: StrategySettings,
+  gate?: (index: number, side: Side) => boolean,
+): TradeLeg[] {
+  const series = buildSeries(bars);
+  const signals = bars.map((_, i) => {
+    const side = signalAt(indication, bars, series, i);
+    return side && gate && !gate(i, side) ? 0 : side;
+  });
+  const slots = bars.slice(WARMUP).map((b) => hourAccumulator(b.t));
+  const ledger: TradeLeg[] = [];
+  replayWindow(
+    bars, series.atr, signals, WARMUP, slots, positionNotional(10_000), POSITION_RT_COST_PCT,
+    tpAtr, slOfTp, true, coordination, false, trailRules, interval, undefined, undefined, ledger,
+  );
+  return ledger;
+}
+
 export function simulateSessions(
   books: { symbol: string; bars: Bar[] }[],
   equity: number,
@@ -1712,8 +2160,16 @@ export function simulateSessions(
     : coordinated
       ? coordinatedConfigs(opts?.trailing !== false, preferences, step)
       : EXECUTION_CONFIGS;
-  const configs =
-    opts?.indication || opts?.range
+  const fixed = opts?.fixed;
+  const configs = fixed
+    ? availableConfigs.filter(
+        (config) =>
+          config.indication === fixed.indication &&
+          config.tpAtr === fixed.tpAtr &&
+          config.slOfTp === fixed.slOfTp &&
+          config.coordination === (fixed.coordination ?? "fixed"),
+      )
+    : opts?.indication || opts?.range
       ? availableConfigs.filter(
           (config) =>
             (!opts?.indication || config.indication === opts.indication) &&
@@ -1757,6 +2213,25 @@ export function simulateSessions(
         }) / notional
       : 1;
   const selected: SessionReport["selected"] = [];
+  const coverage = new Map<string, CoverageRow>();
+  for (const config of configs) {
+    const key = `${config.indication}|${config.range}`;
+    if (!coverage.has(key))
+      coverage.set(key, {
+        indication: config.indication,
+        range: config.range,
+        configs: 0,
+        excluded: 0,
+        withCloses: 0,
+        reachedSamples: 0,
+        passed: 0,
+        bestPf: 0,
+        selected: 0,
+        signalsPre: 0,
+        signalsReplay: 0,
+      });
+  }
+  const signalTally = new Map<Indication, { pre: number; replay: number }>();
   let proven = 0;
   let disabledConfigs = 0;
   let rejectedPf = 0;
@@ -1784,11 +2259,23 @@ export function simulateSessions(
         bars.map((_, i) => signalAt(indication, bars, series, i)),
       ]),
     );
+    for (const [indication, signals] of signalsByIndication) {
+      const tally = signalTally.get(indication) ?? { pre: 0, replay: 0 };
+      for (let i = WARMUP; i < signals.length; i++) {
+        if (!signals[i]) continue;
+        if (i < replayFrom) tally.pre++;
+        else tally.replay++;
+      }
+      signalTally.set(indication, tally);
+    }
     for (const config of configs) {
+      const cov = coverage.get(`${config.indication}|${config.range}`)!;
       if (excluded.has(`${symbol}|${config.key}`)) {
         disabledConfigs++;
+        cov.excluded++;
         continue;
       }
+      cov.configs++;
       const { indication, tpAtr, slOfTp } = config;
       const signals = signalsByIndication.get(indication)!;
       replayWindow(
@@ -1814,11 +2301,18 @@ export function simulateSessions(
         quality.recentSamples < Math.max(3, Math.ceil(minSamples / 2)) ||
         (quality.recentNet > 0 && quality.recentPf >= Math.max(minPf, 1));
       const pass =
-        config.liveFloor &&
-        quality.n >= minSamples &&
-        quality.net > 0 &&
-        quality.pf >= threshold &&
-        followThrough;
+        fixed !== undefined ||
+        (config.liveFloor &&
+          quality.n >= minSamples &&
+          quality.net > 0 &&
+          quality.pf >= threshold &&
+          followThrough);
+      if (quality.n > 0) cov.withCloses++;
+      if (quality.n >= minSamples) {
+        cov.reachedSamples++;
+        cov.bestPf = Math.max(cov.bestPf, quality.pf);
+      }
+      if (pass) cov.passed++;
       addHours(preAcc, preWork);
       if (config.liveFloor && !pass) rejectedPf++;
       if (!pass && !baseline) continue;
@@ -1882,7 +2376,7 @@ export function simulateSessions(
           for (let i = 0; i < replayLength; i++) Object.assign(bestLive[i]!, liveWork[i]);
       }
     }
-    if (name) {
+    if (name && winner) {
       let gateAtBar: boolean[] | undefined;
       if (winner && (selectedOnly || (onlineGate && strategies))) {
         gateAtBar = onlineGate ? [] : undefined;
@@ -1913,9 +2407,12 @@ export function simulateSessions(
           gateAtBar,
         });
       } else addHours(bookLiveAcc, bestLive, scale);
+      coverage.get(`${winner.indication}|${winner.range}`)!.selected++;
       selected.push({
         name,
         symbol,
+        indication: winner.indication,
+        range: winner.range,
         requiredPf: selectedFloor,
         pre: summarizeCandles(bestPre, step),
         replay: summarizeCandles(bestLive, step),
@@ -2011,6 +2508,11 @@ export function simulateSessions(
     greenBookPre: d.green,
     greenBookLive: e.green,
     bookNames: selected.map((r) => r.name),
+    coverage: [...coverage.values()].map((row) => ({
+      ...row,
+      signalsPre: signalTally.get(row.indication)?.pre ?? 0,
+      signalsReplay: signalTally.get(row.indication)?.replay ?? 0,
+    })),
     selected,
   };
 }
@@ -2124,6 +2626,29 @@ function simulateReselected(
     bookEquityLive: { net: position, peak, trough, drawdown },
     greenBookLive: d.green,
     bookNames: selected.map((row) => row.name),
+    coverage: mergeCoverage(reports.map((report) => report.coverage)),
     selected,
   };
+}
+
+function mergeCoverage(parts: CoverageRow[][]): CoverageRow[] {
+  const merged = new Map<string, CoverageRow>();
+  for (const part of parts) {
+    for (const row of part) {
+      const key = `${row.indication}|${row.range}`;
+      const total = merged.get(key) ?? { ...row, configs: 0, excluded: 0, withCloses: 0,
+        reachedSamples: 0, passed: 0, bestPf: 0, selected: 0, signalsPre: 0, signalsReplay: 0 };
+      total.configs += row.configs;
+      total.excluded += row.excluded;
+      total.withCloses += row.withCloses;
+      total.reachedSamples += row.reachedSamples;
+      total.passed += row.passed;
+      total.bestPf = Math.max(total.bestPf, row.bestPf);
+      total.selected += row.selected;
+      total.signalsPre += row.signalsPre;
+      total.signalsReplay += row.signalsReplay;
+      merged.set(key, total);
+    }
+  }
+  return [...merged.values()];
 }

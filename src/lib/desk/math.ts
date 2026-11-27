@@ -12,10 +12,13 @@ import {
   SHORT_TP,
 } from "./constants.ts";
 
+export const NEUTRAL_PF = 1;
+
 export function profitFactor(profit: number, loss: number): number {
   const gp = Number.isFinite(profit) ? Math.max(0, profit) : 0;
   const gl = Number.isFinite(loss) ? Math.max(0, loss) : 0;
-  if (gl < 1e-12) return gp > 1e-12 ? PF_NO_LOSS : 0;
+  // PF 1.0 is neutral: no gross profit and no gross loss (net zero) reads as 1.0, not 0.
+  if (gl < 1e-12) return gp > 1e-12 ? PF_NO_LOSS : NEUTRAL_PF;
   const pf = gp / gl;
   return Number.isFinite(pf) ? pf : 0;
 }
