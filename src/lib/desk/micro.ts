@@ -205,7 +205,7 @@ export type MicroOptions = {
   notional?: number;
   cost?: number;
   // Lane gate: decides whether an entry is booked, reading the closes booked so far.
-  gate?: (closes: Closes) => boolean;
+  gate?: (closes: Closes, index: number) => boolean;
   closes?: Closes;
   trace?: Fill[];
 };
@@ -271,7 +271,7 @@ export class MicroState {
   // Feeds one closed bar. `signal` is the indication's signal on the bar before this one (0 for none); a flat state
   // opens at this bar's open. `last` closes any open position at this bar's close. `allow`, when given, is asked at
   // entry and decides whether the position is booked.
-  onBar(bar: Bar, index: number, signal: Side | 0, last: boolean, allow: (() => boolean) | null, emit: (fill: Fill) => void): void {
+  onBar(bar: Bar, index: number, signal: Side | 0, last: boolean, allow: ((index: number) => boolean) | null, emit: (fill: Fill) => void): void {
     if (!this.open) {
       if (signal === 0) return;
       if (this.onlySide !== 0 && signal !== this.onlySide) return;
@@ -282,7 +282,7 @@ export class MicroState {
       this.side = side;
       this.entry = entry;
       this.entryBar = index;
-      this.booked = allow ? allow() : true;
+      this.booked = allow ? allow(index) : true;
       this.positionNet = 0;
       this.qty = this.notional / entry;
       // Target and stop sit percent beyond the round-trip cost, on both sides of the entry.
@@ -463,7 +463,7 @@ export class MicroRun {
   }
 
   // Feeds one closed bar, books its fills, and posts the change of the booked open mark to the bar's slot.
-  step(bar: Bar, index: number, signal: Side | 0, last: boolean, allow: (() => boolean) | null, acc: MicroAcc, closes?: Closes): void {
+  step(bar: Bar, index: number, signal: Side | 0, last: boolean, allow: ((index: number) => boolean) | null, acc: MicroAcc, closes?: Closes): void {
     this.acc = acc;
     this.closes = closes;
     this.state.onBar(bar, index, signal, last, allow, this.emit);
@@ -484,7 +484,7 @@ export function simulateMicro(book: MicroBook, set: MicroSet, from: number, to: 
   const bars = book.bars;
   const closes = options.closes;
   const gate = options.gate;
-  const allow = gate && closes ? () => gate(closes) : null;
+  const allow = gate && closes ? (index: number) => gate(closes, index) : null;
   const trace = options.trace;
   const run = new MicroRun(set, book.interval, {
     notional: options.notional,

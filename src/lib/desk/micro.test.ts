@@ -184,6 +184,13 @@ test("a blocked entry is a shadow: not booked, but its close is evidence so the 
   assert.equal(allowedCloses.costs.length, 1);
 });
 
+test("the entry gate receives the index of the entry bar", () => {
+  const bars = [bar(0, 100, 100, 100, 100), bar(1, 100, 100, 100, 100), bar(2, 100, 100.5, 99.9, 100.4)];
+  const seen: number[] = [];
+  run(bookWith(bars, 0, 1), setOf(), 3, { closes: { pnls: [], costs: [] }, gate: (_closes, index) => (seen.push(index), true) });
+  assert.deepEqual(seen, [1]);
+});
+
 test("a long-only set ignores a short signal and a window starts flat", () => {
   const bars = [bar(0, 100, 100, 100, 100), bar(1, 100, 100, 100, 100), bar(2, 100, 100.5, 99.9, 100.4)];
   const longOnly = run(bookWith(bars, 0, -1), setOf({ direction: "long" }), 3);

@@ -39,6 +39,8 @@ const WINDOW_MS = WINDOW_HOURS * HOUR_MS;
 const ANCHOR_MS = 4 * HOUR_MS;
 const WARMUP_MS = 48 * HOUR_MS;
 const MIN_POSITIONS = Number(process.env.MIN_POSITIONS ?? 100);
+// Volatility gate, fixed in advance: an entry needs the last closed bar's 14-bar ATR at least 4 x the 0.12% round trip.
+const VOL_MIN_PCT = Number(process.env.VOL_MIN_PCT ?? 0.48);
 
 type CaptureFile = {
   symbol: string;
@@ -282,12 +284,15 @@ function gated(dirs: string[], outDir: string, interval: CandleInterval, topN: n
   const slots = WINDOW_MS / step;
   const books = markets.map((market) => bookFor(market, interval));
   const ranges = books.map((book) => windows.map((window) => ({ from: barIndexAt(book.bars, window.start), to: barIndexAt(book.bars, window.end) })));
+  const atrs = books.map((book) => atrPctOf(book.bars));
   const finalLanes = buildPlan(2, DEFAULT_LANE_POLICY).at(-1)!.lanes;
   const settings = normalizeStrategies();
   const gateName = process.env.GATE ?? "validated";
   // validated: no veto and at least one confirmation (the shipped lane rule). noveto: only a veto blocks. lastnet: the
   // cell's last 20 closes, shadows included, net positive. legacy: the per-cell last-N gate the coordinated engine uses.
-  const gate = (closes: Closes): boolean => {
+  // vol: the last closed bar's ATR percent must clear VOL_MIN_PCT. The other variants read the closes only.
+  const makeGate = (atrPct: Float64Array) => (closes: Closes, index: number): boolean => {
+    if (gateName === "vol") return atrPct[index - 1]! * 100 >= VOL_MIN_PCT;
     if (gateName === "lastnet") {
       const n = closes.pnls.length;
       if (n < 4) return false;
@@ -308,6 +313,7 @@ function gated(dirs: string[], outDir: string, interval: CandleInterval, topN: n
     const positive = windows.map(() => 0);
     const throwaway = newMicroAcc(0, step, 1);
     books.forEach((book, m) => {
+      const gate = makeGate(atrs[m]!);
       const closes: Closes = { pnls: [], costs: [] };
       const first = ranges[m]![0]!;
       // Evidence from the bars before the first window: simulated, not booked.
@@ -332,6 +338,24 @@ function gated(dirs: string[], outDir: string, interval: CandleInterval, topN: n
   }
   writeFileSync(join(outDir, `${interval}-gated-${gateName}.csv`), `${rows.join("\n")}\n`);
   console.log(`${interval} gated ${gateName}: wrote ${rows.length - 1} rows in ${((Date.now() - started) / 1000).toFixed(0)}s`);
+}
+
+// ATR as a percent of price, causal: entry i uses the bars up to the last closed bar. Simple mean of true range over 14 bars.
+function atrPctOf(bars: Bar[], period = 14): Float64Array {
+  const tr = new Float64Array(bars.length);
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i]!;
+    const previousClose = i > 0 ? bars[i - 1]!.c : b.o;
+    tr[i] = Math.max(b.h - b.l, Math.abs(b.h - previousClose), Math.abs(b.l - previousClose));
+  }
+  const out = new Float64Array(bars.length);
+  let sum = 0;
+  for (let i = 0; i < bars.length; i++) {
+    sum += tr[i]!;
+    if (i >= period) sum -= tr[i - period]!;
+    if (i >= period - 1) out[i] = sum / period / bars[i]!.c;
+  }
+  return out;
 }
 
 function merge(outDir: string, interval: CandleInterval): void {
