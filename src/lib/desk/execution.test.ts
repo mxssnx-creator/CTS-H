@@ -6,7 +6,18 @@ import { join } from "node:path";
 import test from "node:test";
 import { Bingx } from "./bingx.server.ts";
 import { requireConnection } from "./connections.ts";
-import { approve, propose, reconcile, send, signOff } from "./execution.server.ts";
+import {
+  approve,
+  clearFlatControls,
+  ownedPortfolio,
+  planClose,
+  protect,
+  propose,
+  reconcile,
+  send,
+  sendBatch,
+  signOff,
+} from "./execution.server.ts";
 import { Journal } from "./journal.server.ts";
 
 const LIMITS = { maxNotional: 150, riskFraction: 0.005, entryBps: 10, exitBps: 20 };
@@ -14,16 +25,21 @@ const NOW = Date.now();
 const SYMBOL = "ETH-USDT";
 const ORDER_ID = "1945935713755381761";
 
-function venue(opts: { hedge?: boolean; failSubmit?: boolean } = {}) {
+function venue(opts: { hedge?: boolean; failSubmit?: boolean; failReplace?: boolean } = {}) {
   const hedge = opts.hedge ?? true;
   const orders = new Map<string, Record<string, unknown>>();
   const writes: URL[] = [];
   const positions: Record<string, unknown>[] = [];
   const controls: Record<string, unknown>[] = [];
+  const controlHistory = new Map<string, Record<string, unknown>>();
+  const batches: Record<string, unknown>[][] = [];
+  const controlWrites: { method: string; params: URLSearchParams }[] = [];
+  let nextControl = 9007199254741010n;
   const transport: typeof fetch = async (url, init) => {
     const dest = new URL(String(url));
     assert.equal(dest.origin, "https://open-api-vst.bingx.com");
     const p = dest.searchParams;
+    const symbol = p.get("symbol") ?? SYMBOL;
     const result = (data: unknown) =>
       new Response(JSON.stringify({ code: 0, data }), { status: 200 });
     const headers = new Headers(init?.headers);
@@ -42,7 +58,7 @@ function venue(opts: { hedge?: boolean; failSubmit?: boolean } = {}) {
       case "/openApi/swap/v2/quote/contracts":
         return result([
           {
-            symbol: SYMBOL,
+            symbol,
             status: 1,
             pricePrecision: 2,
             quantityPrecision: 2,
@@ -53,7 +69,7 @@ function venue(opts: { hedge?: boolean; failSubmit?: boolean } = {}) {
         ]);
       case "/openApi/swap/v2/quote/ticker":
         return result({
-          symbol: SYMBOL,
+          symbol,
           lastPrice: "100",
           bidPrice: "99.98",
           askPrice: "100.02",
@@ -64,18 +80,68 @@ function venue(opts: { hedge?: boolean; failSubmit?: boolean } = {}) {
       case "/openApi/swap/v1/positionSide/dual":
         return result({ dualSidePosition: hedge });
       case "/openApi/swap/v2/trade/openOrders":
-        return result({ orders: controls });
+        return result({
+          orders: p.has("symbol") ? controls.filter((row) => row.symbol === symbol) : controls,
+        });
       case "/openApi/swap/v2/user/positions":
-        return result(positions);
+        return result(
+          p.has("symbol") ? positions.filter((row) => row.symbol === symbol) : positions,
+        );
       case "/openApi/swap/v2/trade/order/test":
         assert.equal(init?.method, "POST");
         return result({});
+      case "/openApi/swap/v2/trade/batchOrders": {
+        assert.equal(init?.method, "POST");
+        const batch = JSON.parse(p.get("batchOrders")!) as Record<string, unknown>[];
+        batches.push(batch);
+        return result({
+          orders: [{ clientOrderID: batch[0]!.clientOrderId }],
+          errors: [{ code: 110400 }],
+        });
+      }
+      case "/openApi/swap/v1/trade/cancelReplace": {
+        controlWrites.push({ method: init!.method!, params: p });
+        const old = p.get("cancelOrderId");
+        assert.equal(p.get("cancelReplaceMode"), "STOP_ON_FAILURE");
+        const original = controls.findIndex((row) => row.orderID === old);
+        assert.ok(original >= 0);
+        const newId = String(nextControl++);
+        controls[original] = {
+          ...Object.fromEntries(p),
+          orderID: newId,
+          origQty: p.get("quantity"),
+          time: NOW,
+        };
+        if (opts.failReplace) throw new Error("Lost replacement acknowledgement");
+        return new Response(
+          `{"code":0,"data":{"cancelResult":"SUCCESS","newOrderResult":"SUCCESS","newOrderId":${newId}}}`,
+        );
+      }
       case "/openApi/swap/v2/trade/order":
+        if (init?.method === "DELETE") {
+          controlWrites.push({ method: "DELETE", params: p });
+          const index = controls.findIndex((row) => row.orderID === p.get("orderId"));
+          assert.ok(index >= 0);
+          const [row] = controls.splice(index, 1);
+          controlHistory.set(String(row?.orderID), { ...row, status: "CANCELLED", executedQty: 0 });
+          return result(row);
+        }
         if (init?.method === "POST") {
+          if (!p.has("clientOrderId")) {
+            controlWrites.push({ method: "POST", params: p });
+            const row = {
+              ...Object.fromEntries(p),
+              orderID: String(nextControl++),
+              origQty: p.get("quantity"),
+              time: NOW,
+            };
+            controls.push(row);
+            return result({ order: row });
+          }
           writes.push(dest);
           orders.set(p.get("clientOrderId")!, {
             clientOrderID: p.get("clientOrderId"),
-            symbol: SYMBOL,
+            symbol,
             side: p.get("side"),
             positionSide: p.get("positionSide"),
             status: "PARTIALLYFILLED",
@@ -84,6 +150,12 @@ function venue(opts: { hedge?: boolean; failSubmit?: boolean } = {}) {
           });
           if (opts.failSubmit) throw new Error("disconnected");
           return result({});
+        }
+        if (p.has("orderId")) {
+          const row =
+            controlHistory.get(p.get("orderId")!) ??
+            controls.find((order) => order.orderID === p.get("orderId"));
+          return row ? result({ order: row }) : new Response('{"code":109421}', { status: 200 });
         }
         const queried = JSON.stringify({
           code: 0,
@@ -105,6 +177,9 @@ function venue(opts: { hedge?: boolean; failSubmit?: boolean } = {}) {
     orders,
     positions,
     controls,
+    controlHistory,
+    controlWrites,
+    batches,
   };
 }
 
@@ -230,4 +305,142 @@ test("risk rejects a foreign position and the wrong venue", async (t) => {
     /match/,
   );
   assert.equal(writes.length, 0);
+});
+
+test("batch uses one signed request and persists per-ticket acknowledgements without resending", async (t) => {
+  const journal = setup(t);
+  const { client, batches } = venue();
+  const tickets = [
+    opening(journal),
+    propose(
+      journal,
+      "bingx-x02",
+      "BTC-USDT",
+      { side: "long", quantity: 0.03, stop: 95, target: 111 },
+      "Second symbol",
+    ),
+  ];
+  for (const ticket of tickets) {
+    await signOff(journal, client, ticket.id, LIMITS);
+    approve(journal, ticket.id, ticket.id, NOW);
+  }
+  const ids = tickets.map(({ id }) => id);
+  await assert.rejects(sendBatch(journal, client, ids, ids[0]!, LIMITS, ["bingx-x02"]), /exact/);
+  const result = await sendBatch(journal, client, ids, ids.join(","), LIMITS, ["bingx-x02"]);
+  assert.equal(batches.length, 1);
+  assert.deepEqual(
+    result.map(({ phase }) => phase),
+    ["reconcile", "uncertain"],
+  );
+  assert.ok(result.every(({ latency }) => latency && latency.submitMs >= 0));
+  assert.deepEqual(
+    batches[0]!.map(({ clientOrderId }) => clientOrderId),
+    ids,
+  );
+  await assert.rejects(
+    sendBatch(journal, client, ids, ids.join(","), LIMITS, ["bingx-x02"]),
+    /current/,
+  );
+  assert.equal(batches.length, 1);
+});
+
+async function fullPosition(journal: Journal, mocked: ReturnType<typeof venue>) {
+  const ticket = opening(journal);
+  await signOff(journal, mocked.client, ticket.id, LIMITS);
+  approve(journal, ticket.id, ticket.id, NOW);
+  await send(journal, mocked.client, ticket.id, ticket.id, LIMITS, ["bingx-x02"]);
+  Object.assign(mocked.orders.get(ticket.id)!, { status: "FILLED", executedQty: "0.03" });
+  mocked.positions.push({
+    symbol: SYMBOL,
+    positionSide: "LONG",
+    positionAmt: "0.03",
+    positionId: "83",
+  });
+  for (const [orderID, type, stopPrice] of [
+    ["84", "STOP_MARKET", 95],
+    ["85", "TAKE_PROFIT_MARKET", 111],
+  ])
+    mocked.controls.push({
+      symbol: SYMBOL,
+      positionSide: "LONG",
+      origQty: "0.03",
+      type,
+      side: "SELL",
+      stopPrice,
+      workingType: "CONTRACT_PRICE",
+      orderID,
+      status: "NEW",
+    });
+  return reconcile(journal, mocked.client, ticket.id);
+}
+
+test("overall protection and a partial target reconcile by venue IDs through target fill and residual close", async (t) => {
+  const journal = setup(t);
+  const mocked = venue();
+  const { client, controls, positions, controlHistory } = mocked;
+  const parent = await fullPosition(journal, mocked);
+  assert.equal(parent.phase, "open");
+  const { id } = parent;
+  const armed = ["bingx-x02"];
+  await assert.rejects(
+    protect(journal, client, id, id, "target", 110, false, armed, false, 0.01),
+    /overall stop/,
+  );
+  await protect(journal, client, id, id, "stop", 96, true, armed);
+  const updated = await reconcile(journal, client, id);
+  assert.equal(updated.venue?.stopId, "9007199254741010");
+  assert.equal(updated.venue?.stopOverall, true);
+  await protect(journal, client, id, id, "target", 110, false, armed, false, 0.01);
+  const guarded = await reconcile(journal, client, id);
+  assert.equal(guarded.targetQuantity, 0.01);
+  assert.equal(guarded.phase, "open");
+  const summary = await ownedPortfolio(journal, client, "bingx-x02");
+  assert.equal(summary.positions[0]?.controls[0]?.overall, true);
+  const [target] = controls.splice(1, 1);
+  controlHistory.set(String(target!.orderID), { ...target, executedQty: "0.01", status: "FILLED" });
+  positions[0]!.positionAmt = "0.02";
+  const residual = await reconcile(journal, client, id);
+  assert.equal(residual.phase, "incident");
+  assert.ok(Math.abs(residual.venue!.remaining - 0.02) < 1e-10);
+  assert.equal(residual.venue?.controlFills?.[String(target!.orderID)], 0.01);
+  const child = planClose(journal, id, "Reduce the owned residual", 0.01);
+  await signOff(journal, client, child.id, LIMITS);
+  approve(journal, child.id, child.id, NOW);
+  await send(journal, client, child.id, child.id, LIMITS, armed);
+  mocked.orders.get(child.id)!.status = "FILLED";
+  positions[0]!.positionAmt = "0.01";
+  assert.equal((await reconcile(journal, client, child.id)).phase, "closed");
+  assert.ok(Math.abs(journal.get(id).venue!.remaining - 0.01) < 1e-10);
+  await protect(journal, client, id, id, "target", 111, true, armed);
+  assert.equal((await reconcile(journal, client, id)).phase, "open");
+});
+
+test("lost control response is reconciled once and stale control cleanup preserves a foreign order", async (t) => {
+  const journal = setup(t);
+  const mocked = venue({ failReplace: true });
+  const { client, controls, controlWrites, positions, orders } = mocked;
+  const { id } = await fullPosition(journal, mocked);
+  const armed = ["bingx-x02"];
+  await protect(journal, client, id, id, "stop", 96, true, armed);
+  assert.equal(journal.get(id).phase, "incident");
+  await assert.rejects(
+    protect(journal, client, id, id, "stop", 97, true, armed),
+    /verified ownership/,
+  );
+  assert.equal((await reconcile(journal, client, id)).phase, "open");
+  assert.equal(controlWrites.length, 1);
+  const child = planClose(journal, id, "Close the owned position");
+  await signOff(journal, client, child.id, LIMITS);
+  approve(journal, child.id, child.id, NOW);
+  await send(journal, client, child.id, child.id, LIMITS, armed);
+  Object.assign(orders.get(child.id)!, { status: "FILLED", executedQty: "0.03" });
+  positions.length = 0;
+  controls.push({ symbol: SYMBOL, orderID: "87", type: "LIMIT" });
+  await reconcile(journal, client, child.id);
+  assert.equal(journal.get(id).phase, "incident");
+  assert.equal((await clearFlatControls(journal, client, id, id, armed)).phase, "closed");
+  assert.deepEqual(
+    controls.map((row) => row.orderID),
+    ["87"],
+  );
 });

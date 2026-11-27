@@ -13,10 +13,18 @@ import {
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { CandleChart, EquityChart } from "./chart";
 import { Panel, Stat } from "./shell";
-import { ACTION_COPY, ACTIONS, BOOK, MAX_LIVE_LEGS, type Floors } from "@/lib/desk/constants";
+import {
+  ACTION_COPY,
+  ACTIONS,
+  BOOK,
+  INDICATIONS,
+  INDICATION_LABELS,
+  MAX_LIVE_LEGS,
+} from "@/lib/desk/constants";
 import { CALIBRATED_EXCLUSIONS } from "@/lib/desk/calibration";
 import type { ReplayProfile } from "@/lib/desk/config-policy";
 import { CONNECTIONS } from "@/lib/desk/connections";
+import { COORDINATION_LABELS } from "@/lib/desk/management";
 import { closePnl } from "@/lib/desk/math";
 import {
   barSignature,
@@ -25,6 +33,14 @@ import {
   type ReplaySize,
   type SessionReport,
 } from "@/lib/desk/process";
+import {
+  DEFAULT_STRATEGIES,
+  STRATEGY_LABELS,
+  STRATEGY_LIMITS,
+  STRATEGY_TYPES,
+  type StrategyNumber,
+  type StrategyType,
+} from "@/lib/desk/strategies";
 import { focusBook, useDesk, useNet } from "@/lib/desk/store";
 
 const num = new Intl.NumberFormat("en-US", { maximumFractionDigits: 6 });
@@ -194,7 +210,7 @@ function Signals() {
         <div className="signal-list">
           {board.map((signal) => (
             <div className="signal-row" key={signal.name}>
-              <strong>{signal.name}</strong>
+              <strong>{INDICATION_LABELS[signal.name]}</strong>
               <span>{signal.detail}</span>
               <span className={`direction ${signal.side ? tone(signal.side) : "muted"}`}>
                 {signal.side > 0 ? (
@@ -305,6 +321,55 @@ export function OverviewPage() {
   );
 }
 
+function ReducePosition({ id, symbol }: { id: string; symbol: string }) {
+  const closePartial = useDesk((s) => s.closePartial);
+  const ready = useDesk(
+    (s) =>
+      s.status === "live" &&
+      s.allow.connect_exchange &&
+      s.allow.flatten_own &&
+      !s.unavailable.includes(symbol),
+  );
+  const [fraction, setFraction] = useState("0.5");
+  const [confirm, setConfirm] = useState(false);
+  return confirm ? (
+    <div className="reduce-order">
+      <select
+        aria-label={`Close percentage for ${symbol}`}
+        value={fraction}
+        onChange={(event) => setFraction(event.target.value)}
+      >
+        <option value="0.25">25%</option>
+        <option value="0.5">50%</option>
+        <option value="0.75">75%</option>
+        <option value="1">100%</option>
+      </select>
+      <button
+        className="desk-button negative"
+        disabled={!ready}
+        onClick={() => {
+          closePartial(id, Number(fraction));
+          setConfirm(false);
+        }}
+      >
+        Confirm close
+      </button>
+      <button className="desk-button" onClick={() => setConfirm(false)}>
+        Cancel
+      </button>
+    </div>
+  ) : (
+    <button
+      className="desk-button"
+      aria-label={`Reduce ${symbol}`}
+      disabled={!ready}
+      onClick={() => setConfirm(true)}
+    >
+      Reduce
+    </button>
+  );
+}
+
 function PositionTable({ compact = false }: { compact?: boolean }) {
   const positions = useDesk((s) => s.positions);
   if (!positions.length) return <Empty>No open paper positions.</Empty>;
@@ -322,9 +387,15 @@ function PositionTable({ compact = false }: { compact?: boolean }) {
                 <th>Mark</th>
                 <th>Stop</th>
                 <th>Target</th>
+                <th>Management</th>
               </>
             )}
             <th>P&L</th>
+            {!compact && (
+              <th>
+                <span className="sr-only">Action</span>
+              </th>
+            )}
           </tr>
         </thead>
         <tbody>
@@ -343,9 +414,23 @@ function PositionTable({ compact = false }: { compact?: boolean }) {
                     <td>{num.format(p.mark)}</td>
                     <td>{num.format(p.sl)}</td>
                     <td>{num.format(p.tp)}</td>
+                    <td>
+                      {p.coordination ? COORDINATION_LABELS[p.coordination] : "Manual"}
+                      {p.sizing?.axis ? " · Axis" : ""}
+                      {p.sizing?.relate ? " · Relate" : ""}
+                      {p.plan?.blockSteps
+                        ? ` · Block ${p.plan.blockFilled}/${p.plan.blockSteps}`
+                        : ""}
+                      {p.plan?.dcaSteps ? ` · DCA ${p.plan.dcaFilled}/${p.plan.dcaSteps}` : ""}
+                    </td>
                   </>
                 )}
                 <td className={tone(pnl)}>{sign(pnl)}</td>
+                {!compact && (
+                  <td>
+                    <ReducePosition id={p.id} symbol={p.symbol} />
+                  </td>
+                )}
               </tr>
             );
           })}
@@ -433,6 +518,7 @@ export function PositionsPage() {
                     <th>Protection</th>
                     <th>Trigger</th>
                     <th>Quantity</th>
+                    <th>Scope</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -442,6 +528,7 @@ export function PositionsPage() {
                       <td>{order.kind === "sl" ? "Stop loss" : "Take profit"}</td>
                       <td>{num.format(order.px)}</td>
                       <td>{num.format(order.qty)}</td>
+                      <td>Remaining position</td>
                     </tr>
                   ))}
                 </tbody>
@@ -458,6 +545,7 @@ export function PositionsPage() {
                 <thead>
                   <tr>
                     <th>Market</th>
+                    <th>Quantity</th>
                     <th>Fill price</th>
                     <th>Net P&L</th>
                   </tr>
@@ -466,6 +554,10 @@ export function PositionsPage() {
                   {fills.slice(0, 12).map((fill) => (
                     <tr key={fill.id}>
                       <td>{fill.symbol}</td>
+                      <td>
+                        {fill.quantity === undefined ? "—" : num.format(fill.quantity)}
+                        {fill.partial ? " · Partial" : ""}
+                      </td>
                       <td>{num.format(fill.px)}</td>
                       <td className={tone(fill.pnl)}>{sign(fill.pnl)}</td>
                     </tr>
@@ -610,21 +702,25 @@ export function IndicationsPage() {
               <thead>
                 <tr>
                   <th>Indication</th>
+                  <th>Stop mode</th>
                   <th>TP / ATR</th>
                   <th>SL / TP</th>
                   <th>Closes</th>
                   <th>PF</th>
+                  <th>Required recent PF</th>
                   <th>Net</th>
                 </tr>
               </thead>
               <tbody>
                 {qualified.map((cell) => (
                   <tr key={cell.id}>
-                    <td>{cell.indication}</td>
+                    <td>{INDICATION_LABELS[cell.indication]}</td>
+                    <td>{COORDINATION_LABELS[cell.coordination ?? "fixed"]}</td>
                     <td>{cell.tpAtr}</td>
                     <td>{cell.slOfTp}</td>
                     <td>{cell.n}</td>
                     <td>{PFText(cell.gw, cell.gl)}</td>
+                    <td>{cell.requiredRecentPf?.toFixed(2) ?? "—"}</td>
                     <td className={tone(cell.net)}>{sign(cell.net)}</td>
                   </tr>
                 ))}
@@ -651,23 +747,26 @@ export function IndicationsPage() {
 
 const REPLAY_HOURS = [12, 24, 48] as const;
 const REPLAY_PROFILES: Record<ReplayProfile, string> = {
+  coordinated: "Coordinated",
   filtered: "Filtered",
   baseline: "Baseline",
 };
 const REPLAY_SIZING: { size: ReplaySize; label: string }[] = [
   { size: "base", label: "Base" },
-  { size: "axis", label: "Axis" },
-  { size: "block", label: "Block" },
-  { size: "both", label: "Axis + Block" },
+  { size: "axis", label: "Axis multiplier" },
+  { size: "block", label: "Block multiplier" },
+  { size: "both", label: "Both multipliers" },
 ];
 
 export function ReplayPage() {
   const books = useDesk((s) => s.books);
   const floors = useDesk((s) => s.floors);
   const connection = useDesk((s) => s.connection);
+  const strategies = useDesk((s) => s.strategies);
+  const trailing = useDesk((s) => s.toggles.trailing);
   const [hours, setHours] = useState<(typeof REPLAY_HOURS)[number]>(48);
   const [size, setSize] = useState<ReplaySize>("base");
-  const [profile, setProfile] = useState<ReplayProfile>("filtered");
+  const [profile, setProfile] = useState<ReplayProfile>("coordinated");
   const [report, setReport] = useState<SessionReport | null>(null);
   const [error, setError] = useState("");
   const sig = barSignature(books);
@@ -684,9 +783,13 @@ export function ReplayPage() {
     };
     worker.onerror = () => setError("Replay worker failed.");
     const source = useDesk.getState().books.map(({ symbol, bars }) => ({ symbol, bars }));
-    worker.postMessage({ books: source, floors, opts: { hours, size, connection, profile } });
+    worker.postMessage({
+      books: source,
+      floors,
+      opts: { hours, size, connection, profile, strategies, trailing },
+    });
     return () => worker.terminate();
-  }, [sig, floors, hours, size, connection, profile]);
+  }, [sig, floors, hours, size, connection, profile, strategies, trailing]);
   const pre = report?.ready ? summarizeReplay(report.bookPre) : null;
   const replay = report?.ready ? summarizeReplay(report.bookLive) : null;
   return (
@@ -721,16 +824,29 @@ export function ReplayPage() {
               ))}
             </div>
           </div>
-          <div>
-            <span>Position sizing</span>
-            <div className="segmented">
-              {REPLAY_SIZING.map(({ size: choice, label }) => (
-                <button key={choice} onClick={() => setSize(choice)} aria-pressed={size === choice}>
-                  {label}
-                </button>
-              ))}
+          {profile === "coordinated" ? (
+            <div>
+              <span>Volume {strategies.volumeFactor.toFixed(1)}×</span>
+              <Link className="text-link" to="/settings">
+                Edit strategy settings <ArrowRight size={14} />
+              </Link>
             </div>
-          </div>
+          ) : (
+            <div>
+              <span>Legacy sizing comparison</span>
+              <div className="segmented">
+                {REPLAY_SIZING.map(({ size: choice, label }) => (
+                  <button
+                    key={choice}
+                    onClick={() => setSize(choice)}
+                    aria-pressed={size === choice}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </Panel>
       {pre && replay && report ? (
@@ -765,7 +881,8 @@ export function ReplayPage() {
             </p>
             <p className="muted detail-copy">
               {num.format(report.evaluatedConfigs)} market configurations scored.{" "}
-              {report.disabledConfigs} calibrated market configurations excluded.
+              {num.format(report.rejectedPf)} failed preselection. {report.disabledConfigs}{" "}
+              calibrated market configurations excluded.
             </p>
             {report.unavailable.length ? (
               <p className="warn detail-copy">
@@ -773,6 +890,20 @@ export function ReplayPage() {
               </p>
             ) : null}
           </Panel>
+          {profile === "coordinated" && (
+            <Panel title="Strategy activity">
+              <div className="strategy-results">
+                {STRATEGY_TYPES.map((kind) => (
+                  <div key={kind}>
+                    <strong>{STRATEGY_LABELS[kind]}</strong>
+                    <span>
+                      {strategies[kind] ? `${report.strategyActions[kind]} actions` : "Off"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </Panel>
+          )}
           <div className="columns-even">
             <Panel title="Selected configurations">
               {report.selected.length ? (
@@ -781,6 +912,7 @@ export function ReplayPage() {
                     <thead>
                       <tr>
                         <th>Configuration</th>
+                        <th>Required pre PF</th>
                         <th>Closes</th>
                         <th>PF</th>
                         <th>Net</th>
@@ -790,6 +922,7 @@ export function ReplayPage() {
                       {report.selected.map((item) => (
                         <tr key={item.name}>
                           <td>{item.name}</td>
+                          <td>{item.requiredPf.toFixed(2)}</td>
                           <td>{item.replay.samples}</td>
                           <td>{PFText(item.replay.grossProfit, item.replay.grossLoss)}</td>
                           <td className={tone(item.replay.net)}>{sign(item.replay.net)}</td>
@@ -841,22 +974,170 @@ export function ReplayPage() {
   );
 }
 
-const FLOOR_NAMES: Record<keyof Floors, string> = {
+const FLOOR_NAMES = {
   base: "Replay preselection PF",
   short: "Short grid PF",
   overall: "Lifetime paper PF",
-  axis: "Axis PF floor",
-  block: "Block PF floor",
-};
+} as const;
 const STRATEGIES = {
   autoEntries: "Automatic paper entries",
   normal: "Direction lane",
-  trailing: "Trailing stop",
-  axis: "Axis sizing",
-  block: "Block sizing",
-  dca: "DCA",
+  trailing: "Managed stops in paper and replay",
   hedge: "Multiple same-market lanes",
 } as const;
+
+const STRATEGY_CARDS = {
+  axis: {
+    description:
+      "Increase entry size after the configuration clears its PF floor and closes two winners.",
+    permission: "axis_volume",
+    fields: [
+      ["axisRatio", "Increase (× seed)"],
+      ["axisPf", "Minimum PF"],
+      ["axisLookback", "Lookback closes"],
+      ["axisSamples", "Required closes"],
+    ],
+  },
+  block: {
+    description: "Reserve part of the entry budget for favorable moves early in the bracket.",
+    permission: "block_volume",
+    fields: [
+      ["blockRatio", "Add ratio (× seed)"],
+      ["blockLevels", "Maximum additions"],
+      ["blockTargetShare", "Maximum share of target distance"],
+      ["blockPf", "Minimum PF"],
+    ],
+  },
+  dca: {
+    description: "Add at adverse levels inside the parent stop using the original risk budget.",
+    permission: "enable_dca",
+    fields: [
+      ["dcaRatio", "Add ratio (× seed)"],
+      ["dcaLevels", "Maximum additions"],
+      ["dcaStopShare", "Rung spacing (× stop distance)"],
+    ],
+  },
+  relate: {
+    description:
+      "Adjust entry size after qualifying closed results in the configuration or a related group.",
+    permission: "enable_relate",
+    fields: [
+      ["relateRatio", "Increase per win (× seed)"],
+      ["relateSteps", "Maximum steps"],
+      ["relatePf", "Minimum PF"],
+      ["relateLookback", "Lookback closes"],
+      ["relateSamples", "Required closes"],
+    ],
+  },
+} as const;
+
+function StrategyField({
+  name,
+  label,
+  disabled = false,
+}: {
+  name: StrategyNumber;
+  label: string;
+  disabled?: boolean;
+}) {
+  const connection = useDesk((s) => s.connection);
+  const value = useDesk((s) => s.strategies[name]);
+  const [min, max, step] = STRATEGY_LIMITS[name];
+  return (
+    <label>
+      {label}
+      <input
+        key={`${connection}-${value}`}
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        defaultValue={value}
+        disabled={disabled}
+        onBlur={(event) => {
+          const state = useDesk.getState();
+          if (state.connection === connection)
+            state.setStrategies({ [name]: event.currentTarget.valueAsNumber });
+          event.currentTarget.value = String(useDesk.getState().strategies[name]);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") event.currentTarget.blur();
+        }}
+      />
+    </label>
+  );
+}
+
+function StrategyCard({ kind }: { kind: StrategyType }) {
+  const strategies = useDesk((s) => s.strategies);
+  const setStrategies = useDesk((s) => s.setStrategies);
+  const card = STRATEGY_CARDS[kind];
+  const permitted = useDesk((s) => s.allow[card.permission]);
+  const mode = kind === "block" ? "blockMode" : kind === "relate" ? "relateMode" : null;
+  return (
+    <Panel
+      title={STRATEGY_LABELS[kind]}
+      aside={
+        <label className="strategy-switch">
+          <input
+            type="checkbox"
+            aria-label={`Enable ${STRATEGY_LABELS[kind]}`}
+            checked={strategies[kind]}
+            onChange={(event) => setStrategies({ [kind]: event.currentTarget.checked })}
+          />
+          <span>{strategies[kind] ? "On" : "Off"}</span>
+        </label>
+      }
+    >
+      <p className="detail-copy">{card.description}</p>
+      <div className="form-grid">
+        {card.fields.map(([name, label]) => (
+          <StrategyField key={name} name={name} label={label} />
+        ))}
+        {mode && (
+          <label>
+            Sizing mode
+            <select
+              value={strategies[mode]}
+              onChange={(event) =>
+                setStrategies({
+                  [mode]: event.currentTarget.value === "additive" ? "additive" : "shared",
+                })
+              }
+            >
+              <option value="shared">
+                {kind === "block" ? "Share budget across additions" : "Use stronger relation"}
+              </option>
+              <option value="additive">
+                {kind === "block" ? "Apply ratio to each addition" : "Combine qualified relations"}
+              </option>
+            </select>
+          </label>
+        )}
+        {kind === "relate" && (
+          <label>
+            Relation scope
+            <select
+              value={strategies.relateScope}
+              onChange={(event) => {
+                const value = event.currentTarget.value;
+                if (value === "configuration" || value === "symbol" || value === "overall")
+                  setStrategies({ relateScope: value });
+              }}
+            >
+              <option value="configuration">Configuration and side</option>
+              <option value="symbol">Symbol and side</option>
+              <option value="overall">Overall by side</option>
+            </select>
+          </label>
+        )}
+      </div>
+      {!permitted && (
+        <p className="warn detail-copy">Paper permission is off. Replay remains available.</p>
+      )}
+    </Panel>
+  );
+}
 
 export function SettingsPage() {
   const connection = useDesk((s) => s.connection);
@@ -866,6 +1147,8 @@ export function SettingsPage() {
   const toggleStrat = useDesk((s) => s.toggleStrat);
   const allow = useDesk((s) => s.allow);
   const toggleAllow = useDesk((s) => s.toggleAllow);
+  const strategies = useDesk((s) => s.strategies);
+  const setStrategies = useDesk((s) => s.setStrategies);
   return (
     <>
       <Heading title="Desk settings" secondary={`Paper strategy settings for ${connection}`} />
@@ -882,7 +1165,7 @@ export function SettingsPage() {
         </Panel>
         <Panel title="Qualification thresholds">
           <div className="form-grid">
-            {(Object.keys(FLOOR_NAMES) as (keyof Floors)[]).map((key) => (
+            {(Object.keys(FLOOR_NAMES) as (keyof typeof FLOOR_NAMES)[]).map((key) => (
               <label key={`${connection}-${key}-${floors[key]}`}>
                 {FLOOR_NAMES[key]}
                 <input
@@ -899,6 +1182,128 @@ export function SettingsPage() {
                   onKeyDown={(e) => {
                     if (e.key === "Enter") e.currentTarget.blur();
                   }}
+                />
+              </label>
+            ))}
+          </div>
+        </Panel>
+      </div>
+      <Panel title="Auto PF">
+        <p className="detail-copy">
+          The required PF starts at the configured minimum. Auto PF adds a larger margin when a
+          configuration has fewer closed trades.
+        </p>
+        <div className="option-list">
+          <label>
+            <span>Auto PF qualification</span>
+            <input
+              type="checkbox"
+              checked={strategies.autoPf}
+              disabled={!allow.change_floors}
+              onChange={(event) => setStrategies({ autoPf: event.currentTarget.checked })}
+            />
+          </label>
+          <label>
+            <span>Check recent closes</span>
+            <input
+              type="checkbox"
+              checked={strategies.autoPfRecent}
+              disabled={!allow.change_floors || !strategies.autoPf}
+              onChange={(event) => setStrategies({ autoPfRecent: event.currentTarget.checked })}
+            />
+          </label>
+        </div>
+        <div className="form-grid stop-fields">
+          <StrategyField
+            name="minimumPf"
+            label="Coordinated minimum PF"
+            disabled={!allow.change_floors}
+          />
+          <StrategyField
+            name="autoPfSamples"
+            label="Minimum closes"
+            disabled={!allow.change_floors || !strategies.autoPf}
+          />
+          <StrategyField
+            name="autoPfPenalty"
+            label="Small-sample PF margin"
+            disabled={!allow.change_floors || !strategies.autoPf}
+          />
+        </div>
+      </Panel>
+      <Panel
+        title="Position sizing and stops"
+        aside={
+          <button className="desk-button" onClick={() => setStrategies(DEFAULT_STRATEGIES)}>
+            Restore strategy defaults
+          </button>
+        }
+      >
+        <div className="option-list stop-options">
+          {(["dynamic", "breakeven"] as const).map((mode) => (
+            <label key={mode}>
+              <span>{COORDINATION_LABELS[mode]}</span>
+              <input
+                type="checkbox"
+                checked={strategies[mode]}
+                onChange={(event) => setStrategies({ [mode]: event.currentTarget.checked })}
+              />
+            </label>
+          ))}
+        </div>
+        <div className="form-grid stop-fields">
+          <StrategyField name="volumeFactor" label="Volume factor (× base)" />
+          <StrategyField name="trailActivation" label="Activation (× target distance)" />
+          <StrategyField name="trailDistance" label="ATR trail gap (× target distance)" />
+        </div>
+      </Panel>
+      <div className="strategy-card-grid">
+        {STRATEGY_TYPES.map((kind) => (
+          <StrategyCard key={kind} kind={kind} />
+        ))}
+      </div>
+      <div className="columns-even">
+        <Panel
+          title="Indications"
+          aside={
+            <button
+              className="desk-button"
+              onClick={() => setStrategies({ enabledIndications: INDICATIONS })}
+            >
+              Enable all indications
+            </button>
+          }
+        >
+          <div className="option-list">
+            {INDICATIONS.map((kind) => (
+              <label key={kind}>
+                <span>{INDICATION_LABELS[kind]}</span>
+                <input
+                  type="checkbox"
+                  checked={strategies.enabledIndications.includes(kind)}
+                  onChange={(event) =>
+                    setStrategies({
+                      enabledIndications: event.currentTarget.checked
+                        ? [...strategies.enabledIndications, kind]
+                        : strategies.enabledIndications.filter((enabled) => enabled !== kind),
+                    })
+                  }
+                />
+              </label>
+            ))}
+          </div>
+        </Panel>
+        <Panel title="Target ranges">
+          <div className="option-list">
+            {(["shortRange", "wideRange"] as const).map((kind) => (
+              <label key={kind}>
+                <span>
+                  {kind === "shortRange" ? "Short · 0.48–0.60 ATR" : "Wide · 0.80–2.00 ATR"}
+                </span>
+                <input
+                  type="checkbox"
+                  checked={strategies[kind]}
+                  onChange={(event) => setStrategies({ [kind]: event.currentTarget.checked })}
                 />
               </label>
             ))}
@@ -977,7 +1382,10 @@ export function ConnectionsPage() {
           X01 routes to BingX mainnet. X02 routes to BingX VST. An operator can set a connection’s
           credentials, sign off risk, and explicitly approve a ticket in the CLI.
         </p>
-        <pre className="proposal-command">npm run desk -- doctor</pre>
+        <pre className="proposal-command">
+          npm run desk -- portfolio --connection{" "}
+          {connection === "bingx-x02" ? "bingx-x02" : "bingx-x01"}
+        </pre>
       </Panel>
     </>
   );

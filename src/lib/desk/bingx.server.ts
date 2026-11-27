@@ -30,7 +30,10 @@ export function signedQuery(params: Params, secret: string): string {
 // A numeric JSON token cannot survive JSON.parse when BingX sends a 64-bit ID.
 function preserveIds(body: string): unknown {
   return JSON.parse(
-    body.replace(/("(?:orderId|orderID|positionId|positionID)"\s*:\s*)(\d+)(?=\s*[,}])/g, '$1"$2"'),
+    body.replace(
+      /("(?:orderId|orderID|positionId|positionID|cancelOrderId|newOrderId)"\s*:\s*)(\d+)(?=\s*[,}])/g,
+      '$1"$2"',
+    ),
   );
 }
 
@@ -53,7 +56,7 @@ export class Bingx {
   }
 
   private async request<T>(
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "DELETE",
     path: string,
     params: Params,
     signed: boolean,
@@ -130,24 +133,51 @@ export class Bingx {
     );
   }
 
-  async order(symbol: string, clientOrderId: string): Promise<RawOrder> {
+  placeBatch(items: Params[]) {
+    if (items.length < 1 || items.length > 5)
+      throw new Error("BingX accepts up to five orders per batch.");
+    return this.request<{ orders?: RawOrder[]; errors?: RawOrder[] }>(
+      "POST",
+      "/openApi/swap/v2/trade/batchOrders",
+      { batchOrders: JSON.stringify(items) },
+      true,
+    );
+  }
+
+  replaceControl(params: Params) {
+    return this.request<RawOrder>("POST", "/openApi/swap/v1/trade/cancelReplace", params, true);
+  }
+
+  cancelOrder(symbol: string, orderId: string) {
+    return this.request<RawOrder>(
+      "DELETE",
+      "/openApi/swap/v2/trade/order",
+      { symbol, orderId },
+      true,
+    );
+  }
+
+  async order(symbol: string, clientOrderId: string, byVenueId = false): Promise<RawOrder> {
     const data = await this.privateGet<RawOrder>("/openApi/swap/v2/trade/order", {
       symbol,
-      clientOrderId,
+      ...(byVenueId ? { orderId: clientOrderId } : { clientOrderId }),
     });
     return data.order && typeof data.order === "object" ? (data.order as RawOrder) : data;
   }
 
-  async openOrders(symbol: string): Promise<RawOrder[]> {
+  async openOrders(symbol?: string): Promise<RawOrder[]> {
     const data = await this.privateGet<RawOrder[] | { orders: RawOrder[] }>(
       "/openApi/swap/v2/trade/openOrders",
-      { symbol },
+      symbol ? { symbol } : {},
     );
     return requireRows(Array.isArray(data) ? data : data.orders, "open orders");
   }
 
-  async positions(symbol: string): Promise<RawOrder[]> {
-    const data = await this.privateGet<RawOrder[]>("/openApi/swap/v2/user/positions", { symbol });
+  async positions(symbol?: string): Promise<RawOrder[]> {
+    const data = await this.privateGet<RawOrder[]>(
+      "/openApi/swap/v2/user/positions",
+      symbol ? { symbol } : {},
+    );
     return requireRows(data, "positions");
   }
 }

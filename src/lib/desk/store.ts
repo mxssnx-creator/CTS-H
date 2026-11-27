@@ -5,6 +5,7 @@ import {
   DEFAULT_FLOORS,
   LIVE_SHORT,
   MAX_LIVE_LEGS,
+  POSITION_RT_COST_PCT,
   TAG,
   type ActionId,
   type Floors,
@@ -44,7 +45,14 @@ import {
   type TapeFill,
 } from "./process.ts";
 import { EMPTY_HEALTH, healBooks, noteHealth, type Health } from "./heal.ts";
-import { closePnl, comboId, positionNotional } from "./math.ts";
+import {
+  RelationLedger,
+  normalizeStrategies,
+  newStrategyActions,
+  recordRelationClose,
+  type StrategySettings,
+} from "./strategies.ts";
+import { closePnl, comboId, positionNotional, stopCappedQty } from "./math.ts";
 
 export type DeskEvent = { t: number; kind: string; msg: string };
 
@@ -72,9 +80,6 @@ type Toggles = {
   autoEntries: boolean;
   normal: boolean;
   trailing: boolean;
-  axis: boolean;
-  block: boolean;
-  dca: boolean;
   hedge: boolean;
 };
 
@@ -92,6 +97,8 @@ type ConnectionState = {
   events: DeskEvent[];
   allow: Record<ActionId, boolean>;
   toggles: Toggles;
+  strategies: StrategySettings;
+  relationLedger: RelationLedger;
   floors: Floors;
   ticks: number;
   lastTs: number;
@@ -122,9 +129,11 @@ type DeskState = ConnectionState & {
   setConnection: (id: ConnectionId) => void;
   toggleAllow: (id: ActionId) => void;
   toggleStrat: (k: keyof Toggles) => void;
+  setStrategies: (patch: Partial<StrategySettings>) => void;
   setFloor: (k: keyof Floors, value: number) => void;
   flattenOwned: () => void;
   flattenLosers: () => void;
+  closePartial: (id: string, fraction: number) => void;
   halt: () => void;
   rewalk: () => void;
   manual: (side: 1 | -1) => void;
@@ -134,7 +143,7 @@ type DeskState = ConnectionState & {
 const allowAll = Object.fromEntries(ACTIONS.map((a) => [a, true])) as Record<ActionId, boolean>;
 const SESSION_KEY = "cts-h-settings";
 const LEGACY_KEY = "helix-ctsa-session";
-type Preferences = Partial<Pick<ConnectionState, "allow" | "toggles" | "floors">>;
+type Preferences = Partial<Pick<ConnectionState, "allow" | "toggles" | "floors" | "strategies">>;
 
 function log(events: DeskEvent[], kind: string, msg: string): DeskEvent[] {
   return [{ t: Date.now(), kind, msg }, ...events].slice(0, 120);
@@ -157,8 +166,11 @@ function readPreferences(id: ConnectionId): Preferences {
 function writePreferences(id: ConnectionId, s: Required<Preferences>) {
   if (typeof window === "undefined") return;
   try {
-    const { allow, toggles, floors } = s;
-    localStorage.setItem(`${SESSION_KEY}:${id}`, JSON.stringify({ allow, toggles, floors }));
+    const { allow, toggles, floors, strategies } = s;
+    localStorage.setItem(
+      `${SESSION_KEY}:${id}`,
+      JSON.stringify({ allow, toggles, floors, strategies }),
+    );
   } catch {
     // The active desk remains usable with storage disabled.
   }
@@ -182,13 +194,12 @@ function initialScope(saved: Preferences = {}): ConnectionState {
       autoEntries: false,
       normal: false,
       trailing: true,
-      axis: true,
-      block: true,
-      dca: false,
       hedge: true,
       ...saved.toggles,
     },
     floors: { ...DEFAULT_FLOORS, ...saved.floors },
+    strategies: normalizeStrategies(saved.strategies),
+    relationLedger: new RelationLedger(),
     ticks: 0,
     lastTs: 0,
     peak: BOOK,
@@ -251,6 +262,7 @@ export const useDesk = create<DeskState>((set, get) => ({
       writePreferences(s.connection, { ...s, allow });
       return {
         allow,
+        barSig: id === "trail_1_5" ? "" : s.barSig,
         orders: syncOrders({ ...s, allow }, s.positions),
         events: log(
           s.events,
@@ -263,7 +275,39 @@ export const useDesk = create<DeskState>((set, get) => ({
     set((s) => {
       const toggles = { ...s.toggles, [k]: !s.toggles[k] };
       writePreferences(s.connection, { ...s, toggles });
-      return { toggles, events: log(s.events, "allow", `${k} ${toggles[k] ? "ON" : "OFF"}`) };
+      return {
+        toggles,
+        barSig: k === "trailing" ? "" : s.barSig,
+        events: log(s.events, "allow", `${k} ${toggles[k] ? "ON" : "OFF"}`),
+      };
+    }),
+  setStrategies: (patch) =>
+    set((s) => {
+      const accepted = { ...patch };
+      const qualificationKeys = [
+        "minimumPf",
+        "autoPf",
+        "autoPfRecent",
+        "autoPfPenalty",
+        "autoPfSamples",
+      ] as const;
+      if (!s.allow.change_floors) for (const key of qualificationKeys) delete accepted[key];
+      const strategies = normalizeStrategies({ ...s.strategies, ...accepted });
+      writePreferences(s.connection, { ...s, strategies });
+      const rescore =
+        strategies.dynamic !== s.strategies.dynamic ||
+        strategies.breakeven !== s.strategies.breakeven ||
+        strategies.shortRange !== s.strategies.shortRange ||
+        strategies.wideRange !== s.strategies.wideRange ||
+        strategies.enabledIndications.join() !== s.strategies.enabledIndications.join() ||
+        strategies.trailActivation !== s.strategies.trailActivation ||
+        strategies.trailDistance !== s.strategies.trailDistance;
+      if (rescore) return { strategies, cells: [], barSig: "" };
+      const requalify = qualificationKeys.some((key) => strategies[key] !== s.strategies[key]);
+      return {
+        strategies,
+        cells: requalify ? applyFloors(s.cells, s.floors, strategies) : s.cells,
+      };
     }),
   setFloor: (k, value) =>
     set((s) => {
@@ -273,7 +317,7 @@ export const useDesk = create<DeskState>((set, get) => ({
       writePreferences(s.connection, { ...s, floors });
       return {
         floors,
-        cells: s.cells.length ? applyFloors(s.cells, floors) : s.cells,
+        cells: s.cells.length ? applyFloors(s.cells, floors, s.strategies) : s.cells,
         events: log(s.events, "allow", `floor ${k} ${value}`),
       };
     }),
@@ -300,6 +344,12 @@ export const useDesk = create<DeskState>((set, get) => ({
         return { events: log(s.events, "deny", "flatten_losers denied") };
       const losers = s.positions.filter((p) => closePnl(p.side, p.entry, p.mark, p.qty) < 0);
       return affectPositions(s, losers, "flatten_losers");
+    }),
+  closePartial: (id, fraction) =>
+    set((s) => {
+      if (!(fraction > 0 && fraction <= 1) || !s.allow.flatten_own) return s;
+      const rows = s.positions.filter((position) => position.id === id);
+      return affectPositions(s, rows, fraction < 1 ? "partial_close" : "flatten_own", fraction);
     }),
   manual: (side) =>
     set((s) => {
@@ -340,10 +390,11 @@ export const useDesk = create<DeskState>((set, get) => ({
       }
       const atr = atrSeries(book.bars).at(-1) ?? px * 0.001;
       const a = Math.max(atr, px * 0.0008);
-      const base = positionNotional(BOOK);
-      const qty = base / px;
+      const base = positionNotional(BOOK) * s.strategies.volumeFactor;
       const tp = LIVE_SHORT.minTp * a;
       const sl = LIVE_SHORT.minSlOfTp * tp;
+      if (!(px + side * tp > 0 && px - side * sl > 0)) return s;
+      const qty = stopCappedQty(base, px, sl, POSITION_RT_COST_PCT, side);
       const pos: LivePos = {
         id: `x:${TAG}${s.connection}:manual:${crypto.randomUUID()}`,
         symbol: book.symbol,
@@ -418,6 +469,11 @@ export const useDesk = create<DeskState>((set, get) => ({
             BOOK,
             s.floors,
             s.connection,
+            {
+              coordinated: true,
+              trailing: s.toggles.trailing && s.allow.trail_1_5,
+              trailRules: s.strategies,
+            },
           );
           cells = replay.cells;
           if (replay.internFills.length) internFills = mergeFills(internFills, replay.internFills);
@@ -456,6 +512,10 @@ export const useDesk = create<DeskState>((set, get) => ({
             ? cells.filter((c) => {
                 const time = barTime[c.symbol];
                 return (
+                  c.validExec &&
+                  !c.disabled &&
+                  c.net > 0 &&
+                  Boolean(c.signal ?? c.side) &&
                   time &&
                   c.cursorT === time &&
                   !have.has(key(c)) &&
@@ -464,24 +524,37 @@ export const useDesk = create<DeskState>((set, get) => ({
               })
             : [];
         if (eligible.length) {
+          const markets = new Set(eligible.map((cell) => cell.symbol));
           for (const book of books) {
             const mark = marks[book.symbol];
-            if (mark) mark.atr = atrSeries(book.bars).at(-1) ?? mark.price * 0.001;
+            if (mark && markets.has(book.symbol))
+              mark.atr = atrSeries(book.bars).at(-1) ?? mark.price * 0.001;
           }
-          const fresh = openFromPerforming(
+          const actions = newStrategyActions();
+          const add = openFromPerforming(
             eligible,
             marks,
             BOOK,
             {
-              block: s.allow.block_volume && s.toggles.block,
-              axis: s.allow.axis_volume && s.toggles.axis,
+              block: false,
+              axis: false,
+              trailing: s.toggles.trailing && s.allow.trail_1_5,
+              strategies: {
+                ...s.strategies,
+                axis: s.allow.axis_volume && s.strategies.axis,
+                block: s.allow.block_volume && s.strategies.block,
+                dca: s.allow.enable_dca && s.strategies.dca,
+                relate: s.allow.enable_relate && s.strategies.relate,
+              },
+              evidence: s.relationLedger,
+              actions,
+              limit: room,
               normalLive: s.allow.enable_normal_live && s.toggles.normal,
               hedge: s.toggles.hedge,
               floors: s.floors,
             },
             scope,
           );
-          const add = fresh.slice(0, room);
           for (const p of add) lastEntries[`${p.symbol}|${p.indication}`] = barTime[p.symbol]!;
           if (add.length) {
             positions = [...positions, ...add];
@@ -494,6 +567,10 @@ export const useDesk = create<DeskState>((set, get) => ({
               "open",
               `paper +${add.length} ${scope.system}/${scope.connection}`,
             );
+            if (actions.axis)
+              events = log(events, "axis", `${actions.axis} entries sized from closing evidence`);
+            if (actions.relate)
+              events = log(events, "relate", `${actions.relate} entries sized from scoped history`);
             if (s.allow.protect_grid) events = log(events, "protect", "SL+TP armed on owned legs");
           }
         }
@@ -509,18 +586,20 @@ export const useDesk = create<DeskState>((set, get) => ({
       if (split.owned.length && canAffect(s.connection)) {
         const marked = markPositions(split.owned, prices, {
           trail: s.allow.trail_1_5 && s.toggles.trailing,
-          dca: s.allow.enable_dca && s.toggles.dca,
+          dca: s.allow.enable_dca && s.strategies.dca,
+          block: s.allow.block_volume && s.strategies.block,
+          legacyDca: false,
           equity: BOOK,
           asOf,
         });
         const held = split.skipped;
         positions = [...marked.open, ...held];
-        if (marked.closed.length || marked.dca.length) {
+        if (marked.closed.length || marked.dca.length || marked.block.length) {
           coord = [
             coordHit(
               "mark",
               scope,
-              marked.closed.length + marked.dca.length,
+              marked.closed.length + marked.dca.length + marked.block.length,
               split.skipped.length,
               "closes and adds stay inside the scope",
             ),
@@ -532,8 +611,18 @@ export const useDesk = create<DeskState>((set, get) => ({
           if (closedIds.has(d.id)) continue;
           events = log(events, "dca", `${d.symbol} add ${d.dca} @ ${d.mark}`);
         }
+        for (const add of marked.block)
+          events = log(events, "block", `${add.symbol} add @ ${add.mark}`);
         for (const c of marked.closed) {
           closedNet += c.pnl;
+          if (c.pos.configId)
+            recordRelationClose(
+              s.relationLedger,
+              c.pos.configId,
+              c.pos.symbol,
+              c.pos.side,
+              c.pnl + (c.pos.realized ?? 0),
+            );
           liveFills = [
             {
               id: `x:${c.pos.id}:${ts}`,
@@ -545,6 +634,8 @@ export const useDesk = create<DeskState>((set, get) => ({
               ts,
               side: c.pos.side,
               indication: c.pos.indication,
+              coordination: c.pos.coordination,
+              quantity: c.pos.qty,
             },
             ...liveFills,
           ].slice(0, 200);
@@ -615,17 +706,30 @@ function syncOrders(
   return controlOrders(positions, { protect: s.allow.protect_grid, connection: s.connection });
 }
 
-function closeSome(s: DeskState, rows: LivePos[], reason: string): Partial<DeskState> {
+function closeSome(
+  s: DeskState,
+  rows: LivePos[],
+  reason: string,
+  fraction = 1,
+): Partial<DeskState> {
   if (!rows.length) return { events: log(s.events, "flat", "nothing in scope to close") };
-  const drop = new Set(rows.map((p) => p.id));
+  const changes = new Map<string, LivePos | null>();
   let closed = s.closedNet;
   let live = s.liveFills;
   for (const p of rows) {
-    const pnl = closePnl(p.side, p.entry, p.mark, p.qty);
+    const quantity = p.qty * fraction;
+    const pnl = closePnl(p.side, p.entry, p.mark, quantity);
     closed += pnl;
+    const realized = pnl + (p.realized ?? 0);
+    if (fraction === 1 && p.configId)
+      recordRelationClose(s.relationLedger, p.configId, p.symbol, p.side, realized);
+    changes.set(
+      p.id,
+      fraction < 1 ? { ...p, qty: p.qty - quantity, plan: undefined, realized } : null,
+    );
     live = [
       {
-        id: `x:${p.id}:${reason}`,
+        id: `x:${p.id}:${crypto.randomUUID()}`,
         tape: "live" as const,
         symbol: p.symbol,
         combo: p.combo,
@@ -634,11 +738,17 @@ function closeSome(s: DeskState, rows: LivePos[], reason: string): Partial<DeskS
         ts: Date.now(),
         side: p.side,
         indication: p.indication,
+        coordination: p.coordination,
+        quantity,
+        partial: fraction < 1,
       },
       ...live,
     ];
   }
-  const positions = s.positions.filter((p) => !drop.has(p.id));
+  const positions = s.positions.flatMap((p) => {
+    const updated = changes.get(p.id);
+    return updated === null ? [] : [updated ?? p];
+  });
   return {
     positions,
     orders: syncOrders(s, positions),
@@ -648,7 +758,12 @@ function closeSome(s: DeskState, rows: LivePos[], reason: string): Partial<DeskS
   };
 }
 
-function affectPositions(s: DeskState, rows: LivePos[], action: string): Partial<DeskState> {
+function affectPositions(
+  s: DeskState,
+  rows: LivePos[],
+  action: string,
+  fraction = 1,
+): Partial<DeskState> {
   const scope = positionScope(s.connection);
   const { owned, skipped } = partition(rows, scope);
   if (!canAffect(s.connection)) {
@@ -666,6 +781,7 @@ function affectPositions(s: DeskState, rows: LivePos[], action: string): Partial
     const quote = s.books.find((book) => book.symbol === position.symbol)?.quote;
     return (
       s.status === "live" &&
+      s.allow.connect_exchange &&
       quote &&
       !s.unavailable.includes(position.symbol) &&
       (quote.exchangeTime == null || Date.now() - quote.exchangeTime <= 20_000)
@@ -679,7 +795,7 @@ function affectPositions(s: DeskState, rows: LivePos[], action: string): Partial
     omitted,
     omitted > 0 ? "Closed only owned positions with fresh marks" : "scope match",
   );
-  const closed = closeSome(s, ready, action);
+  const closed = closeSome(s, ready, action, fraction);
   return {
     ...closed,
     coord: [hit, ...s.coord].slice(0, 40),

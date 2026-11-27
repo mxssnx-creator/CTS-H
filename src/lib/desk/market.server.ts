@@ -3,9 +3,10 @@ import { Bingx, BingxError, requireRows } from "./bingx.server.ts";
 import { requireConnection, requireSymbol, type ConnectionId } from "./connections.ts";
 import { PREFERRED_SYMBOLS } from "./constants.ts";
 import { saneBars } from "./heal.ts";
+import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "./intervals.ts";
 import type { Bar } from "./process.ts";
 
-export const HOUR_MS = 3_600_000;
+export { HOUR_MS } from "./intervals.ts";
 export const MAX_QUOTE_AGE_MS = 20_000;
 const KLINE_LOOKBACK = 132;
 const KLINE_MIN_SPACING = 1_075;
@@ -133,6 +134,7 @@ async function candleRequest(
   symbol: string,
   limit: number,
   end: number,
+  interval: CandleInterval,
 ): Promise<unknown> {
   const start = Date.now();
   const slot = Math.max(start, nextCandleSlot);
@@ -140,15 +142,15 @@ async function candleRequest(
   if (slot > start) await delay(slot - start);
   return client.publicGet("/openApi/swap/v3/quote/klines", {
     symbol,
-    interval: "1h",
-    startTime: end - limit * HOUR_MS,
+    interval,
+    startTime: end - limit * CANDLE_INTERVALS[interval],
     endTime: end - 1,
     limit,
   });
 }
 
-function contiguous(bars: Bar[], end: number) {
-  return bars.length > 0 && bars.every((bar, i) => bar.t === end - (bars.length - i) * HOUR_MS);
+function contiguous(bars: Bar[], end: number, step = HOUR_MS as number) {
+  return bars.length > 0 && bars.every((bar, i) => bar.t === end - (bars.length - i) * step);
 }
 
 export async function loadKlines(
@@ -156,25 +158,28 @@ export async function loadKlines(
   symbol: string,
   limit: number,
   end: number,
+  interval: CandleInterval = "1h",
 ): Promise<Bar[]> {
   const normalized = requireSymbol(symbol);
+  const step = CANDLE_INTERVALS[interval];
   if (
     !Number.isInteger(limit) ||
     limit < 1 ||
     limit > 1440 ||
     !Number.isSafeInteger(end) ||
-    end % HOUR_MS !== 0
+    !step ||
+    end % step !== 0
   ) {
-    throw new Error("Historical candles need an aligned UTC end and a limit of 1 to 1440 hours.");
+    throw new Error("Historical candles need an aligned UTC end and a limit of 1 to 1440 bars.");
   }
   const origin = client.connection.origin;
   return cached(
-    `${origin}:${normalized}:1h:${end}:${limit}`,
-    (bars: Bar[]) => (bars.length === limit && contiguous(bars, end) ? HOUR_MS : 5_000),
+    `${origin}:${normalized}:${interval}:${end}:${limit}`,
+    (bars: Bar[]) => (bars.length === limit && contiguous(bars, end, step) ? HOUR_MS : 5_000),
     async () => {
       let raw: unknown;
       try {
-        raw = await candleRequest(client, normalized, limit, end);
+        raw = await candleRequest(client, normalized, limit, end, interval);
       } catch (error) {
         if (
           error instanceof BingxError &&
@@ -184,7 +189,7 @@ export async function loadKlines(
         )
           throw error;
         await delay(5_000);
-        raw = await candleRequest(client, normalized, limit, end);
+        raw = await candleRequest(client, normalized, limit, end, interval);
       }
       const bars = requireRows(raw, "candles").map((row) => ({
         t: Number(row.time),
@@ -198,8 +203,8 @@ export async function loadKlines(
       return saneBars(bars.sort((a, b) => a.t - b.t)).filter(
         (bar) =>
           Number.isSafeInteger(bar.t) &&
-          bar.t % HOUR_MS === 0 &&
-          bar.t >= end - limit * HOUR_MS &&
+          bar.t % step === 0 &&
+          bar.t >= end - limit * step &&
           bar.t < end,
       );
     },
@@ -233,6 +238,37 @@ export async function loadFunding(client: Bingx, symbol: string): Promise<number
 }
 
 const EMPTY_DEPTH: Depth = { bids: [], asks: [] };
+const EMPTY_DETAIL = { depth: EMPTY_DEPTH, funding: null };
+
+async function focusDetails(client: Bingx, focus: string, quote: Quote | undefined) {
+  if (!quote) return EMPTY_DETAIL;
+  return cached(`${client.connection.origin}:${focus}:detail`, 5_000, async () => {
+    const [depth, funding] = await Promise.allSettled([
+      loadDepth(client, focus),
+      loadFunding(client, focus),
+    ]);
+    return {
+      depth: depth.status === "fulfilled" ? depth.value : EMPTY_DEPTH,
+      funding: funding.status === "fulfilled" ? funding.value : null,
+    };
+  });
+}
+
+export async function loadQuoteSnapshot(connection: ConnectionId, focus: string) {
+  const client = new Bingx(requireConnection(connection));
+  const quotes = await loadTickers(client);
+  const detail = await focusDetails(client, focus, quotes.get(focus));
+  const ts = client.now();
+  const books: BookSnap[] = [];
+  const unavailable: string[] = [];
+  for (const symbol of PREFERRED_SYMBOLS) {
+    const quote = quotes.get(symbol);
+    if (!quote || !quoteIsFresh(quote, ts)) unavailable.push(symbol);
+    if (quote)
+      books.push({ symbol, quote, bars: [], ...(focus === symbol ? detail : EMPTY_DETAIL) });
+  }
+  return { ts, books, unavailable, stale: unavailable.length === PREFERRED_SYMBOLS.length };
+}
 
 export async function loadSnapshot(
   connection: ConnectionId,
@@ -246,18 +282,7 @@ export async function loadSnapshot(
     PREFERRED_SYMBOLS.map((symbol) => loadKlines(client, symbol, KLINE_LOOKBACK, end)),
   );
   const quotes = await loadTickers(client);
-  const detail = quotes.has(focus)
-    ? await cached(`${client.connection.origin}:${focus}:detail`, 5_000, async () => {
-        const [depth, funding] = await Promise.allSettled([
-          loadDepth(client, focus),
-          loadFunding(client, focus),
-        ]);
-        return {
-          depth: depth.status === "fulfilled" ? depth.value : EMPTY_DEPTH,
-          funding: funding.status === "fulfilled" ? funding.value : null,
-        };
-      })
-    : { depth: EMPTY_DEPTH, funding: null };
+  const detail = await focusDetails(client, focus, quotes.get(focus));
   const unavailable: string[] = [];
   const books: BookSnap[] = [];
   const ts = client.now();
@@ -278,7 +303,7 @@ export async function loadSnapshot(
       symbol,
       quote,
       bars: knownEnd === end ? [] : result.value,
-      ...(focus === symbol ? detail : { depth: EMPTY_DEPTH, funding: null }),
+      ...(focus === symbol ? detail : EMPTY_DETAIL),
     });
   }
   return {

@@ -5,7 +5,7 @@ import { configurationKey, excludedConfigurations } from "./config-policy.ts";
 import {
   BOOK,
   DEFAULT_FLOORS,
-  INDICATIONS,
+  LEGACY_INDICATIONS,
   PREFERRED_SYMBOLS,
   REPLAY_SYMBOLS,
   WIDE_SL_OF_TP,
@@ -21,7 +21,7 @@ const standardConfigs = [
 ];
 const validKeys = new Set(
   standardConfigs.flatMap(({ tpAtr, slOfTp }) =>
-    INDICATIONS.map((indication) => configurationKey(indication, tpAtr, slOfTp)),
+    LEGACY_INDICATIONS.map((indication) => configurationKey(indication, tpAtr, slOfTp)),
   ),
 );
 

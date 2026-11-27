@@ -21,7 +21,9 @@ export const PF = {
   shortBlock: 1.15,
 };
 export const LIVE_SHORT = { minTp: 0.48, minSlOfTp: 0.75, maxTp: 0.6 };
-export const SHORT_TP = [0.3, 0.32, 0.34, 0.36, 0.38, 0.4, 0.42, 0.45, 0.48, 0.5, 0.52, 0.55, 0.58, 0.6];
+export const SHORT_TP = [
+  0.3, 0.32, 0.34, 0.36, 0.38, 0.4, 0.42, 0.45, 0.48, 0.5, 0.52, 0.55, 0.58, 0.6,
+];
 export const SHORT_SL = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5];
 export const TAG = "CTSH_";
 export const BOOK = 10_000;
@@ -44,6 +46,7 @@ export const ACTIONS = [
   "flatten_losers",
   "change_floors",
   "enable_dca",
+  "enable_relate",
   "enable_normal_live",
   "connect_exchange",
 ] as const;
@@ -55,16 +58,18 @@ export const ACTION_COPY: Record<ActionId, string> = {
   intern_all_pre: "Walk closed 1h bars through the enabled paper configurations",
   promote_real: "Promote last-N valid cells onto the performing set",
   live_paper_execute: "Open gated paper legs tagged CTS-H on the live tape",
-  block_volume: "Size Block additive 0.2 on N=1,3,4,5,6 (skip 2), cap 2.5×",
-  axis_volume: "Size Axis 3.0× partials, depth 2, same 2.5× cap",
+  block_volume: "Allow funded Block additions before the target",
+  axis_volume: "Allow Axis sizing when the lane qualifies",
   protect_grid: "Keep one SL and one TP on each owned leg",
-  trail_1_5: "Trail the stop 1.5% from peak",
+  trail_1_5: "Allow managed trailing stops",
   flatten_own: "Flatten positions whose system, connection, and type match the active scope",
   flatten_losers: "Flatten in-scope positions that are underwater",
   change_floors: "Edit PF floors used by the gate",
-  enable_dca: "Allow one extra clip when a leg is adverse (playbook still gates it)",
+  enable_dca: "Allow risk-bounded DCA additions",
+  enable_relate: "Allow Relate sizing for qualifying close histories",
   enable_normal_live: "Let the unadjusted direction lane print live",
-  connect_exchange: "Select the exchange connection. Only the active system, connection, and type are affected",
+  connect_exchange:
+    "Select the exchange connection. Only the active system, connection, and type are affected",
 };
 
 export const PREFERRED_SYMBOLS = [
@@ -78,17 +83,17 @@ export const PREFERRED_SYMBOLS = [
   "BNB-USDT",
   "ARB-USDT",
   "SUI-USDT",
-];
-
-// Liquid USDT perpetuals listed on both CTS-H BingX routes.
-export const REPLAY_SYMBOLS = [
-  ...PREFERRED_SYMBOLS,
   "BCH-USDT",
   "LTC-USDT",
   "ADA-USDT",
   "HBAR-USDT",
   "DOT-USDT",
   "NEAR-USDT",
+];
+
+// Liquid USDT perpetuals listed on both CTS-H BingX routes.
+export const REPLAY_SYMBOLS = [
+  ...PREFERRED_SYMBOLS,
   "AAVE-USDT",
   "UNI-USDT",
   "ATOM-USDT",
@@ -125,8 +130,31 @@ export const REPLAY_SYMBOLS = [
   "NEO-USDT",
 ];
 
-export const INDICATIONS = ["direction", "move", "break", "rsi", "macd", "bollinger", "ema", "active"] as const;
+export const LEGACY_INDICATIONS = [
+  "direction",
+  "move",
+  "break",
+  "rsi",
+  "macd",
+  "bollinger",
+  "ema",
+  "active",
+] as const;
+export const NEW_INDICATIONS = ["pullback", "rangeFade"] as const;
+export const INDICATIONS = [...LEGACY_INDICATIONS, ...NEW_INDICATIONS] as const;
 export type Indication = (typeof INDICATIONS)[number];
+export const INDICATION_LABELS: Record<Indication, string> = {
+  direction: "Trend direction",
+  move: "Price impulse",
+  break: "Range breakout",
+  rsi: "RSI",
+  macd: "MACD",
+  bollinger: "Bollinger",
+  ema: "EMA cross",
+  active: "Volume activity",
+  pullback: "EMA pullback",
+  rangeFade: "Range fade",
+};
 
 export type Floors = {
   overall: number;
