@@ -25,6 +25,10 @@ const ANCHOR_MS = 4 * HOUR_MS;
 const BULL = 5;
 const BEAR = -5;
 const FIRST_TEST = 12;
+// WALK=minpf (Experiment E): eligibility and the recency gate both need a pooled PF of at least MIN_PF.
+const minPfWalk = process.env.WALK === "minpf";
+const MIN_PF = Number(process.env.MIN_PF ?? 1.1);
+const RECENT_WINDOWS = Number(process.env.RECENT_WINDOWS ?? 6);
 const MIN_POSITIONS = 300;
 const MIN_POSITIVE_SHARE = 0.6;
 const FIELDS = 12;
@@ -198,6 +202,20 @@ for (let k = FIRST_TEST; k < K; k++) {
     const g = gp[at]! - gp[at0]!;
     const l = gl[at]! - gl[at0]!;
     const n = net[at]! - net[at0]!;
+    if (minPfWalk) {
+      // Experiment E: pooled training PF at or above MIN_PF, and the same over the last RECENT_WINDOWS training windows.
+      if (p < MIN_POSITIONS) continue;
+      if (profitFactor(g, l) < MIN_PF) continue;
+      const from = s * (K + 1) + Math.max(0, k - RECENT_WINDOWS);
+      if (profitFactor(gp[at]! - gp[from]!, gl[at]! - gl[from]!) < MIN_PF) continue;
+      eligible += 1;
+      const score = profitFactor(g, l);
+      if (score > bestScore) {
+        bestScore = score;
+        best = s;
+      }
+      continue;
+    }
     if (p < MIN_POSITIONS || l <= 0 || n <= 0) continue;
     const pf = g / l;
     if (pf < 1) continue;
@@ -264,7 +282,7 @@ const result = {
   markets: markets.length,
   sets: S,
   windows: windows.length,
-  rules: { bull: BULL, bear: BEAR, firstTestWindow: FIRST_TEST, minPositions: MIN_POSITIONS, minPositiveShare: MIN_POSITIVE_SHARE },
+  rules: minPfWalk ? { walk: "minpf", minPf: MIN_PF, recentWindows: RECENT_WINDOWS, firstTestWindow: FIRST_TEST, minPositions: MIN_POSITIONS } : { walk: "positive-share", bull: BULL, bear: BEAR, firstTestWindow: FIRST_TEST, minPositions: MIN_POSITIONS, minPositiveShare: MIN_POSITIVE_SHARE },
   regimeCounts: Object.fromEntries(["BULL", "BEAR", "CHOP"].map((r) => [r, windows.filter((w) => w.regime === r).length])),
   oosByRegime: Object.fromEntries(
     [...oosByRegime.entries()].map(([regime, t]) => [
@@ -282,7 +300,7 @@ const result = {
   seconds: Math.round((Date.now() - started) / 1000),
 };
 mkdirSync(outDir, { recursive: true });
-writeFileSync(join(outDir, `regime-${interval}${atrBrackets ? "-atr" : ""}${trendMode === "on" ? "-trend" : trendMode === "breadth" ? "-breadth" : ""}.json`), JSON.stringify(result, null, 1));
+writeFileSync(join(outDir, `regime-${interval}${atrBrackets ? "-atr" : ""}${trendMode === "on" ? "-trend" : trendMode === "breadth" ? "-breadth" : ""}${minPfWalk ? "-minpf" : ""}.json`), JSON.stringify(result, null, 1));
 console.log(`${interval}: ${S} sets, ${markets.length} markets, ${windows.length} windows (${JSON.stringify(result.regimeCounts)}), ${result.seconds}s`);
 console.log(`  out of sample pooled PF ${result.oosPooled.pf}, net ${result.oosPooled.net}, traded ${result.oosPooled.tradedWindows}, flat ${result.oosPooled.flatWindows}`);
 for (const [regime, row] of Object.entries(result.oosByRegime)) console.log(`  ${regime}: traded ${row.tradedWindows}, flat ${row.flatWindows}, PF ${row.pf}, net ${row.net}`);

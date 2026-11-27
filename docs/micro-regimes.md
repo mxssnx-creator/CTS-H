@@ -70,3 +70,12 @@ Rules, fixed before the run.
 - Regimes: BULL PF 1.21 (7 windows, net +41), BEAR PF 1.20 (13 windows, net +90), CHOP PF 0.80 (17 windows, net −123).
 - Pre-registered criterion: not met. The first half is negative and CHOP is below 1.00. The best result so far is breakeven overall, with the bull and bear sides both positive.
 - The walk picked eight different sets across 37 windows, which is the signature of selection noise rather than one stable edge.
+
+## Experiment E: minimum-PF validation (pre-registered before the run)
+
+- The minimum PF is 1.10: one round trip of costs of margin, by the convention in docs/conventions.md (1.1 equals one round trip of costs when costs are 10% of gross loss).
+- Training eligibility, pooled over every training window: at least 300 positions, pooled PF at least 1.10.
+- Recency gate: the same set's pooled PF over the last six training windows must also be at least 1.10. A set that fails it does not trade.
+- Score: pooled training PF. The highest-scoring eligible set trades the test window. If none is eligible, the window is flat, which reads PF 1.00.
+- Validation: pooled out-of-sample PF at or above 1.10, in each regime with at least five traded windows, and in each time half. Also reported: the share of traded windows with positive net. A "consistently positive" claim needs that share to be high as well as the PF.
+- Brackets: ATR, as Experiment B. Direction: the breadth gate of Experiment D, and without it. Timeframes: 4h, 1h and 30m.
