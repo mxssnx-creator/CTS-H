@@ -31,6 +31,7 @@ function bookWith(bars: Bar[], signalAt: number, side: 1 | -1, indication: "volu
   return {
     interval: "1m",
     bars,
+    atr: new Float64Array(bars.length).fill(2),
     signals: { [indication]: { at: Int32Array.from([signalAt]), side: Int8Array.from([side]) } },
   };
 }
@@ -285,7 +286,7 @@ test("the streaming state gives the same fills as the batch run on the same bars
   at.forEach((index, k) => {
     signalOn[index] = side[k]!;
   });
-  const book: MicroBook = { interval: "1m", bars, signals: { volumeBreak: { at: Int32Array.from(at), side: Int8Array.from(side) } } };
+  const book: MicroBook = { interval: "1m", bars, atr: new Float64Array(bars.length).fill(2), signals: { volumeBreak: { at: Int32Array.from(at), side: Int8Array.from(side) } } };
   const variants: MicroSet[] = [
     setOf({ tp: 0.2, sl: 0.2, holdMinutes: 30 }),
     setOf({ tp: 0.5, sl: 0.3, trail: { kind: "dynamic", retrace: 0.4 }, holdMinutes: 120, partial: 0.5 }),
@@ -307,4 +308,23 @@ test("the streaming state gives the same fills as the batch run on the same bars
     assert.deepEqual(streamFills, batchFills, set.id);
     assert.ok(streaming.flat, "the window end leaves the state flat");
   }
+});
+
+test("ATR brackets sit multiples of the signal-bar ATR beyond the cost", () => {
+  // ATR 2 on the signal bar, so a 1.0 ATR target sits at 100 + 2 + 0.12 = 102.12 and the 1.0 ATR stop at 97.88.
+  const bars = [bar(0, 100, 100, 100, 100), bar(1, 100, 100, 100, 100), bar(2, 100, 102.5, 99.9, 102.2), bar(3, 102.2, 102.3, 101.9, 102.1)];
+  const book = bookWith(bars, 0, 1);
+  const { trace } = run(book, setOf({ bracket: "atr", tp: 1, sl: 1, holdMinutes: 60 }), 4);
+  assert.equal(trace.length, 1);
+  assert.equal(trace[0]!.reason, "tp");
+  assert.ok(Math.abs(trace[0]!.price - 102.12) < 1e-12);
+});
+
+test("an ATR bracket does not enter without an ATR value", () => {
+  const bars = [bar(0, 100, 100, 100, 100), bar(1, 100, 100, 100, 100), bar(2, 100, 102.5, 99.9, 102.2)];
+  const book = bookWith(bars, 0, 1);
+  book.atr = new Float64Array(bars.length).fill(Number.NaN);
+  const { acc, trace } = run(book, setOf({ bracket: "atr", tp: 1, sl: 1 }), 3);
+  assert.equal(trace.length, 0);
+  assert.equal(acc.positions, 0);
 });

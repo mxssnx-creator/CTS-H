@@ -51,6 +51,8 @@ export type MicroSet = {
   holdMinutes: number;
   // Share of the position closed at the first target touch; 0 disables the partial.
   partial: number;
+  // percent: tp and sl are percent of the entry. atr: tp and sl are multiples of the ATR at the signal bar.
+  bracket?: "percent" | "atr";
 };
 
 export type MicroGrid = {
@@ -61,6 +63,7 @@ export type MicroGrid = {
   sl: readonly number[];
   retrace: readonly number[];
   partials: readonly number[];
+  brackets?: readonly ("percent" | "atr")[];
 };
 
 // The main search trades both directions, as the brief asks. Long-only and short-only are diagnostics for chosen sets.
@@ -79,7 +82,7 @@ export function trailLabel(trail: Trail): string {
 }
 
 export function microSetId(set: Omit<MicroSet, "id">): string {
-  return [
+  const base = [
     set.interval,
     set.indication,
     set.direction,
@@ -88,22 +91,26 @@ export function microSetId(set: Omit<MicroSet, "id">): string {
     trailLabel(set.trail),
     `h${set.holdMinutes}`,
     `p${set.partial.toFixed(1)}`,
-  ].join("|");
+  ];
+  // Percent ids stay as they were; ATR brackets carry an extra token.
+  return (set.bracket === "atr" ? [...base, "atr"] : base).join("|");
 }
 
 export function enumerateMicroSets(grid: MicroGrid = MICRO_GRID): MicroSet[] {
   const trails: Trail[] = [{ kind: "fixed" }, ...grid.retrace.map((retrace): Trail => ({ kind: "dynamic", retrace }))];
   const sets: MicroSet[] = [];
-  for (const interval of grid.intervals) {
-    for (const indication of grid.indications) {
-      for (const direction of grid.directions) {
-        for (const tp of grid.tp) {
-          for (const sl of grid.sl) {
-            for (const trail of trails) {
-              for (const holdMinutes of MICRO_HOLDS[interval]) {
-                for (const partial of grid.partials) {
-                  const base = { interval, indication, direction, tp, sl, trail, holdMinutes, partial };
-                  sets.push({ ...base, id: microSetId(base) });
+  for (const bracket of grid.brackets ?? ["percent"]) {
+    for (const interval of grid.intervals) {
+      for (const indication of grid.indications) {
+        for (const direction of grid.directions) {
+          for (const tp of grid.tp) {
+            for (const sl of grid.sl) {
+              for (const trail of trails) {
+                for (const holdMinutes of MICRO_HOLDS[interval]) {
+                  for (const partial of grid.partials) {
+                    const base = { interval, indication, direction, tp, sl, trail, holdMinutes, partial, bracket };
+                    sets.push({ ...base, id: microSetId(base) });
+                  }
                 }
               }
             }
@@ -156,7 +163,8 @@ export function barIndexAt(bars: readonly Bar[], t: number): number {
 }
 
 export type SignalEvents = { at: Int32Array; side: Int8Array };
-export type MicroBook = { interval: CandleInterval; bars: Bar[]; signals: Partial<Record<Indication, SignalEvents>> };
+// atr: the ATR14 at each bar, in price units, causal. ATR brackets read it at the signal bar.
+export type MicroBook = { interval: CandleInterval; bars: Bar[]; atr: Float64Array; signals: Partial<Record<Indication, SignalEvents>> };
 
 // Signals for every indication, as sparse lists of closed-bar indices. The indicator series are causal, so
 // the signal at bar i depends only on bars up to i.
@@ -175,7 +183,7 @@ export function buildMicroBook(bars: Bar[], interval: CandleInterval, indication
     }
     signals[indication] = { at: Int32Array.from(at), side: Int8Array.from(side) };
   }
-  return { interval, bars, signals };
+  return { interval, bars, signals, atr: Float64Array.from(series.atr) };
 }
 
 export type Closes = { pnls: number[]; costs: number[] };
@@ -226,6 +234,7 @@ export class MicroState {
   private readonly retrace: number;
   private readonly partial: number;
   private readonly onlySide: 0 | 1 | -1;
+  private readonly atrBracket: boolean;
   private open = false;
   private side: Side = 1;
   private entry = 0;
@@ -252,6 +261,7 @@ export class MicroState {
     this.retrace = set.trail.kind === "dynamic" ? set.trail.retrace : 0;
     this.partial = set.partial;
     this.onlySide = set.direction === "long" ? 1 : set.direction === "short" ? -1 : 0;
+    this.atrBracket = set.bracket === "atr";
   }
 
   get flat(): boolean {
@@ -273,12 +283,13 @@ export class MicroState {
   // Feeds one closed bar. `signal` is the indication's signal on the bar before this one (0 for none); a flat state
   // opens at this bar's open. `last` closes any open position at this bar's close. `allow`, when given, is asked at
   // entry and decides whether the position is booked.
-  onBar(bar: Bar, index: number, signal: Side | 0, last: boolean, allow: ((index: number) => boolean) | null, emit: (fill: Fill) => void): void {
+  onBar(bar: Bar, index: number, signal: Side | 0, last: boolean, allow: ((index: number) => boolean) | null, emit: (fill: Fill) => void, entryAtr = Number.NaN): void {
     if (!this.open) {
       if (signal === 0) return;
       if (this.onlySide !== 0 && signal !== this.onlySide) return;
       const entry = bar.o;
       if (!(entry > 0)) return;
+      if (this.atrBracket && !(entryAtr > 0)) return;
       const side = signal;
       this.open = true;
       this.side = side;
@@ -287,10 +298,13 @@ export class MicroState {
       this.booked = allow ? allow(index) : true;
       this.positionNet = 0;
       this.qty = this.notional / entry;
-      // Target and stop sit percent beyond the round-trip cost, on both sides of the entry.
+      // Percent brackets sit percent of the entry beyond the round-trip cost. ATR brackets sit multiples of the ATR at the
+      // signal bar beyond the cost. Both sit on both sides of the entry.
       const costAbs = entry * this.cost;
-      this.target = entry + side * (entry * this.tpFrac + costAbs);
-      this.stop = entry - side * (entry * this.slFrac + costAbs);
+      const tpUnits = this.atrBracket ? entryAtr * this.set.tp : entry * this.tpFrac;
+      const slUnits = this.atrBracket ? entryAtr * this.set.sl : entry * this.slFrac;
+      this.target = entry + side * (tpUnits + costAbs);
+      this.stop = entry - side * (slUnits + costAbs);
       this.remaining = 1;
       this.activated = false;
       this.partialTaken = false;
@@ -465,10 +479,10 @@ export class MicroRun {
   }
 
   // Feeds one closed bar, books its fills, and posts the change of the booked open mark to the bar's slot.
-  step(bar: Bar, index: number, signal: Side | 0, last: boolean, allow: ((index: number) => boolean) | null, acc: MicroAcc, closes?: Closes): void {
+  step(bar: Bar, index: number, signal: Side | 0, last: boolean, allow: ((index: number) => boolean) | null, acc: MicroAcc, closes?: Closes, entryAtr = Number.NaN): void {
     this.acc = acc;
     this.closes = closes;
-    this.state.onBar(bar, index, signal, last, allow, this.emit);
+    this.state.onBar(bar, index, signal, last, allow, this.emit, entryAtr);
     const mark = this.state.mark(bar.c);
     const slot = slotOf(acc, bar.t);
     if (slot >= 0 && slot < acc.slotDelta.length) acc.slotDelta[slot] = acc.slotDelta[slot]! + (mark - this.lastMark);
@@ -508,7 +522,7 @@ export function simulateMicro(book: MicroBook, set: MicroSet, from: number, to: 
       signal = events.side[k]! as Side;
       k++;
     }
-    run.step(bars[b]!, b, signal, b === to - 1, allow, acc, closes);
+    run.step(bars[b]!, b, signal, b === to - 1, allow, acc, closes, book.atr[b - 1] ?? Number.NaN);
     b++;
   }
 }

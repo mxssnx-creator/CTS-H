@@ -18,3 +18,20 @@ Rules, fixed before the run.
 - Reported: out-of-sample pooled PF and net, windows traded and flat, results by regime, and a population baseline (all sets pooled per window). Also the long and short PF of the whole grid by regime, to show direction dependence.
 - Success, judged pre-registration: a configuration is profitable across regimes if its out-of-sample pooled PF is above 1.00 in each of the BULL, BEAR and CHOP regimes, with at least five traded windows in each. Anything else is reported as not profitable across regimes.
 - Limits: windows overlap no test with its own training history. Fills are bar-based, costs are the model's round trip, and there is no funding or slippage beyond the model.
+
+## Experiment A result: percent brackets, 4 hours (recorded, not changed)
+
+- 48 markets, 49 windows: 9 BULL, 19 BEAR, 21 CHOP. Test windows from window 12: 37.
+- Eligible sets per test window: median 0, maximum 5. The walk traded 2 windows: BEAR with PF 0.70 (net −29), CHOP with PF 0.65 (net −78). It stayed flat in the other 35.
+- Out of sample: pooled PF 0.67, net −107. Population median PF per window 0.54 over all 18,620 sets.
+- Population by regime: BULL long PF 0.68 and short PF 0.40; BEAR long 0.44 and short 0.75; CHOP long 0.66 and short 0.54. Both directions lose in every regime.
+- Cause identified: the median 4-hour ATR14 is 2.38% of price (interquartile 1.84% to 3.07%). The percent grid's stops are 0.32% to 0.92% including cost, inside one candle's normal range. That explains why 82% of exits at 4 hours are stop-outs.
+
+## Experiment B: ATR-scaled brackets (pre-registered before any run)
+
+- Brackets: target = tpMult × ATR14 + round-trip cost, stop = slMult × ATR14 + cost. ATR14 is taken on the last closed bar before entry, and is causal.
+- tpMult in {0.5, 1.0, 1.5, 2.0, 3.0}. slMult in {0.5, 1.0, 1.5, 2.0}.
+- Everything else as before: 19 indications, both directions, fixed or dynamic trail (retrace 0.3 to 0.6), two holds per timeframe, partial 0 or 0.5. That is 7,600 sets per timeframe.
+- Windows, regime labels, walk rule and success criterion as in Experiment A.
+- Timeframes: 4h first, then 1h and 30m as their candles finish.
+- Not part of the brief's percent grid: it is a second bracket family, reported separately.

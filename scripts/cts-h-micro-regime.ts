@@ -79,7 +79,10 @@ const windows = spans.map((span, w) => {
   return { name: `W${w}`, start: span.start, end: span.end, markets: moves.length, medianMove: Number(median.toFixed(2)), regime };
 });
 
-const sets = enumerateMicroSets({ ...MICRO_GRID, intervals: [interval] });
+// BRACKET=atr runs Experiment B: target and stop as multiples of the ATR, the grid fixed in docs/micro-regimes.md.
+const atrBrackets = process.env.BRACKET === "atr";
+const grid = atrBrackets ? { ...MICRO_GRID, brackets: ["atr"] as const, tp: [0.5, 1.0, 1.5, 2.0, 3.0], sl: [0.5, 1.0, 1.5, 2.0] } : MICRO_GRID;
+const sets = enumerateMicroSets({ ...grid, intervals: [interval] });
 const S = sets.length;
 const accs = windows.map((window) => newMicroAcc(window.start, step, slots));
 const stats = new Float64Array(S * K * FIELDS);
@@ -219,6 +222,7 @@ for (let w = 0; w < K; w++) {
 
 const result = {
   interval,
+  brackets: atrBrackets ? "atr" : "percent",
   markets: markets.length,
   sets: S,
   windows: windows.length,
@@ -240,7 +244,7 @@ const result = {
   seconds: Math.round((Date.now() - started) / 1000),
 };
 mkdirSync(outDir, { recursive: true });
-writeFileSync(join(outDir, `regime-${interval}.json`), JSON.stringify(result, null, 1));
+writeFileSync(join(outDir, `regime-${interval}${atrBrackets ? "-atr" : ""}.json`), JSON.stringify(result, null, 1));
 console.log(`${interval}: ${S} sets, ${markets.length} markets, ${windows.length} windows (${JSON.stringify(result.regimeCounts)}), ${result.seconds}s`);
 console.log(`  out of sample pooled PF ${result.oosPooled.pf}, net ${result.oosPooled.net}, traded ${result.oosPooled.tradedWindows}, flat ${result.oosPooled.flatWindows}`);
 for (const [regime, row] of Object.entries(result.oosByRegime)) console.log(`  ${regime}: traded ${row.tradedWindows}, flat ${row.flatWindows}, PF ${row.pf}, net ${row.net}`);
