@@ -64,6 +64,26 @@ Use `--history-hours 1000` for a continuous capture that supports earlier cutoff
 
 The CLI and web desk accept 1m, 5m, 15m, 30m, 1h and 4h candles. Settings are retained independently per connection and interval, and open paper positions retain their original interval and hold limit. The engine warms indicators on 22 contiguous candles and selects one configuration per market using the pre window. Holdout entries use the next open, ambiguous stops and targets settle at the stop, and open positions close at the boundary. Coordinated intraday holds are configured in minutes; other cases use 24 candles. Profitable periods use hourly equity on intervals up to 1h and four-hour equity on 4h candles. Drawdown uses candle equity. The CLI models the venue taker fee and configurable `--slip-bps` per fill. The browser uses a fixed 0.12% round-trip cost. Funding payments, depth-limited execution and liquidation are outside the model.
 
+### Period reports and coverage
+
+`--html` writes the full report. `--markdown` writes the same results as text, and `--period-hours` (default 4) sets the period length. Periods start at the beginning of each window, so a 120-hour holdout with 4-hour periods has exactly 30 full lines, and the 72-hour prehistory has 18. Each run also includes a coverage table with one row per indication and range. The table shows how many configurations were evaluated, how many reached the closes minimum, how many passed the gates, which symbols selected them, and the signal counts in each window. The status column explains each empty row. Low-frequency indications can clear every gate with a longer prehistory, so a short window can leave them with no qualifying configuration even when their signals are sound.
+
+The replay evaluates only the selected configuration for each market in the holdout. Candidate configurations are still scored in the prehistory. Portfolio results match the full candidate replay, and the run is much faster. `--selected-only` is accepted for compatibility and no longer changes the output.
+
+The command below reproduces the five-day, 30-market run. The bingx-x01 candles are captured and written to the same folder as the report.
+
+```sh
+node scripts/cts-h.ts replay --connection bingx-x01 \
+  --symbols BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,AVAX-USDT,LINK-USDT,BNB-USDT,ARB-USDT,SUI-USDT,BCH-USDT,LTC-USDT,ADA-USDT,HBAR-USDT,DOT-USDT,NEAR-USDT,AAVE-USDT,UNI-USDT,ATOM-USDT,FIL-USDT,INJ-USDT,OP-USDT,ETC-USDT,APT-USDT,SEI-USDT,WLD-USDT,ALGO-USDT,XLM-USDT,TRX-USDT,FET-USDT \
+  --hours 120 --pre-hours 72 --interval 1h --profile coordinated \
+  --indication all --strategies axis,block,dca,relate \
+  --capture reports/coordinated-5d-3d-30-markets-1h/capture.json \
+  --html reports/coordinated-5d-3d-30-markets-1h/cts-h-replay.html \
+  --markdown reports/coordinated-5d-3d-30-markets-1h/cts-h-replay.md
+```
+
+Use `npm run --silent desk -- replay …` when you need JSON on stdout, because `npm run` otherwise prints its own header.
+
 ### Configuration selection
 
 The default **coordinated** profile qualifies each enabled indication, bracket and stop mode independently. It ranks eligible candidates by profitable periods and uses realized P&L to break ties. It adds EMA pullback and range fade. The **filtered** profile adds 0.8–2.0 ATR targets with 0.5–1.5× stop-to-target ratios to the execution-eligible short grid. The **baseline** preserves the original grid. Filtered and coordinated sizing cap modeled stop risk plus costs at 0.8% of planned position notional. Coordinated sizing reduces entry size after two consecutive losses.

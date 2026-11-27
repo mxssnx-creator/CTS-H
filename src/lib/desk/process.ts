@@ -1245,13 +1245,38 @@ export type SessionReport = {
   greenBookPre: number;
   greenBookLive: number;
   bookNames: string[];
+  coverage: CoverageRow[];
   selected: {
     name: string;
     symbol: string;
+    indication: Indication;
+    range: "short" | "wide";
     requiredPf: number;
     pre: ReplaySummary;
     replay: ReplaySummary;
   }[];
+};
+
+export type CoverageRow = {
+  indication: Indication;
+  range: "short" | "wide";
+  // Configurations of this indication and range considered for each symbol.
+  configs: number;
+  // Configurations skipped by the published calibration exclusions.
+  excluded: number;
+  // Configurations that closed at least one trade in the prehistory.
+  withCloses: number;
+  // Configurations with the minimum closes required for qualification.
+  reachedSamples: number;
+  // Configurations passing the PF, sample and follow-through gates.
+  passed: number;
+  // Highest prehistory PF among configurations that reached the closes minimum.
+  bestPf: number;
+  // Symbols whose selected configuration uses this indication and range.
+  selected: number;
+  // Raw indication signals on the closed candles of each window.
+  signalsPre: number;
+  signalsReplay: number;
 };
 
 export type ReplaySize = "base" | "block" | "axis" | "both";
@@ -1337,7 +1362,11 @@ export function summarizeReplay(rows: HourPoint[]): ReplaySummary {
 }
 
 function addHours(dst: HourAcc[], src: readonly HourAcc[], scale = 1) {
-  for (const [index, row] of src.entries()) {
+  const count = src.length;
+  for (let index = 0; index < count; index++) {
+    const row = src[index]!;
+    // Idle hours contribute nothing; most candidate configurations are idle in most hours.
+    if (!row.trades && !row.realized && !row.mtm && !row.openLegs) continue;
     const out = dst[index]!;
     out.trades += row.trades;
     out.wins += row.wins;
@@ -1427,6 +1456,10 @@ function replayWindow(
   let priorMark = 0;
   let priorPnl: number | undefined;
   let earlierPnl: number | undefined;
+  const micro = CANDLE_INTERVALS[interval] <= 15 * 60_000;
+  const maxHold = micro && trailRules
+    ? Math.ceil(trailRules.microHoldMinutes * 60_000 / CANDLE_INTERVALS[interval])
+    : MAX_HOLD;
   for (let offset = 0; offset < slots.length; offset++) {
     const row = slots[offset]!;
     if (gateAtBar) gateAtBar[offset] = gate?.cell.validExec ?? true;
@@ -1444,7 +1477,7 @@ function replayWindow(
     const side = signals[i - 1];
     if (!leg && offset > 0 && side) {
       const dist = targetDistance(tpAtr, atr[i - 1] ?? 0, bar.o, cost,
-        CANDLE_INTERVALS[interval] <= 15 * 60_000 ? trailRules?.microTargetCosts : 0);
+        micro ? trailRules?.microTargetCosts : 0);
       const stopDistance = dist * slOfTp;
       const planned = throttle ? notional * sizeAfterLosses(earlierPnl, priorPnl) : notional;
       const tp = bar.o + side * dist;
@@ -1464,9 +1497,6 @@ function replayWindow(
       }
     }
     if (leg) {
-      const maxHold = CANDLE_INTERVALS[interval] <= 15 * 60_000 && trailRules
-        ? Math.ceil(trailRules.microHoldMinutes * 60_000 / CANDLE_INTERVALS[interval])
-        : MAX_HOLD;
       const hit = exitOnBar(leg.side, leg.tp, leg.sl, bar, ++leg.hold, maxHold);
       if (hit || offset === slots.length - 1) {
         const pnl = closePnl(leg.side, leg.entry, hit?.exit ?? bar.c, leg.qty, cost);
@@ -1513,6 +1543,8 @@ function rankPre(rows: HourAcc[], byHour = false, checkRecent = false) {
   let recentSamples = 0;
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!;
+    // Idle hours add nothing to the sums or green count; a later active hour still closes the prior one.
+    if (!row.trades && !row.realized && !row.mtm) continue;
     gp += row.grossProfit;
     gl += row.grossLoss;
     n += row.trades;
@@ -1757,6 +1789,25 @@ export function simulateSessions(
         }) / notional
       : 1;
   const selected: SessionReport["selected"] = [];
+  const coverage = new Map<string, CoverageRow>();
+  for (const config of configs) {
+    const key = `${config.indication}|${config.range}`;
+    if (!coverage.has(key))
+      coverage.set(key, {
+        indication: config.indication,
+        range: config.range,
+        configs: 0,
+        excluded: 0,
+        withCloses: 0,
+        reachedSamples: 0,
+        passed: 0,
+        bestPf: 0,
+        selected: 0,
+        signalsPre: 0,
+        signalsReplay: 0,
+      });
+  }
+  const signalTally = new Map<Indication, { pre: number; replay: number }>();
   let proven = 0;
   let disabledConfigs = 0;
   let rejectedPf = 0;
@@ -1784,11 +1835,23 @@ export function simulateSessions(
         bars.map((_, i) => signalAt(indication, bars, series, i)),
       ]),
     );
+    for (const [indication, signals] of signalsByIndication) {
+      const tally = signalTally.get(indication) ?? { pre: 0, replay: 0 };
+      for (let i = WARMUP; i < signals.length; i++) {
+        if (!signals[i]) continue;
+        if (i < replayFrom) tally.pre++;
+        else tally.replay++;
+      }
+      signalTally.set(indication, tally);
+    }
     for (const config of configs) {
+      const cov = coverage.get(`${config.indication}|${config.range}`)!;
       if (excluded.has(`${symbol}|${config.key}`)) {
         disabledConfigs++;
+        cov.excluded++;
         continue;
       }
+      cov.configs++;
       const { indication, tpAtr, slOfTp } = config;
       const signals = signalsByIndication.get(indication)!;
       replayWindow(
@@ -1819,6 +1882,12 @@ export function simulateSessions(
         quality.net > 0 &&
         quality.pf >= threshold &&
         followThrough;
+      if (quality.n > 0) cov.withCloses++;
+      if (quality.n >= minSamples) {
+        cov.reachedSamples++;
+        cov.bestPf = Math.max(cov.bestPf, quality.pf);
+      }
+      if (pass) cov.passed++;
       addHours(preAcc, preWork);
       if (config.liveFloor && !pass) rejectedPf++;
       if (!pass && !baseline) continue;
@@ -1882,7 +1951,7 @@ export function simulateSessions(
           for (let i = 0; i < replayLength; i++) Object.assign(bestLive[i]!, liveWork[i]);
       }
     }
-    if (name) {
+    if (name && winner) {
       let gateAtBar: boolean[] | undefined;
       if (winner && (selectedOnly || (onlineGate && strategies))) {
         gateAtBar = onlineGate ? [] : undefined;
@@ -1913,9 +1982,12 @@ export function simulateSessions(
           gateAtBar,
         });
       } else addHours(bookLiveAcc, bestLive, scale);
+      coverage.get(`${winner.indication}|${winner.range}`)!.selected++;
       selected.push({
         name,
         symbol,
+        indication: winner.indication,
+        range: winner.range,
         requiredPf: selectedFloor,
         pre: summarizeCandles(bestPre, step),
         replay: summarizeCandles(bestLive, step),
@@ -2011,6 +2083,11 @@ export function simulateSessions(
     greenBookPre: d.green,
     greenBookLive: e.green,
     bookNames: selected.map((r) => r.name),
+    coverage: [...coverage.values()].map((row) => ({
+      ...row,
+      signalsPre: signalTally.get(row.indication)?.pre ?? 0,
+      signalsReplay: signalTally.get(row.indication)?.replay ?? 0,
+    })),
     selected,
   };
 }
@@ -2124,6 +2201,29 @@ function simulateReselected(
     bookEquityLive: { net: position, peak, trough, drawdown },
     greenBookLive: d.green,
     bookNames: selected.map((row) => row.name),
+    coverage: mergeCoverage(reports.map((report) => report.coverage)),
     selected,
   };
+}
+
+function mergeCoverage(parts: CoverageRow[][]): CoverageRow[] {
+  const merged = new Map<string, CoverageRow>();
+  for (const part of parts) {
+    for (const row of part) {
+      const key = `${row.indication}|${row.range}`;
+      const total = merged.get(key) ?? { ...row, configs: 0, excluded: 0, withCloses: 0,
+        reachedSamples: 0, passed: 0, bestPf: 0, selected: 0, signalsPre: 0, signalsReplay: 0 };
+      total.configs += row.configs;
+      total.excluded += row.excluded;
+      total.withCloses += row.withCloses;
+      total.reachedSamples += row.reachedSamples;
+      total.passed += row.passed;
+      total.bestPf = Math.max(total.bestPf, row.bestPf);
+      total.selected += row.selected;
+      total.signalsPre += row.signalsPre;
+      total.signalsReplay += row.signalsReplay;
+      merged.set(key, total);
+    }
+  }
+  return [...merged.values()];
 }

@@ -36,7 +36,7 @@ import {
   normalizeStrategies,
   type StrategySettings,
 } from "../src/lib/desk/strategies.ts";
-import { captureReplay, renderReplay, runReplay, type Capture } from "./cts-h-replay.ts";
+import { captureReplay, renderMarkdown, renderReplay, runReplay, type Capture } from "./cts-h-replay.ts";
 
 const HELP = `CTS-H BingX Trading Desk
   brief [--connection bingx-x02] [--symbol ETH-USDT]
@@ -44,7 +44,8 @@ const HELP = `CTS-H BingX Trading Desk
          [--symbols BTC-USDT,ETH-USDT] [--end ISO] [--history-hours 132] [--input candles.json] [--capture candles.json]
          [--profile coordinated|filtered|baseline|both|all] [--indication NAME|all] [--range short|wide]
          [--strategies none|axis,block,dca,relate] [--min-pf 1.0] [--auto-pf on|off]
-         [--strategy-settings config.json] [--volume-factor 1.0] [--selected-only] [--independent-indications] [--reselect-hours 24] [--html report.html]
+         [--strategy-settings config.json] [--volume-factor 1.0] [--independent-indications] [--reselect-hours 24]
+         [--period-hours 4] [--html report.html] [--markdown report.md]
   doctor
   account --connection bingx-x02
   propose --connection bingx-x02 --symbol ETH-USDT --side long --qty N --stop N --target N --why TEXT
@@ -134,6 +135,8 @@ async function main() {
       "strategy-settings": { type: "string" },
       "volume-factor": { type: "string" },
       "selected-only": { type: "boolean" },
+      "period-hours": { type: "string" },
+      markdown: { type: "string" },
       "independent-indications": { type: "boolean" },
       "reselect-hours": { type: "string" },
       "min-pf": { type: "string" },
@@ -303,6 +306,8 @@ async function main() {
       if (!books.length) throw new Error("No requested markets exist in the capture.");
       return { ...capture, end: cutoff, books };
     });
+    const periodHours = number(values["period-hours"] ?? "4", "period hours", [1, 336]);
+    if (!Number.isInteger(periodHours)) throw new Error("Period hours must be a whole number.");
     const runs = replayInput.flatMap((capture) => {
       const strategies = normalizeStrategies({
         ...defaultForInterval(capture.interval ?? "1h"),
@@ -313,14 +318,16 @@ async function main() {
           preHours,
           indication: indication as Indication | undefined,
           range,
-          selectedOnly: values["selected-only"],
+          // Portfolio outcomes match the full candidate replay; only selected cells are replayed.
+          selectedOnly: true,
           independentIndications: values["independent-indications"],
           reselectHours,
         }),
       );
     });
     if (values.capture) await writeFile(values.capture, JSON.stringify(captures), { flag: "wx" });
-    if (values.html) await writeFile(values.html, renderReplay(runs), { flag: "wx" });
+    if (values.html) await writeFile(values.html, renderReplay(runs, "", periodHours), { flag: "wx" });
+    if (values.markdown) await writeFile(values.markdown, renderMarkdown(runs, periodHours), { flag: "wx" });
     print(
       runs.map(({ report, ...run }) => ({
         ...run,

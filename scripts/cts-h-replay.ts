@@ -7,15 +7,17 @@ import {
   CALIBRATION_EVIDENCE,
 } from "../src/lib/desk/calibration.ts";
 import type { ReplayProfile } from "../src/lib/desk/config-policy.ts";
-import { BOOK, DEFAULT_FLOORS, POSITION_RT_COST_PCT } from "../src/lib/desk/constants.ts";
+import { BOOK, DEFAULT_FLOORS, LASTN, POSITION_RT_COST_PCT } from "../src/lib/desk/constants.ts";
 import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/intervals.ts";
 import { loadKlines } from "../src/lib/desk/market.server.ts";
 import { positionNotional } from "../src/lib/desk/math.ts";
+import { periodRows, type PeriodRow } from "../src/lib/desk/periods.ts";
 import {
   simulateSessions,
   sizedNotional,
   summarizeReplay,
   type Bar,
+  type CoverageRow,
   type ReplayOpts,
   type ReplaySize,
   type SessionReport,
@@ -237,7 +239,145 @@ function profileName(run: ReplayRun) {
   return run.strategySettings?.autoPf ? `${label} · Auto PF` : label;
 }
 
-export function renderReplay(runs: ReplayRun[], introduction = ""): string {
+const PERIOD_HEAD = [
+  "UTC period start", "UTC period end", "Hours", "Closes", "Wins", "Losses", "Win rate",
+  "Realized", "MTM change", "Net", "Cumulative net", "Gross profit", "Gross loss", "Trade PF",
+  "Positive hours", "Period drawdown", "Open legs at end",
+];
+const periodCells = (row: PeriodRow): (string | number)[] => [
+  iso(row.start), iso(row.end), row.hours, row.trades, row.wins, row.losses,
+  row.winRate === null ? "—" : `${fmt(row.winRate * 100)}%`,
+  row.realized, row.mtm, row.net, row.cumulative, row.grossProfit, row.grossLoss,
+  pf(row.grossProfit, row.grossLoss), row.positiveHours, row.drawdown, row.openLegsEnd,
+];
+
+export function minimumCloses(run: { strategySettings: StrategySettings | null }) {
+  return run.strategySettings?.autoPf ? run.strategySettings.autoPfSamples : LASTN.minSamples;
+}
+
+export function coverageStatus(row: CoverageRow, minSamples: number): string {
+  if (row.configs === 0) return "Every configuration excluded by published calibration";
+  if (row.selected) return `Selected on ${row.selected} symbol${row.selected === 1 ? "" : "s"}`;
+  if (row.passed) return "Passed the gates but was not the best configuration on any symbol";
+  if (row.reachedSamples) return "Reached the closes minimum; PF, net or follow-through gate failed";
+  if (row.withCloses) return `Below the ${minSamples}-close minimum in the prehistory`;
+  if (row.signalsPre) return "Signals in the prehistory produced no closes";
+  return "No signals in the prehistory";
+}
+
+function coverageDetail(run: ReplayRun) {
+  const minSamples = minimumCloses(run);
+  return run.report.coverage.map((row) => {
+    const picks = run.report.selected.filter(
+      (item) => item.indication === row.indication && item.range === row.range,
+    );
+    const gp = picks.reduce((total, item) => total + item.replay.grossProfit, 0);
+    const gl = picks.reduce((total, item) => total + item.replay.grossLoss, 0);
+    return {
+      row,
+      closes: picks.reduce((total, item) => total + item.replay.samples, 0),
+      gp,
+      gl,
+      net: picks.reduce((total, item) => total + item.replay.net, 0),
+      status: coverageStatus(row, minSamples),
+    };
+  });
+}
+
+const COVERAGE_HEAD = [
+  "Indication", "Range", "Configurations", "Excluded", "With prehistory closes",
+  "At closes minimum", "Best prehistory PF at minimum", "Passed gates", "Selected symbols", "Prehistory signals",
+  "Holdout signals", "Selected holdout closes", "Selected PF", "Selected net", "Status",
+];
+function coverageTable(run: ReplayRun) {
+  return table(
+    COVERAGE_HEAD,
+    coverageDetail(run)
+      .map(({ row, closes, gp, gl, net, status }) =>
+        `<tr><td>${esc(row.indication)}</td><td>${esc(row.range)}</td>${[
+          row.configs, row.excluded, row.withCloses, row.reachedSamples,
+          row.reachedSamples ? fmt(row.bestPf) : "—", row.passed,
+          row.selected, row.signalsPre, row.signalsReplay, closes, pf(gp, gl), net,
+        ].map(cell).join("")}<td>${esc(status)}</td></tr>`,
+      )
+      .join(""),
+  );
+}
+
+// Accepts the per-period rows produced by `periodRows` for one run.
+function periodTable(rows: PeriodRow[]) {
+  return table(PERIOD_HEAD, rows.map((row) => `<tr>${periodCells(row).map((v, i) => i < 2 ? `<td>${esc(String(v))}</td>` : cell(v)).join("")}</tr>`).join(""));
+}
+
+function markdownTable(head: string[], body: (string | number)[][]) {
+  const text = (v: string | number) => (typeof v === "number" ? fmt(v) : v).replace(/\|/g, "\\|");
+  return [
+    `| ${head.join(" | ")} |`,
+    `| ${head.map(() => "---").join(" | ")} |`,
+    ...body.map((values) => `| ${values.map(text).join(" | ")} |`),
+  ].join("\n");
+}
+
+export function renderMarkdown(runs: ReplayRun[], periodHours = 4): string {
+  const sections = runs.map((run) => {
+    const holdoutStart = run.end - run.hours * HOUR_MS;
+    const holdout = periodRows(run.report.bookLive, periodHours, holdoutStart);
+    const prehistory = periodRows(run.report.bookPre, periodHours, holdoutStart - run.preHours * HOUR_MS);
+    const base = run.variants[0]!;
+    const coverage = coverageDetail(run);
+    const selected = run.report.selected.map((item) => [
+      item.name, item.indication, item.range, `${fmt(run.costs[item.symbol]! * 100)}%`,
+      item.pre.samples, pf(item.pre.grossProfit, item.pre.grossLoss), item.requiredPf,
+      item.replay.samples, pf(item.replay.grossProfit, item.replay.grossLoss),
+      item.replay.net, item.replay.drawdown, item.replay.green,
+    ]);
+    return [
+      `## ${run.connection} · ${run.interval} · ${profileName(run)} · ${iso(run.end)}`,
+      "",
+      `- Source: ${run.origin}`,
+      `- Symbols with complete coverage: ${run.report.symbols} of ${run.requested}`,
+      `- Holdout: ${run.hours}h starting ${iso(run.end - run.hours * HOUR_MS)}; prehistory: ${run.preHours}h starting ${iso(run.end - (run.hours + run.preHours) * HOUR_MS)}`,
+      `- Holdout result: ${fmt(base.replay.net)} net, ${base.replay.samples} closes, PF ${pf(base.replay.grossProfit, base.replay.grossLoss)}, ${base.replay.green} of ${run.report.bookLive.length} periods positive, drawdown ${fmt(base.replay.drawdown)}`,
+      `- Configurations scored: ${fmt(run.report.evaluatedConfigs)}; failed preselection: ${fmt(run.report.rejectedPf)}; excluded by calibration: ${run.report.disabledConfigs}`,
+      `- Strategy actions: ${STRATEGY_TYPES.map((kind) => `${STRATEGY_LABELS[kind]} ${run.report.strategyActions[kind]}`).join(", ")}`,
+      `- Slippage: ${run.slipBps} bp per fill; costs and fee fallbacks: ${run.feesEstimated.length ? run.feesEstimated.join(", ") : "none"}`,
+      `- Capture and cost SHA-256: ${run.evidence}`,
+      "",
+      `### Holdout by ${periodHours}-hour period (UTC, from ${iso(holdoutStart)})`,
+      "",
+      markdownTable(PERIOD_HEAD, holdout.map(periodCells)),
+      "",
+      `### Prehistory by ${periodHours}-hour period (UTC, from ${iso(holdoutStart - run.preHours * HOUR_MS)})`,
+      "",
+      markdownTable(PERIOD_HEAD, prehistory.map(periodCells)),
+      "",
+      "### Indication and range coverage",
+      "",
+      markdownTable(
+        COVERAGE_HEAD,
+        coverage.map(({ row, closes, gp, gl, net, status }) => [
+          row.indication, row.range, row.configs, row.excluded, row.withCloses,
+          row.reachedSamples, row.reachedSamples ? row.bestPf : "—", row.passed, row.selected,
+          row.signalsPre, row.signalsReplay,
+          closes, pf(gp, gl), net, status,
+        ]),
+      ),
+      "",
+      "### Selections by symbol",
+      "",
+      markdownTable(
+        ["Symbol and configuration", "Indication", "Range", "Costs", "Prehistory closes",
+          "Prehistory PF", "Required PF", "Holdout closes", "Holdout PF", "Holdout net",
+          "Holdout drawdown", "Positive periods"],
+        selected,
+      ),
+      "",
+    ].join("\n");
+  });
+  return ["# CTS-H replay · period report", "", ...sections].join("\n");
+}
+
+export function renderReplay(runs: ReplayRun[], introduction = "", periodHours = 4): string {
   const comparisons = runs
     .filter((run) => run.profile !== "baseline")
     .flatMap((after) => {
@@ -383,6 +523,13 @@ export function renderReplay(runs: ReplayRun[], introduction = ""): string {
       ${run.feesEstimated.length ? `<p>Fee fallback applied to ${esc(run.feesEstimated.join(", "))}.</p>` : ""}
       <h3>Holdout P&amp;L</h3><div class="chart" role="img" aria-label="Net profit and loss per reporting period">${bars}</div>
       ${table(["UTC period", "Closes", "Wins", "Losses", "Realized", "MTM change", "Net", "Trade PF", "Open"], hourly)}
+      <h3>Holdout by ${periodHours}-hour period (UTC, from the window start)</h3>
+      ${periodTable(periodRows(raw.bookLive, periodHours, run.end - run.hours * HOUR_MS))}
+      <h3>Prehistory by ${periodHours}-hour period (UTC, from the window start)</h3>
+      ${periodTable(periodRows(raw.bookPre, periodHours, run.end - (run.hours + run.preHours) * HOUR_MS))}
+      <h3>Indication and range coverage</h3>
+      <p>Every indication and range is evaluated on each symbol. A cell without a selection shows the gate that stopped it.</p>
+      ${coverageTable(run)}
       ${independent ? `<h3>Independent indications</h3><p>Each indication selects its own qualifying configuration per market and period. These portfolios overlap and are not additive.</p>${table(["Indication", "Selections", "Closes", "PF", "Net", "Drawdown", "Positive hours"], independent)}` : ""}
       <h3>Selections by period</h3>
       ${table(["Symbol and configuration", "Costs", "Pre closes", "Pre PF", "Required PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD"], selected)}
