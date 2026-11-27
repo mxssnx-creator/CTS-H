@@ -1,3 +1,4 @@
+import type { ReplayProfile } from "../src/lib/desk/config-policy.ts";
 import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -10,7 +11,7 @@ import {
   requireSymbol,
   type PrivateConnection,
 } from "../src/lib/desk/connections.ts";
-import { PREFERRED_SYMBOLS } from "../src/lib/desk/constants.ts";
+import { REPLAY_SYMBOLS } from "../src/lib/desk/constants.ts";
 import {
   account,
   approve,
@@ -21,13 +22,19 @@ import {
   type Limits,
 } from "../src/lib/desk/execution.server.ts";
 import { Journal } from "../src/lib/desk/journal.server.ts";
-import { loadDepth, loadFunding, loadQuote, quoteIsFresh } from "../src/lib/desk/market.server.ts";
+import {
+  HOUR_MS,
+  loadDepth,
+  loadFunding,
+  loadQuote,
+  quoteIsFresh,
+} from "../src/lib/desk/market.server.ts";
 import { captureReplay, renderReplay, runReplay, type Capture } from "./cts-h-replay.ts";
 
 const HELP = `CTS-H BingX Trading Desk
   brief [--connection bingx-x02] [--symbol ETH-USDT]
-  replay [--connection bingx-x01|bingx-x02|both] [--hours 12|24|48] [--symbols BTC-USDT,ETH-USDT] [--end ISO] [--html report.html] [--capture candles.json]
-  replay --input candles.json [--hours 48] [--html report.html]
+  replay [--connection bingx-x01|bingx-x02|both] [--hours 12|24|48] [--symbols BTC-USDT,ETH-USDT] [--end ISO] [--history-hours 132] [--profile filtered|baseline|both] [--html report.html] [--capture candles.json]
+  replay --input candles.json [--hours 48] [--end ISO] [--profile filtered|baseline|both] [--html report.html]
   doctor
   account --connection bingx-x02
   propose --connection bingx-x02 --symbol ETH-USDT --side long --qty N --stop N --target N --why TEXT
@@ -104,6 +111,8 @@ async function main() {
       symbol: { type: "string" },
       symbols: { type: "string" },
       hours: { type: "string" },
+      "history-hours": { type: "string" },
+      profile: { type: "string" },
       end: { type: "string" },
       html: { type: "string" },
       input: { type: "string" },
@@ -163,26 +172,46 @@ async function main() {
     const hours = Number(values.hours ?? 48);
     if (hours !== 12 && hours !== 24 && hours !== 48)
       throw new Error("Replay hours must be 12, 24 or 48.");
+    const history = number(values["history-hours"] ?? "132", "history hours", [
+      hours * 2 + 22,
+      1440,
+    ]);
+    if (!Number.isInteger(history)) throw new Error("History hours must be a whole number.");
     const slip = number(values["slip-bps"] ?? "1", "slippage basis points", [0, 200]);
     const source = values.connection ?? "bingx-x01";
     const connections = source === "both" ? ["bingx-x01", "bingx-x02"] : [source];
-    const symbols = [
-      ...new Set((values.symbols?.split(",") ?? PREFERRED_SYMBOLS).map(requireSymbol)),
-    ];
+    const symbols = [...new Set((values.symbols?.split(",") ?? REPLAY_SYMBOLS).map(requireSymbol))];
     if (!symbols.length || symbols.length > 50) throw new Error("Supply 1 to 50 unique symbols.");
     const end = values.end ? Date.parse(values.end) : undefined;
-    if (values.end && !/Z$/.test(values.end)) throw new Error("Use a UTC replay end ending in Z.");
+    if (
+      end !== undefined &&
+      (!values.end!.endsWith("Z") || !Number.isSafeInteger(end) || end <= 0 || end % HOUR_MS !== 0)
+    ) {
+      throw new Error("Use a replay cutoff on a UTC hour ending in Z.");
+    }
     const input = values.input
       ? (JSON.parse(await readFile(values.input, "utf8")) as Capture[])
       : null;
     const captures =
       input ??
       (await Promise.all(
-        connections.map((c) => captureReplay(requireConnection(c).id, symbols, end)),
+        connections.map((c) => captureReplay(requireConnection(c).id, symbols, end, history)),
       ));
     if (!Array.isArray(captures) || !captures.length)
       throw new Error("Expected a capture array from CTS-H.");
-    const runs = captures.map((capture) => runReplay(capture, hours, slip));
+    if (input && end !== undefined && captures.some((capture) => end > capture.end)) {
+      throw new Error("Choose a replay end at or before the latest captured closed hour.");
+    }
+    const replayInput =
+      input && end !== undefined ? captures.map((capture) => ({ ...capture, end })) : captures;
+    const profile = values.profile ?? "filtered";
+    if (profile !== "filtered" && profile !== "baseline" && profile !== "both") {
+      throw new Error("Choose the filtered, baseline or both replay profiles.");
+    }
+    const profiles: ReplayProfile[] = profile === "both" ? ["baseline", "filtered"] : [profile];
+    const runs = replayInput.flatMap((capture) =>
+      profiles.map((selection) => runReplay(capture, hours, slip, selection)),
+    );
     if (values.capture) await writeFile(values.capture, JSON.stringify(captures), { flag: "wx" });
     if (values.html) await writeFile(values.html, renderReplay(runs), { flag: "wx" });
     print(
@@ -191,6 +220,8 @@ async function main() {
         symbols: report.symbols,
         unavailable: report.unavailable,
         qualifying: report.proven,
+        evaluatedConfigs: report.evaluatedConfigs,
+        disabledConfigs: report.disabledConfigs,
         chosen: report.bookNames,
       })),
     );

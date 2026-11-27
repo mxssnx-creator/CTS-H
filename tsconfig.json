@@ -33,6 +33,7 @@
     "src",
     "server",
     "scripts/cts-h.ts",
+    "scripts/cts-h-calibrate.ts",
     "scripts/cts-h-replay.ts"
   ]
 }

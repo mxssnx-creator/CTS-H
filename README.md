@@ -37,17 +37,34 @@ Run validation from the local checkout. Load `desk-operating-model`, then ask th
 
 ## Replay
 
-```sh
-npm run desk -- replay --connection both --hours 48 \
-  --symbols BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,BCH-USDT \
-  --html cts-h-replay.html --capture cts-h-candles.json
+The CLI defaults to 50 USDT perpetuals available on both BingX feeds. The web desk replays its active watchlist in a Web Worker.
 
-npm run desk -- replay --input cts-h-candles.json --hours 48
+```sh
+npm run desk -- replay --connection both --hours 48 --profile both \
+  --html cts-h-replay.html --capture cts-h-candles.json
+npm run desk -- replay --input cts-h-candles.json --hours 48 --profile both
 ```
 
-Specify a closed UTC cutoff with `--end 2026-11-27T08:00:00Z`. The engine requires contiguous one-hour candles, uses 22 bars to warm the indicators and selects one configuration per symbol on the pre window. The holdout starts flat, prices an entry at the next open, uses the adverse stop when both triggers are touched and closes any remaining simulated position at the boundary. The CLI uses the venue taker schedule and a configurable `--slip-bps` per fill. The browser replay uses the paper desk’s fixed 0.12% round-trip cost. Reports distinguish complete coverage, trade PF, green hours, and hourly drawdown. Axis and Block in this desk scale size. They preserve the base configuration's trade sequence.
+Use `--symbols BTC-USDT,ETH-USDT` for a narrower run. Use `--end 2026-11-27T08:00:00Z` for a historical cutoff. A continuous capture made with `--history-hours 1000` supports replaying earlier cutoffs from the same data.
 
-Public REST history calls are paced to BingX’s allowance. Warm browser refreshes reuse closed bars and request updated quotes. Replays in the browser run in a Web Worker. The public feed and the replay do not query account endpoints. The simulation models fees and slippage but omits funding payments, queue fills, liquidation, and execution in periods the browser was disconnected.
+The engine requires contiguous one-hour candles, warms indicators on 22 bars and selects one configuration per symbol from the pre window. The holdout starts flat, enters at the next open, uses the adverse stop when both triggers are touched and closes any remaining simulated position at the boundary. The CLI uses the venue taker schedule and a configurable `--slip-bps` per fill. The browser uses a fixed 0.12% round-trip cost. Axis and Block scales preserve the base trade sequence. Funding payments, depth-limited execution and liquidation are outside the replay model.
+
+### Configuration selection
+
+The default **filtered** profile keeps the execution-eligible short grid and adds 0.8–2.0 ATR targets with 0.5–1.5× stop-to-target ratios. Entry sizing caps the modeled stop distance plus round-trip cost at 0.8% of planned position notional. It omits published exclusions and walks the holdout only for candidates that qualify on the pre window. Automatic paper scoring uses the same exclusions for the active connection. The **baseline** replay profile retains the original short-grid selection for direct comparison. Both profiles use the same price, fee and slippage model.
+
+The exclusion data is scoped by connection, symbol, indication and bracket. It takes effect after the last calibration window. An exclusion required at least 24 closes, pooled PF no greater than 0.80, at least three losing periods with six or more closes each and zero adequately sampled winning periods. Each historical comparison uses six calibration windows ending from 22 October through 11 November 2026. The comparative evaluation windows end on 15, 19, 21, 23, 25 and 27 November. Sign-off and signed operator tickets follow the operator workflow below.
+
+Rebuild the configuration evidence from a continuous capture with the following command. The optional `--policy` argument exports the lists into a new TypeScript file.
+
+```sh
+node scripts/cts-h-calibrate.ts --input cts-h-history.json \
+  --end 2026-10-22T08:00:00Z --end 2026-10-26T08:00:00Z \
+  --end 2026-10-30T08:00:00Z --end 2026-11-03T08:00:00Z \
+  --end 2026-11-07T08:00:00Z --end 2026-11-11T08:00:00Z
+```
+
+Public REST history queries are paced. Warm browser refreshes reuse closed bars and fetch updated quotes.
 
 ## Operator tickets
 

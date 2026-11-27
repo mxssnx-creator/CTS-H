@@ -7,9 +7,13 @@ import {
   POSITION_RT_COST_PCT,
   TAG,
   TRAIL_PCT,
+  WIDE_SL_OF_TP,
+  WIDE_TP_ATR,
   type Floors,
   type Indication,
 } from "./constants.ts";
+import { configurationKey, excludedConfigurations, type ReplayProfile } from "./config-policy.ts";
+import type { ConnectionId } from "./connections.ts";
 import { saneBars } from "./heal.ts";
 import {
   allShortCombos,
@@ -22,6 +26,7 @@ import {
   pfFromPnls,
   positionNotional,
   profitFactor,
+  stopCappedQty,
 } from "./math.ts";
 
 export type Bar = {
@@ -112,6 +117,32 @@ export type Series = {
 };
 
 const PF_NO_LOSS_NEAR = 3.999;
+const REPLAY_HOUR = 3_600_000;
+const WARMUP = 22;
+const SHORT_COMBOS = allShortCombos();
+const STRATEGY_CONFIGS = INDICATIONS.flatMap((indication) =>
+  SHORT_COMBOS.map(({ tpAtr, slOfTp }) => ({
+    indication,
+    tpAtr,
+    slOfTp,
+    key: configurationKey(indication, tpAtr, slOfTp),
+    liveFloor: liveShortOk(tpAtr, slOfTp),
+  })),
+);
+const EXECUTION_CONFIGS = [
+  ...STRATEGY_CONFIGS.filter((config) => config.liveFloor),
+  ...INDICATIONS.flatMap((indication) =>
+    WIDE_TP_ATR.flatMap((tpAtr) =>
+      WIDE_SL_OF_TP.map((slOfTp) => ({
+        indication,
+        tpAtr,
+        slOfTp,
+        key: configurationKey(indication, tpAtr, slOfTp),
+        liveFloor: true,
+      })),
+    ),
+  ),
+];
 
 export function atrSeries(bars: Bar[], n = 14): number[] {
   const out = new Array<number>(bars.length).fill(0);
@@ -381,14 +412,15 @@ export function gateCell(cell: Cell, floors: Floors) {
   cell.disabled = !validStill && dis.length >= LASTN.minSamples && disNet < 0;
 }
 
-function blankCell(symbol: string, indication: Indication, tpAtr: number, slOfTp: number): Cell {
+function blankCell(symbol: string, config: (typeof STRATEGY_CONFIGS)[number]): Cell {
+  const { key, indication, tpAtr, slOfTp, liveFloor } = config;
   return {
-    id: `${symbol}|${indication}|${comboId(tpAtr, slOfTp)}`,
+    id: `${symbol}|${key}`,
     symbol,
     indication,
     tpAtr,
     slOfTp,
-    liveFloor: liveShortOk(tpAtr, slOfTp),
+    liveFloor,
     n: 0,
     wins: 0,
     gw: 0,
@@ -427,6 +459,7 @@ function advance(
   atr: number[],
   notional: number,
   from: number,
+  capped: boolean,
   push: (fill: TapeFill) => void,
 ) {
   const start = Math.max(from, 22);
@@ -445,7 +478,7 @@ function advance(
         entry: b.c,
         tp: b.c + side * tpDist,
         sl: b.c - side * slDist,
-        qty: notional / b.c,
+        qty: capped ? stopCappedQty(notional, b.c, slDist, POSITION_RT_COST_PCT) : notional / b.c,
         hold: 0,
       };
       continue;
@@ -480,10 +513,11 @@ export function syncBooks(
   books: { symbol: string; bars: Bar[] }[],
   equity: number,
   floors: Floors,
+  connection?: ConnectionId,
 ): { cells: Cell[]; internFills: TapeFill[]; closes: number; valid: number; symbols: number } {
   const byId = new Map(prev.map((c) => [c.id, c]));
   const notional = positionNotional(equity);
-  const combos = allShortCombos();
+  const configs = connection ? EXECUTION_CONFIGS : STRATEGY_CONFIGS;
   const cells: Cell[] = [];
   const cap = 240;
   const ring: TapeFill[] = [];
@@ -499,6 +533,8 @@ export function syncBooks(
     const bars = closedBars(saneBars(book.bars));
     if (bars.length < 24) continue;
     symbols += 1;
+    const lastT = bars.at(-1)!.t;
+    const excluded = excludedConfigurations(connection, lastT + REPLAY_HOUR);
     const series = buildSeries(bars);
     const sides = {} as Record<Indication, Array<Side | 0>>;
     for (const indication of INDICATIONS) {
@@ -506,23 +542,29 @@ export function syncBooks(
       for (let i = 22; i < bars.length; i++) row[i] = signalAt(indication, bars, series, i);
       sides[indication] = row;
     }
-    for (const combo of combos) {
-      for (const indication of INDICATIONS) {
-        const id = `${book.symbol}|${indication}|${comboId(combo.tpAtr, combo.slOfTp)}`;
-        const lastT = bars.at(-1)?.t ?? 0;
-        const prior = byId.get(id);
-        const stale = !!prior && prior.cursorT > lastT;
-        const cell =
-          prior && !stale
-            ? { ...prior, lastN: prior.lastN.slice(), leg: prior.leg ? { ...prior.leg } : null }
-            : blankCell(book.symbol, indication, combo.tpAtr, combo.slOfTp);
-        const from = cell.cursorT ? indexAfter(bars, cell.cursorT) : 22;
-        const before = cell.n;
-        advance(cell, bars, sides[indication]!, series.atr, notional, from, push);
-        closes += cell.n - before;
-        gateCell(cell, floors);
-        cells.push(cell);
-      }
+    for (const config of configs) {
+      const id = `${book.symbol}|${config.key}`;
+      if (excluded.has(id)) continue;
+      const prior = byId.get(id);
+      const cell =
+        prior && prior.cursorT <= lastT
+          ? { ...prior, lastN: prior.lastN.slice(), leg: prior.leg ? { ...prior.leg } : null }
+          : blankCell(book.symbol, config);
+      const from = cell.cursorT ? indexAfter(bars, cell.cursorT) : WARMUP;
+      const before = cell.n;
+      advance(
+        cell,
+        bars,
+        sides[config.indication]!,
+        series.atr,
+        notional,
+        from,
+        Boolean(connection),
+        push,
+      );
+      closes += cell.n - before;
+      gateCell(cell, floors);
+      cells.push(cell);
     }
   }
   let valid = 0;
@@ -592,15 +634,15 @@ export function openFromPerforming(
       block: opts.block && c.pf >= (opts.floors?.block ?? 0),
       axis: opts.axis && c.pf >= (opts.floors?.axis ?? 0),
     });
-    const qty = notional / m.price;
     const tpDist = c.tpAtr * a;
     const slDist = c.slOfTp * tpDist;
+    const qty = stopCappedQty(notional, m.price, slDist, POSITION_RT_COST_PCT);
     out.push({
       id: `x:${TAG}${scope.connection}:${c.id}:${c.cursorT}`,
       symbol: c.symbol,
       side,
       qty,
-      qtyBase: base / m.price,
+      qtyBase: stopCappedQty(base, m.price, slDist, POSITION_RT_COST_PCT),
       entry: m.price,
       mark: m.price,
       peak: m.price,
@@ -799,6 +841,9 @@ export type SessionReport = {
   promoted: HourPoint[];
   proven: number;
   symbols: number;
+  profile: ReplayProfile;
+  evaluatedConfigs: number;
+  disabledConfigs: number;
   unavailable: string[];
   preNet: number;
   liveNet: number;
@@ -824,15 +869,23 @@ export type SessionReport = {
 
 export type ReplaySize = "base" | "block" | "axis" | "both";
 
+export type QualifiedReplay = {
+  symbol: string;
+  key: string;
+  samples: number;
+  grossProfit: number;
+  grossLoss: number;
+};
+
 export type ReplayOpts = {
   hours?: 12 | 24 | 48;
   size?: ReplaySize;
   end?: number;
   costs?: Readonly<Record<string, number>>;
+  connection?: ConnectionId;
+  profile?: ReplayProfile;
+  onQualified?: (row: QualifiedReplay) => void;
 };
-
-const REPLAY_HOUR = 3_600_000;
-const WARMUP = 22;
 
 function hourAccumulator(t: number): HourAcc {
   return {
@@ -911,6 +964,7 @@ function replayWindow(
   cost: number,
   tpAtr: number,
   slOfTp: number,
+  capped: boolean,
 ) {
   let leg: OpenLeg | null = null;
   let priorMark = 0;
@@ -930,12 +984,13 @@ function replayWindow(
     const side = signals[i - 1];
     if (!leg && offset > 0 && side) {
       const dist = tpAtr * Math.max(atr[i - 1] ?? 0, bar.o * 0.0004);
+      const stopDistance = dist * slOfTp;
       leg = {
         side,
         entry: bar.o,
         tp: bar.o + side * dist,
-        sl: bar.o - side * dist * slOfTp,
-        qty: notional / bar.o,
+        sl: bar.o - side * stopDistance,
+        qty: capped ? stopCappedQty(notional, bar.o, stopDistance, cost) : notional / bar.o,
         hold: 0,
       };
     }
@@ -972,7 +1027,7 @@ function rankPre(rows: HourAcc[]) {
     gl += row.grossLoss;
     n += row.trades;
   }
-  return { n, net: gp - gl, pf: profitFactor(gp, gl) };
+  return { n, net: gp - gl, pf: profitFactor(gp, gl), grossProfit: gp, grossLoss: gl };
 }
 
 export function simulateSessions(
@@ -983,6 +1038,8 @@ export function simulateSessions(
 ): SessionReport {
   const hours = opts?.hours ?? 24;
   const size = opts?.size ?? "both";
+  const profile = opts?.profile ?? "filtered";
+  const baseline = profile === "baseline";
   const span = WARMUP + hours * 2;
   const latest = Math.max(0, ...books.map((b) => lastClosedBar(b.bars)?.t ?? 0));
   const end = opts?.end ?? latest + REPLAY_HOUR;
@@ -993,6 +1050,10 @@ export function simulateSessions(
       ? [{ symbol: b.symbol, bars }]
       : [];
   });
+  const excluded = baseline
+    ? excludedConfigurations(undefined, 0)
+    : excludedConfigurations(opts?.connection, start + WARMUP * REPLAY_HOUR);
+  const configs = baseline ? STRATEGY_CONFIGS : EXECUTION_CONFIGS;
   const present = new Set(aligned.map((b) => b.symbol));
   const unavailable = books.map((b) => b.symbol).filter((s) => !present.has(s));
   const clock = (from: number) =>
@@ -1017,7 +1078,7 @@ export function simulateSessions(
       : 1;
   const selected: SessionReport["selected"] = [];
   let proven = 0;
-  const combos = allShortCombos();
+  let disabledConfigs = 0;
   for (const { symbol, bars } of aligned) {
     const series = buildSeries(bars);
     const cost = opts?.costs?.[symbol] ?? POSITION_RT_COST_PCT;
@@ -1025,42 +1086,71 @@ export function simulateSessions(
     const bestLive = clock(replayFrom);
     let bestNet = 0;
     let name = "";
-    for (const indication of INDICATIONS) {
-      const signals = bars.map((_, i) => signalAt(indication, bars, series, i));
-      for (const { tpAtr, slOfTp } of combos) {
-        replayWindow(bars, series.atr, signals, WARMUP, preWork, notional, cost, tpAtr, slOfTp);
-        const quality = rankPre(preWork);
-        const pass =
-          liveShortOk(tpAtr, slOfTp) &&
-          quality.n >= LASTN.minSamples &&
-          quality.net > 0 &&
-          quality.pf >= Math.max(floors.base, floors.short);
-        const choose = pass && quality.net > bestNet;
-        // The portfolio decision uses only the pre-window data above.
-        addHours(preAcc, preWork);
-        replayWindow(
-          bars,
-          series.atr,
-          signals,
-          replayFrom,
-          liveWork,
-          notional,
-          cost,
-          tpAtr,
-          slOfTp,
-        );
-        addHours(liveAcc, liveWork);
-        if (pass) {
-          proven++;
-          addHours(promotedAcc, liveWork);
-        }
-        if (choose) {
-          bestNet = quality.net;
-          name = `${symbol} ${indication} ${comboId(tpAtr, slOfTp)}`;
-          for (let i = 0; i < hours; i++) {
-            Object.assign(bestPre[i]!, preWork[i]);
-            Object.assign(bestLive[i]!, liveWork[i]);
-          }
+    const signalsByIndication = new Map(
+      INDICATIONS.map((indication) => [
+        indication,
+        bars.map((_, i) => signalAt(indication, bars, series, i)),
+      ]),
+    );
+    for (const config of configs) {
+      if (excluded.has(`${symbol}|${config.key}`)) {
+        disabledConfigs++;
+        continue;
+      }
+      const { indication, tpAtr, slOfTp } = config;
+      const signals = signalsByIndication.get(indication)!;
+      replayWindow(
+        bars,
+        series.atr,
+        signals,
+        WARMUP,
+        preWork,
+        notional,
+        cost,
+        tpAtr,
+        slOfTp,
+        !baseline,
+      );
+      const quality = rankPre(preWork);
+      const pass =
+        config.liveFloor &&
+        quality.n >= LASTN.minSamples &&
+        quality.net > 0 &&
+        quality.pf >= Math.max(floors.base, floors.short);
+      addHours(preAcc, preWork);
+      if (!pass && !baseline) continue;
+      replayWindow(
+        bars,
+        series.atr,
+        signals,
+        replayFrom,
+        liveWork,
+        notional,
+        cost,
+        tpAtr,
+        slOfTp,
+        !baseline,
+      );
+      addHours(liveAcc, liveWork);
+      if (!pass) continue;
+      proven++;
+      addHours(promotedAcc, liveWork);
+      if (opts?.onQualified) {
+        const realized = rankPre(liveWork);
+        opts.onQualified({
+          symbol,
+          key: config.key,
+          samples: realized.n,
+          grossProfit: realized.grossProfit,
+          grossLoss: realized.grossLoss,
+        });
+      }
+      if (quality.net > bestNet) {
+        bestNet = quality.net;
+        name = `${symbol} ${indication} ${comboId(tpAtr, slOfTp)}`;
+        for (let i = 0; i < hours; i++) {
+          Object.assign(bestPre[i]!, preWork[i]);
+          Object.assign(bestLive[i]!, liveWork[i]);
         }
       }
     }
@@ -1095,6 +1185,9 @@ export function simulateSessions(
     promoted,
     proven,
     symbols: aligned.length,
+    profile,
+    evaluatedConfigs: configs.length * aligned.length - disabledConfigs,
+    disabledConfigs,
     unavailable,
     preNet: a.net,
     liveNet: b.net,

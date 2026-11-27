@@ -4,6 +4,7 @@ import {
   LIVE_BLOCK_COUNTS,
   LIVE_SHORT,
   MAX_MUL,
+  MODEL_STOP_RISK,
   PF_NO_LOSS,
   POSITION_COST_PCT,
   POSITION_RT_COST_PCT,
@@ -77,6 +78,11 @@ export function axisQty(baseQty: number): number {
 export function positionNotional(equity: number): number {
   const e = Number(equity) > 0 ? equity : 0;
   return e * POSITION_COST_PCT;
+}
+
+export function stopCappedQty(notional: number, entry: number, stopDistance: number, roundTripCost: number) {
+  const stopCost = stopDistance + entry * roundTripCost;
+  return Math.min(notional / entry, notional * MODEL_STOP_RISK / stopCost);
 }
 
 export function allShortCombos(): { tpAtr: number; slOfTp: number }[] {

@@ -417,6 +417,7 @@ export const useDesk = create<DeskState>((set, get) => ({
             books.map((b) => ({ symbol: b.symbol, bars: b.bars })),
             BOOK,
             s.floors,
+            s.connection,
           );
           cells = replay.cells;
           if (replay.internFills.length) internFills = mergeFills(internFills, replay.internFills);
