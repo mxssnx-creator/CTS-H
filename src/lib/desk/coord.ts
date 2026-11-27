@@ -1,15 +1,11 @@
-import { MAX_MUL } from "./constants";
+import { MAX_MUL } from "./constants.ts";
 import type { LivePos, Side } from "./process";
 
-export const SYSTEM_ID = "CTS-A";
+import { connectionOf } from "./connections.ts";
+export { CONNECTIONS, connectionOf, type ConnectionId } from "./connections.ts";
 
-export const CONNECTIONS = [
-  { id: "bingx-public", label: "BingX public", route: "paper" },
-  { id: "bingx-vst-02", label: "BingX VST", route: "none" },
-  { id: "bingx-x01", label: "BingX mainnet", route: "none" },
-] as const;
+export const SYSTEM_ID = "CTS-H";
 
-export type ConnectionId = (typeof CONNECTIONS)[number]["id"];
 export type TicketType = "position" | "order" | "intern";
 
 export type Scope = {
@@ -52,12 +48,8 @@ export type WorkingOrder = {
 
 export type OrderCtrl = { protect: boolean; connection: string };
 
-export function connectionOf(id: string) {
-  return CONNECTIONS.find((c) => c.id === id) ?? null;
-}
-
 export function canAffect(connection: string): boolean {
-  return connectionOf(connection)?.route === "paper";
+  return connectionOf(connection) !== null;
 }
 
 export function positionScope(connection: string): Scope {

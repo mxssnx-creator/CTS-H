@@ -7,12 +7,28 @@ import { useDesk } from "./store.ts";
 function book(px: number) {
   const bars = [];
   for (let i = 0; i < 8; i++) {
-    bars.push({ t: 1_700_000_000_000 + i * 3_600_000, o: px, h: px * 1.01, l: px * 0.99, c: px, v: 10 });
+    bars.push({
+      t: 1_700_000_000_000 + i * 3_600_000,
+      o: px,
+      h: px * 1.01,
+      l: px * 0.99,
+      c: px,
+      v: 10,
+    });
   }
   return {
     symbol: "BTC-USDT",
     bars,
-    quote: { symbol: "BTC-USDT", last: px, changePct: 0, quoteVolume: 1, high: px, low: px, bid: px, ask: px },
+    quote: {
+      symbol: "BTC-USDT",
+      last: px,
+      changePct: 0,
+      quoteVolume: 1,
+      high: px,
+      low: px,
+      bid: px,
+      ask: px,
+    },
     funding: null,
     depth: { bids: [] as [number, number][], asks: [] as [number, number][] },
   };
@@ -35,7 +51,7 @@ function pos(over: Partial<LivePos> = {}): LivePos {
     hold: 0,
     dca: 0,
     openedAt: Date.now(),
-    system: "CTS-A",
+    system: "CTS-H",
     connection: "bingx-public",
     type: "position",
     ...over,
@@ -78,9 +94,54 @@ test("protect off drops in-scope control orders immediately", () => {
 
 test("manual entry stops at the live cap and does not drop an open leg", () => {
   const allow = { ...useDesk.getState().allow, live_paper_execute: true };
-  const positions = Array.from({ length: MAX_LIVE_LEGS }, (_, i) => pos({ id: `x:${i}`, indication: "move", symbol: i % 2 ? "ETH-USDT" : "BTC-USDT" }));
-  useDesk.setState({ allow, positions, books: [book(100)], phase: "performing", connection: "bingx-public" });
+  const positions = Array.from({ length: MAX_LIVE_LEGS }, (_, i) =>
+    pos({ id: `x:${i}`, indication: "move", symbol: i % 2 ? "ETH-USDT" : "BTC-USDT" }),
+  );
+  useDesk.setState({
+    allow,
+    positions,
+    books: [book(100)],
+    phase: "performing",
+    connection: "bingx-public",
+  });
   useDesk.getState().manual(1);
   assert.equal(useDesk.getState().positions.length, MAX_LIVE_LEGS);
   assert.ok(useDesk.getState().events[0]?.msg.includes("live cap"));
+});
+
+test("switching BingX connections keeps paper positions and net scoped", () => {
+  const saved = useDesk.getState();
+  try {
+    useDesk.setState({
+      connection: "bingx-public",
+      inactive: {},
+      books: [book(100)],
+      positions: [pos()],
+      closedNet: 4,
+      allow: { ...saved.allow, connect_exchange: true },
+    });
+    useDesk.getState().setConnection("bingx-x02");
+    assert.equal(useDesk.getState().positions.length, 0);
+    assert.equal(useDesk.getState().closedNet, 0);
+    assert.equal(useDesk.getState().books.length, 0);
+    useDesk.getState().setConnection("bingx-public");
+    assert.equal(useDesk.getState().positions[0]?.id, "x:audit");
+    assert.equal(useDesk.getState().status, "loading");
+    assert.equal(useDesk.getState().closedNet, 4);
+  } finally {
+    useDesk.setState(saved);
+  }
+});
+
+test("an unavailable or restored quote does not execute an owned paper stop", () => {
+  useDesk.setState({
+    allow: { ...useDesk.getState().allow, live_paper_execute: false, intern_arm: false },
+    positions: [pos()],
+    books: [book(100)],
+    connection: "bingx-public",
+    phase: "performing",
+  });
+  useDesk.getState().ingest([book(97)], Date.now(), { unavailable: ["BTC-USDT"] });
+  assert.equal(useDesk.getState().positions.length, 1);
+  assert.equal(useDesk.getState().positions[0]?.mark, 100);
 });

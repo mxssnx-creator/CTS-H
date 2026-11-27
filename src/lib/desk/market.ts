@@ -1,18 +1,19 @@
 import { createServerFn } from "@tanstack/react-start";
-import { PREFERRED_SYMBOLS } from "./constants";
-
-export const fetchUniverse = createServerFn({ method: "GET" }).handler(async () => {
-  const { loadUniverse } = await import("./market.server");
-  return loadUniverse();
-});
+import { PREFERRED_SYMBOLS } from "./constants.ts";
+import { requireConnection } from "./connections.ts";
 
 export const fetchSnapshot = createServerFn({ method: "POST" })
-  .validator((input: { symbols?: string[]; focus?: string }) => {
-    const symbols = (input?.symbols ?? PREFERRED_SYMBOLS).filter((s) => typeof s === "string").slice(0, 10);
-    const focus = typeof input?.focus === "string" ? input.focus : symbols[0] ?? "BTC-USDT";
-    return { symbols, focus };
+  .validator((input: { connection?: string; focus?: string; knownEnd?: number }) => {
+    const connection = requireConnection(input?.connection ?? "bingx-public").id;
+    const focus =
+      PREFERRED_SYMBOLS.find((symbol) => symbol === input?.focus) ?? PREFERRED_SYMBOLS[0]!;
+    return {
+      connection,
+      focus,
+      knownEnd: Number.isSafeInteger(input?.knownEnd) ? input.knownEnd : undefined,
+    };
   })
   .handler(async ({ data }) => {
-    const { loadSnapshot } = await import("./market.server");
-    return loadSnapshot(data.symbols, data.focus);
+    const { loadSnapshot } = await import("./market.server.ts");
+    return loadSnapshot(data.connection, data.focus, data.knownEnd);
   });

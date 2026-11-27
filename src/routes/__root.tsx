@@ -8,8 +8,8 @@ export const Route = createRootRoute({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "HELIX × CTS-A" },
-      { name: "theme-color", content: "#07080c" },
+      { title: "CTS-H Trading Desk" },
+      { name: "theme-color", content: "#0c1018" },
     ],
     links: [
       { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },

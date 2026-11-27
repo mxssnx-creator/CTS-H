@@ -11,6 +11,7 @@ import {
   parseAppEnv,
   projectRoot,
   readAppEnv,
+  resolveAppEnv,
 } from "./with-app-env.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -59,8 +60,9 @@ test("an explicit process-env override wins over the file", () => {
   assert.equal(merged.PATH, "/usr/bin");
 });
 
-test("the template ships auth off", () => {
-  assert.deepEqual(readAppEnv(projectRoot()), { VITE_AUTH_ENABLED: "false" });
+test("the standalone public desk defaults auth off", () => {
+  assert.equal(resolveAppEnv(makeWorkspace(), {}).VITE_AUTH_ENABLED, "false");
+  assert.equal(resolveAppEnv(makeWorkspace(), { GROK_PROJECT_ID: "test" }).VITE_AUTH_ENABLED, undefined);
 });
 
 test("vite loadEnv resolves the wrapped value", () => {

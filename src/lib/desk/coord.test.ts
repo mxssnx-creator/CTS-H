@@ -10,11 +10,11 @@ function row(partial: Partial<Tracked> & Pick<Tracked, "id" | "system" | "connec
 test("exchange affect keeps only the active system, connection, and type", () => {
   const scope = positionScope("bingx-public");
   const rows = [
-    row({ id: "a", system: "CTS-A", connection: "bingx-public", type: "position" }),
+    row({ id: "a", system: "CTS-H", connection: "bingx-public", type: "position" }),
     row({ id: "b", system: "OTHER", connection: "bingx-public", type: "position" }),
-    row({ id: "c", system: "CTS-A", connection: "bingx-x01", type: "position" }),
-    row({ id: "d", system: "CTS-A", connection: "bingx-public", type: "order" }),
-    row({ id: "e", system: "CTS-A", connection: "bingx-public", type: "intern" }),
+    row({ id: "c", system: "CTS-H", connection: "bingx-x01", type: "position" }),
+    row({ id: "d", system: "CTS-H", connection: "bingx-public", type: "order" }),
+    row({ id: "e", system: "CTS-H", connection: "bingx-public", type: "intern" }),
   ];
   const { owned, skipped } = partition(rows, scope);
   assert.deepEqual(owned.map((r) => r.id), ["a"]);
@@ -23,10 +23,12 @@ test("exchange affect keeps only the active system, connection, and type", () =>
   assert.equal(owns(rows[3]!, scope), false);
 });
 
-test("only the public paper route can affect the exchange book", () => {
+test("only registered connections can affect their paper book", () => {
   assert.equal(canAffect("bingx-public"), true);
-  assert.equal(canAffect("bingx-vst-02"), false);
-  assert.equal(canAffect("bingx-x01"), false);
+  assert.equal(canAffect("bingx-x02"), true);
+  assert.equal(canAffect("bingx-vst-02"), true);
+  assert.equal(canAffect("bingx-x01"), true);
+  assert.equal(canAffect("other-exchange"), false);
   const hit = coordHit("flatten", positionScope("bingx-x01"), 0, 2, "no order route");
   assert.equal(hit.kept, 0);
   assert.equal(hit.skipped, 2);
@@ -50,7 +52,7 @@ test("protect orders inherit the position system and connection", () => {
     hold: 0,
     dca: 0,
     openedAt: 1,
-    system: "CTS-A",
+    system: "CTS-H",
     connection: "bingx-public",
     type: "position",
   } satisfies LivePos;
@@ -63,7 +65,7 @@ test("protect orders inherit the position system and connection", () => {
   assert.equal(orders[0]?.px, 90);
   assert.equal(orders[1]?.px, 110);
   assert.equal(orders[0]?.connection, "bingx-public");
-  assert.equal(orders[0]?.system, "CTS-A");
+  assert.equal(orders[0]?.system, "CTS-H");
   assert.equal(orders[1]?.kind, "tp");
   const off = controlOrders([pos, { ...pos, id: "x:2", connection: "bingx-x01" }], { protect: false, connection: "bingx-public" });
   assert.deepEqual(off.map((o) => o.positionId), ["x:2", "x:2"]);

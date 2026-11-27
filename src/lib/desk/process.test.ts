@@ -12,7 +12,7 @@ function bars(n = 90, drift = 0.003): Bar[] {
     p = p * (1 + drift);
     const c = p;
     out.push({
-      t: 1_700_000_000_000 + i * 60_000,
+      t: 1_700_000_000_000 + i * 3_600_000,
       o,
       h: Math.max(o, c) * 1.002,
       l: Math.min(o, c) * 0.998,
@@ -41,13 +41,13 @@ test("closed-bar pass scores the short grid on a trend", () => {
   assert.ok(board.some((row) => row.side !== 0));
 });
 
-test("both-hit bars take the wick that prints first", () => {
+test("both-hit bars take the stop with either candle color", () => {
   const bull = { t: 1, o: 100, h: 110, l: 90, c: 105, v: 1 };
   const bear = { t: 2, o: 105, h: 110, l: 90, c: 95, v: 1 };
   const longBull = exitOnBar(1, 108, 92, bull, 1);
   const longBear = exitOnBar(1, 108, 92, bear, 1);
   assert.equal(longBull?.reason, "sl");
-  assert.equal(longBear?.reason, "tp");
+  assert.equal(longBear?.reason, "sl");
 });
 
 test("replay range follows the requested window", () => {
@@ -102,7 +102,7 @@ function leg(over: Partial<LivePos> = {}): LivePos {
     hold: 0,
     dca: 0,
     openedAt: 0,
-    system: "CTS-A",
+    system: "CTS-H",
     connection: "bingx-public",
     type: "position",
     ...over,
@@ -140,3 +140,19 @@ test("a flat cell does not keep the side of a closed leg", () => {
   assert.ok(again.cells.every((c) => c.side === 0));
 });
 
+
+test("holdout prices cannot change preselection and stale coverage cannot qualify", () => {
+  const length = 132;
+  const hourly = bars(length, .004).map((bar) => ({ ...bar, closed: true }));
+  const boundary = hourly.length - 48;
+  const altered = hourly.map((bar, i) => i < boundary ? bar : ({ ...bar, h: bar.h * 1.1, l: bar.l * .9 }));
+  const a = simulateSessions([{ symbol: "BTC-USDT", bars: hourly }], 10_000, DEFAULT_FLOORS, { hours: 48 });
+  const b = simulateSessions([{ symbol: "BTC-USDT", bars: altered }], 10_000, DEFAULT_FLOORS, { hours: 48 });
+  assert.equal(a.ready, true);
+  assert.deepEqual(a.bookNames, b.bookNames);
+  assert.deepEqual(a.bookPre, b.bookPre);
+  const gap = hourly.filter((_, i) => i !== length - 8);
+  const c = simulateSessions([{ symbol: "BTC-USDT", bars: gap }], 10_000, DEFAULT_FLOORS, { hours: 48 });
+  assert.equal(c.ready, false);
+  assert.deepEqual(c.unavailable, ["BTC-USDT"]);
+});

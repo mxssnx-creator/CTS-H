@@ -1,4 +1,4 @@
-import type { Bar } from "./process";
+import type { Bar } from "./process.ts";
 
 export type HealBook = {
   symbol: string;
@@ -34,10 +34,10 @@ export function healBooks<T extends HealBook>(prev: T[], next: T[]): { books: T[
   const books: T[] = [];
   for (const row of next) {
     seen.add(row.symbol);
-    const bars = saneBars(row.bars);
+    const old = prevBy.get(row.symbol);
+    const bars = old?.bars === row.bars ? row.bars : saneBars(row.bars);
     const close = bars.at(-1)?.c ?? 0;
     const last = row.quote.last > 0 ? row.quote.last : close;
-    const old = prevBy.get(row.symbol);
     if (!bars.length || !(last > 0)) {
       if (old && saneBars(old.bars).length) {
         books.push(old);

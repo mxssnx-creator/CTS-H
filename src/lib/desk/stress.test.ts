@@ -42,7 +42,7 @@ function leg(px: number): LivePos {
     hold: 0,
     dca: 0,
     openedAt: 10 * 3_600_000,
-    system: "CTS-A",
+    system: "CTS-H",
     connection: "bingx-public",
     type: "position",
   };

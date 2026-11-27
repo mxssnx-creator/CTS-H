@@ -1,134 +1,153 @@
 import { Link, useRouterState } from "@tanstack/react-router";
+import {
+  Activity,
+  CandlestickChart,
+  ChevronDown,
+  FlaskConical,
+  LayoutDashboard,
+  Layers3,
+  Radio,
+  SlidersHorizontal,
+  Wallet,
+} from "lucide-react";
 import type { ReactNode } from "react";
+import { CONNECTIONS, type ConnectionId } from "@/lib/desk/connections";
+import { useDesk } from "@/lib/desk/store";
 import { DeskFeed } from "./feed";
-import { BOOK } from "@/lib/desk/constants";
-import { SYSTEM_ID } from "@/lib/desk/coord";
-import { greenHour } from "@/lib/desk/process";
-import { focusBook, liveHeadline, useDesk, useNet } from "@/lib/desk/store";
 
 const NAV = [
-  ["/", "Overview"],
-  ["/allow", "Allow"],
-  ["/strategies", "Strategies"],
-  ["/tactics", "Tactics"],
-  ["/lanes", "Indications"],
-  ["/combinations", "Combinations"],
-  ["/heatmap", "Heatmap"],
-  ["/positions", "Positions"],
-  ["/orders", "Orders"],
-  ["/performance", "Performance"],
-  ["/results", "Results"],
-  ["/statistics", "Statistics"],
-  ["/engine", "Engine"],
-  ["/replay", "Replay"],
-  ["/system", "System"],
-  ["/settings", "Settings"],
-  ["/connections", "Connections"],
+  { to: "/", label: "Overview", icon: LayoutDashboard },
+  { to: "/lanes", label: "Research", icon: Activity },
+  { to: "/positions", label: "Portfolio", icon: Wallet },
+  { to: "/replay", label: "Trade replay", icon: FlaskConical },
+  { to: "/settings", label: "Settings", icon: SlidersHorizontal },
+  { to: "/connections", label: "Connections", icon: Radio },
 ] as const;
 
-function money(n: number) {
-  const sign = n < 0 ? "-" : "";
-  return `${sign}$${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2, minimumFractionDigits: 2 })}`;
-}
-
 export function DeskShell({ children }: { children: ReactNode }) {
-  const path = useRouterState({ select: (s) => s.location.pathname });
+  const path = useRouterState({ select: (state) => state.location.pathname });
   const status = useDesk((s) => s.status);
-  const phase = useDesk((s) => s.phase);
-  const net = useNet();
-  const books = useDesk((s) => s.books);
   const connection = useDesk((s) => s.connection);
-  const liveFills = useDesk((s) => s.liveFills);
-  const lastTs = useDesk((s) => s.lastTs);
-  const peak = useDesk((s) => s.peak);
-  const head = liveHeadline(liveFills);
-  const focus = useDesk((s) => focusBook(s));
-  const hour = greenHour(liveFills, lastTs || Date.now());
-  const equity = BOOK + net;
-  const dd = peak > 0 ? ((peak - equity) / peak) * 100 : 0;
-
+  const setConnection = useDesk((s) => s.setConnection);
+  const connect = useDesk((s) => s.allow.connect_exchange);
+  const phase = useDesk((s) => s.phase);
+  const page = NAV.find((item) => item.to === path)?.label ?? "Trading desk";
+  const signal = !connect
+    ? "Feed paused"
+    : status === "live"
+      ? "Feed online"
+      : status === "loading"
+        ? "Connecting"
+        : "Feed delayed";
   return (
-    <div className="grid min-h-screen grid-rows-[auto_auto_1fr_auto] bg-bg text-fg md:grid-cols-[220px_1fr] md:grid-rows-[auto_1fr_auto]">
+    <div className="desk-frame">
       <DeskFeed />
-      <header className="flex flex-wrap items-center gap-4 border-b border-line bg-surface px-4 py-3 md:col-span-2">
-        <div className="font-mono text-sm tracking-widest">
-          HELIX <span className="text-accent">× CTS-A</span>
-        </div>
-        <span
-          className={`rounded-full border border-line px-2 py-1 font-mono text-xs ${status === "live" ? "text-bid" : status === "degraded" ? "text-warn" : "text-warn"}`}
-        >
-          {status === "live" ? "LIVE TAPE · BINGX" : status === "degraded" ? "RECOVERING" : status === "error" ? "FEED ERROR" : "CONNECTING"}
-        </span>
-        <div className="font-mono text-xs text-muted">
-          <div className="text-dim">System net</div>
-          <div className={net >= 0 ? "text-bid" : "text-ask"}>{money(net)}</div>
-        </div>
-        <div className="font-mono text-xs text-muted">
-          <div className="text-dim">Book</div>
-          <div>{money(equity)}</div>
-        </div>
-        <div className="font-mono text-xs text-muted">
-          <div className="text-dim">Hour</div>
-          <div className={hour.code === "R1" ? "text-ask" : hour.code === "G1" ? "text-bid" : ""}>{hour.code}</div>
-        </div>
-        <div className="font-mono text-xs text-muted">
-          <div className="text-dim">Drawdown</div>
-          <div>{dd.toFixed(2)}%</div>
-        </div>
-        <div className="font-mono text-xs text-muted">
-          <div className="text-dim">Scope</div>
-          <div>
-            {SYSTEM_ID} · {connection}
-          </div>
-          <div className="text-dim">{phase}</div>
-        </div>
-        <div className="font-mono text-xs text-muted">
-          <div className="text-dim">Headline</div>
-          <div>{head.length}</div>
-        </div>
-        {focus ? (
-          <div className="ml-auto font-mono text-sm">
-            {focus.symbol} <span className={focus.quote.changePct >= 0 ? "text-bid" : "text-ask"}>{focus.quote.last}</span>
-          </div>
-        ) : null}
-      </header>
-      <nav className="flex gap-1 overflow-x-auto border-b border-line bg-bg p-2 md:flex-col md:overflow-visible md:border-r md:border-b-0">
-        {NAV.map(([to, label]) => {
-          const on = path === to;
-          return (
+      <aside className="desk-sidebar">
+        <Link to="/" className="desk-brand" aria-label="CTS-H home">
+          <span className="desk-mark">
+            <CandlestickChart size={21} strokeWidth={2.3} />
+          </span>
+          <span>
+            <strong>CTS-H</strong>
+            <small>Trading desk</small>
+          </span>
+        </Link>
+        <nav aria-label="Desk navigation" className="desk-nav">
+          {NAV.map(({ to, label, icon: Icon }) => (
             <Link
               key={to}
               to={to}
-              className={`rounded-md px-3 py-2 text-left text-sm whitespace-nowrap ${on ? "bg-surface-2 text-fg" : "text-muted"}`}
+              aria-current={path === to ? "page" : undefined}
+              className={path === to ? "nav-current" : ""}
             >
-              {label}
+              <Icon size={17} strokeWidth={1.7} />
+              <span>{label}</span>
             </Link>
-          );
-        })}
-      </nav>
-      <main className="min-w-0 p-4">{children}</main>
-      <footer className="border-t border-line px-4 py-2 font-mono text-xs text-dim md:col-span-2">
-        Live BingX quotes. CTS-A paper stage on that tape. No signed exchange orders. Every desk action starts allowed.
-        {books.length ? ` · ${books.length} books` : ""}
-      </footer>
+          ))}
+        </nav>
+        <div className="desk-sidebar-foot">
+          <Layers3 size={18} />
+          <span>
+            Paper execution
+            <small>{phase === "halted" ? "Entries paused" : "BingX perpetuals"}</small>
+          </span>
+        </div>
+      </aside>
+      <div className="desk-workspace">
+        <div className="desk-topbar">
+          <div className="desk-breadcrumb">
+            Workspace <span>/</span> <strong>{page}</strong>
+          </div>
+          <div className="desk-top-controls">
+            <span className={`feed-badge ${status === "live" && connect ? "feed-ready" : ""}`}>
+              <i />
+              {signal}
+            </span>
+            <label className="connection-select">
+              <span className="sr-only">Active connection</span>
+              <select
+                value={connection}
+                disabled={!connect}
+                onChange={(e) => setConnection(e.currentTarget.value as ConnectionId)}
+              >
+                {CONNECTIONS.map((item) => (
+                  <option value={item.id} key={item.id}>
+                    {item.slot
+                      ? `${item.slot} · ${item.network === "vst" ? "VST demo" : "Mainnet"}`
+                      : "Public feed"}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown size={14} aria-hidden />
+            </label>
+          </div>
+        </div>
+        <main className="desk-main" id="desk-main">
+          {children}
+        </main>
+      </div>
     </div>
   );
 }
 
-export function Panel({ title, children }: { title: string; children: ReactNode }) {
+export function Panel({
+  title,
+  children,
+  aside,
+  className = "",
+}: {
+  title: string;
+  children: ReactNode;
+  aside?: ReactNode;
+  className?: string;
+}) {
   return (
-    <section className="rounded-md border border-line bg-surface p-4">
-      <h2 className="mb-3 font-mono text-xs tracking-widest text-muted uppercase">{title}</h2>
+    <section className={`desk-panel ${className}`}>
+      <div className="panel-heading">
+        <h2>{title}</h2>
+        {aside}
+      </div>
       {children}
     </section>
   );
 }
 
-export function Stat({ k, v, tone }: { k: string; v: string; tone?: "bid" | "ask" }) {
+export function Stat({
+  label,
+  value,
+  detail,
+  tone,
+}: {
+  label: string;
+  value: string;
+  detail?: string;
+  tone?: "positive" | "negative";
+}) {
   return (
-    <div className="rounded-md border border-line bg-bg p-3">
-      <div className="font-mono text-xs text-dim uppercase">{k}</div>
-      <div className={`font-mono text-lg ${tone === "bid" ? "text-bid" : tone === "ask" ? "text-ask" : ""}`}>{v}</div>
+    <div className="desk-stat">
+      <div className="stat-label">{label}</div>
+      <div className={`stat-value ${tone ?? ""}`}>{value}</div>
+      {detail && <div className="stat-detail">{detail}</div>}
     </div>
   );
 }

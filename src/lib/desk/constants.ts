@@ -23,7 +23,7 @@ export const PF = {
 export const LIVE_SHORT = { minTp: 0.48, minSlOfTp: 0.75, maxTp: 0.6 };
 export const SHORT_TP = [0.3, 0.32, 0.34, 0.36, 0.38, 0.4, 0.42, 0.45, 0.48, 0.5, 0.52, 0.55, 0.58, 0.6];
 export const SHORT_SL = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5];
-export const TAG = "CTSAV2_";
+export const TAG = "CTSH_";
 export const BOOK = 10_000;
 export const MAX_HOLD = 24;
 export const MAX_LIVE_LEGS = 12;
@@ -51,7 +51,7 @@ export const ACTION_COPY: Record<ActionId, string> = {
   intern_arm: "Arm intern scoring of every indication × short-GRID cell",
   intern_all_pre: "Walk closed 1h bars through the 14×9 short GRID",
   promote_real: "Promote last-N valid cells onto the performing set",
-  live_paper_execute: "Open gated paper legs tagged CTSA on the live tape",
+  live_paper_execute: "Open gated paper legs tagged CTS-H on the live tape",
   block_volume: "Size Block additive 0.2 on N=1,3,4,5,6 (skip 2), cap 2.5×",
   axis_volume: "Size Axis 3.0× partials, depth 2, same 2.5× cap",
   protect_grid: "Keep one SL and one TP on each owned leg",

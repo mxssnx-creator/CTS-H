@@ -1,8 +1,38 @@
-import { INDICATIONS, LASTN, MAX_HOLD, MAX_MUL, PF, TAG, TRAIL_PCT, type Floors, type Indication } from "./constants";
-import { saneBars } from "./heal";
-import { allShortCombos, axisQty, blockQty, capTotalQty, closePnl, comboId, liveShortOk, pfFromPnls, positionNotional } from "./math";
+import {
+  INDICATIONS,
+  LASTN,
+  MAX_HOLD,
+  MAX_MUL,
+  PF,
+  POSITION_RT_COST_PCT,
+  TAG,
+  TRAIL_PCT,
+  type Floors,
+  type Indication,
+} from "./constants.ts";
+import { saneBars } from "./heal.ts";
+import {
+  allShortCombos,
+  axisQty,
+  blockQty,
+  capTotalQty,
+  closePnl,
+  comboId,
+  liveShortOk,
+  pfFromPnls,
+  positionNotional,
+  profitFactor,
+} from "./math.ts";
 
-export type Bar = { t: number; o: number; h: number; l: number; c: number; v: number };
+export type Bar = {
+  t: number;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+  closed?: boolean;
+};
 
 export type Side = 1 | -1;
 
@@ -263,7 +293,11 @@ export type IndicationRow = {
 export function indicationBoard(bars: Bar[]): IndicationRow[] {
   const closed = closedBars(bars);
   if (closed.length < 24) {
-    return INDICATIONS.map((name) => ({ name, side: 0 as const, detail: "waiting for closed bars" }));
+    return INDICATIONS.map((name) => ({
+      name,
+      side: 0 as const,
+      detail: "waiting for closed bars",
+    }));
   }
   const series = buildSeries(closed);
   const i = closed.length - 1;
@@ -293,8 +327,15 @@ export function indicationBoard(bars: Bar[]): IndicationRow[] {
   });
 }
 
+export function lastClosedBar(bars: Bar[]): Bar | undefined {
+  const last = bars.at(-1);
+  return last?.closed === false || (last?.closed === undefined && bars.length > 1)
+    ? bars.at(-2)
+    : last;
+}
+
 function closedBars(bars: Bar[]): Bar[] {
-  return bars.length > 1 ? bars.slice(0, -1) : bars;
+  return lastClosedBar(bars) === bars.at(-1) ? bars : bars.slice(0, -1);
 }
 
 function indexAfter(bars: Bar[], t: number): number {
@@ -327,8 +368,13 @@ export function gateCell(cell: Cell, floors: Floors) {
   const pf = pfFromPnls(slice.map((p) => ({ pnl: p })));
   const undersampled = slice.length < LASTN.minSamples;
   const pass = !undersampled && pf >= floors.short && net >= 0;
-  const proven = cell.n >= 6 && cell.pf >= floors.short && cell.net > 0 && !(cell.pf >= PF_NO_LOSS_NEAR && cell.net <= 1e-6);
-  cell.validExec = cell.liveFloor && cell.n >= LASTN.minSamples && (cell.n < 6 ? pass : proven && pass);
+  const proven =
+    cell.n >= 6 &&
+    cell.pf >= Math.max(floors.base, floors.overall) &&
+    cell.net > 0 &&
+    !(cell.pf >= PF_NO_LOSS_NEAR && cell.net <= 1e-6);
+  cell.validExec =
+    cell.liveFloor && cell.n >= LASTN.minSamples && (cell.n < 6 ? pass : proven && pass);
   const dis = cell.lastN.slice(-LASTN.disable);
   const disNet = dis.reduce((a, b) => a + b, 0);
   const validStill = cell.validExec;
@@ -368,12 +414,8 @@ export function exitOnBar(
   const hitTp = side > 0 ? bar.h >= tp : bar.l <= tp;
   const hitSl = side > 0 ? bar.l <= sl : bar.h >= sl;
   if (!(hitTp || hitSl || hold >= MAX_HOLD)) return null;
-  if (hitTp && hitSl) {
-    const bull = bar.c >= bar.o;
-    const slFirst = side > 0 ? bull : !bull;
-    return slFirst ? { exit: sl, reason: "sl" } : { exit: tp, reason: "tp" };
-  }
-  if (hitSl) return { exit: sl, reason: "sl" };
+  // OHLC does not establish which trigger traded first. Use the adverse fill.
+  if (hitSl) return { exit: side > 0 ? Math.min(bar.o, sl) : Math.max(bar.o, sl), reason: "sl" };
   if (hitTp) return { exit: tp, reason: "tp" };
   return { exit: bar.c, reason: "time" };
 }
@@ -470,9 +512,10 @@ export function syncBooks(
         const lastT = bars.at(-1)?.t ?? 0;
         const prior = byId.get(id);
         const stale = !!prior && prior.cursorT > lastT;
-        const cell = prior && !stale
-          ? { ...prior, lastN: prior.lastN.slice(), leg: prior.leg ? { ...prior.leg } : null }
-          : blankCell(book.symbol, indication, combo.tpAtr, combo.slOfTp);
+        const cell =
+          prior && !stale
+            ? { ...prior, lastN: prior.lastN.slice(), leg: prior.leg ? { ...prior.leg } : null }
+            : blankCell(book.symbol, indication, combo.tpAtr, combo.slOfTp);
         const from = cell.cursorT ? indexAfter(bars, cell.cursorT) : 22;
         const before = cell.n;
         advance(cell, bars, sides[indication]!, series.atr, notional, from, push);
@@ -496,7 +539,13 @@ export function applyFloors(cells: Cell[], floors: Floors): Cell[] {
   });
 }
 
-export type SizeOpts = { block: boolean; axis: boolean; normalLive: boolean; hedge: boolean };
+export type SizeOpts = {
+  block: boolean;
+  axis: boolean;
+  normalLive: boolean;
+  hedge: boolean;
+  floors?: Floors;
+};
 
 export function sizedNotional(base: number, opts: { block: boolean; axis: boolean }): number {
   if (!(base > 0)) return 0;
@@ -518,7 +567,10 @@ export function openFromPerforming(
   scope: { system: string; connection: string },
 ): LivePos[] {
   const ranked = cells
-    .filter((c) => c.validExec && !c.disabled && c.liveFloor && c.net > 0 && (c.side === 1 || c.side === -1))
+    .filter(
+      (c) =>
+        c.validExec && !c.disabled && c.liveFloor && c.net > 0 && (c.side === 1 || c.side === -1),
+    )
     .filter((c) => opts.normalLive || c.indication !== "direction")
     .sort((a, b) => b.pf - a.pf || b.net - a.net);
   const seen = new Set<string>();
@@ -536,12 +588,15 @@ export function openFromPerforming(
     symbols.add(c.symbol);
     const side = c.side as Side;
     const a = Math.max(m.atr, m.price * 0.0008);
-    const notional = sizedNotional(base, opts);
+    const notional = sizedNotional(base, {
+      block: opts.block && c.pf >= (opts.floors?.block ?? 0),
+      axis: opts.axis && c.pf >= (opts.floors?.axis ?? 0),
+    });
     const qty = notional / m.price;
     const tpDist = c.tpAtr * a;
     const slDist = c.slOfTp * tpDist;
     out.push({
-      id: `x:${TAG}${c.symbol.replace("-", "")}${c.indication.slice(0, 3)}${out.length}`,
+      id: `x:${TAG}${scope.connection}:${c.id}:${c.cursorT}`,
       symbol: c.symbol,
       side,
       qty,
@@ -576,7 +631,11 @@ export function markPositions(
   positions: LivePos[],
   prices: Record<string, number>,
   opts: { trail: boolean; dca: boolean; equity: number; asOf?: number },
-): { open: LivePos[]; closed: { pos: LivePos; pnl: number; px: number; reason: string }[]; dca: LivePos[] } {
+): {
+  open: LivePos[];
+  closed: { pos: LivePos; pnl: number; px: number; reason: string }[];
+  dca: LivePos[];
+} {
   const open: LivePos[] = [];
   const closed: { pos: LivePos; pnl: number; px: number; reason: string }[] = [];
   const dca: LivePos[] = [];
@@ -588,7 +647,8 @@ export function markPositions(
       continue;
     }
     const asOf = opts.asOf ?? 0;
-    const elapsed = asOf > 0 ? Math.floor(asOf / 3_600_000) - Math.floor(p.openedAt / 3_600_000) : p.hold;
+    const elapsed =
+      asOf > 0 ? Math.floor(asOf / 3_600_000) - Math.floor(p.openedAt / 3_600_000) : p.hold;
     const next: LivePos = { ...p, mark: px, hold: Math.max(p.hold, elapsed) };
     if (next.side > 0) next.peak = Math.max(next.peak, px);
     else next.peak = Math.min(next.peak, px);
@@ -597,34 +657,54 @@ export function markPositions(
       if (next.side > 0) next.sl = Math.min(next.tp, Math.max(next.sl, next.peak - dist));
       else next.sl = Math.max(next.tp, Math.min(next.sl, next.peak + dist));
     }
-    if (opts.dca && next.dca < 2) {
-      const adverse = next.side > 0 ? next.entry - px : px - next.entry;
-      const room = next.qtyBase * MAX_MUL - next.qty;
-      if (adverse > Math.abs(next.entry - next.sl) * 0.45 && room > 0) {
-        const add = Math.min(room, base / px);
-        if (add > 0) {
-          next.entry = (next.entry * next.qty + px * add) / (next.qty + add);
-          next.qty += add;
-          next.dca += 1;
-          dca.push(next);
-        }
-      }
-    }
     next.qty = Math.min(next.qty, next.qtyBase * MAX_MUL);
     const hitTp = next.side > 0 ? px >= next.tp : px <= next.tp;
     const hitSl = next.side > 0 ? px <= next.sl : px >= next.sl;
     if (hitSl) {
-      closed.push({ pos: next, pnl: closePnl(next.side, next.entry, next.sl, next.qty), px: next.sl, reason: "sl" });
+      closed.push({
+        pos: next,
+        pnl: closePnl(next.side, next.entry, next.sl, next.qty),
+        px: next.sl,
+        reason: "sl",
+      });
     } else if (hitTp) {
-      closed.push({ pos: next, pnl: closePnl(next.side, next.entry, next.tp, next.qty), px: next.tp, reason: "tp" });
+      closed.push({
+        pos: next,
+        pnl: closePnl(next.side, next.entry, next.tp, next.qty),
+        px: next.tp,
+        reason: "tp",
+      });
     } else if (next.hold >= MAX_HOLD) {
-      closed.push({ pos: next, pnl: closePnl(next.side, next.entry, px, next.qty), px, reason: "hold" });
-    } else open.push(next);
+      closed.push({
+        pos: next,
+        pnl: closePnl(next.side, next.entry, px, next.qty),
+        px,
+        reason: "hold",
+      });
+    } else {
+      if (opts.dca && next.dca < 2) {
+        const adverse = next.side > 0 ? next.entry - px : px - next.entry;
+        const room = next.qtyBase * MAX_MUL - next.qty;
+        if (adverse > Math.abs(next.entry - next.sl) * 0.45 && room > 0) {
+          const add = Math.min(room, base / px);
+          if (add > 0) {
+            next.entry = (next.entry * next.qty + px * add) / (next.qty + add);
+            next.qty += add;
+            next.dca += 1;
+            dca.push(next);
+          }
+        }
+      }
+      open.push(next);
+    }
   }
   return { open, closed, dca };
 }
 
-export function headline(livePnls: { symbol: string; combo: string; pnl: number }[], minPf = PF.short) {
+export function headline(
+  livePnls: { symbol: string; combo: string; pnl: number }[],
+  minPf = PF.short,
+) {
   const map = new Map<string, { n: number; net: number; pnls: number[] }>();
   for (const r of livePnls) {
     const k = `${r.symbol}|${r.combo}`;
@@ -677,9 +757,9 @@ export function cellRollup(cells: Cell[]) {
 export function barSignature(books: { symbol: string; bars: Bar[] }[]): string {
   let sig = "";
   for (const b of books) {
-    const closed = closedBars(b.bars);
-    const last = closed.at(-1);
-    sig += `${b.symbol}:${last?.t ?? 0}:${closed.length}|`;
+    const last = lastClosedBar(b.bars);
+    const length = b.bars.length - Number(last !== b.bars.at(-1));
+    sig += `${b.symbol}:${last?.t ?? 0}:${length}|`;
   }
   return sig;
 }
@@ -693,7 +773,22 @@ export type HourPoint = {
   mtm: number;
   net: number;
   pf: number;
+  grossProfit: number;
+  grossLoss: number;
   openLegs: number;
+};
+
+type HourAcc = Omit<HourPoint, "net" | "pf">;
+
+type ReplaySummary = {
+  net: number;
+  samples: number;
+  wins: number;
+  green: number;
+  pf: number;
+  grossProfit: number;
+  grossLoss: number;
+  drawdown: number;
 };
 
 export type SessionReport = {
@@ -704,6 +799,7 @@ export type SessionReport = {
   promoted: HourPoint[];
   proven: number;
   symbols: number;
+  unavailable: string[];
   preNet: number;
   liveNet: number;
   promotedNet: number;
@@ -723,96 +819,161 @@ export type SessionReport = {
   greenBookPre: number;
   greenBookLive: number;
   bookNames: string[];
+  selected: { name: string; symbol: string; pre: ReplaySummary; replay: ReplaySummary }[];
 };
-
-type HourAcc = {
-  t: number;
-  trades: number;
-  wins: number;
-  losses: number;
-  realized: number;
-  mtm: number;
-  gw: number;
-  gl: number;
-  openLegs: number;
-};
-
-function emptySession(note: string): SessionReport {
-  return {
-    ready: false,
-    note,
-    pre: [],
-    live: [],
-    promoted: [],
-    proven: 0,
-    symbols: 0,
-    preNet: 0,
-    liveNet: 0,
-    promotedNet: 0,
-    greenPre: 0,
-    greenLive: 0,
-    greenPromoted: 0,
-    prePf: 0,
-    livePf: 0,
-    promotedPf: 0,
-    samplesPre: 0,
-    samplesLive: 0,
-    samplesPromoted: 0,
-    bookPre: [],
-    bookLive: [],
-    bookNetPre: 0,
-    bookNetLive: 0,
-    greenBookPre: 0,
-    greenBookLive: 0,
-    bookNames: [],
-  };
-}
-
-function hourAcc(t: number): HourAcc {
-  return { t, trades: 0, wins: 0, losses: 0, realized: 0, mtm: 0, gw: 0, gl: 0, openLegs: 0 };
-}
-
-function pricePnl(side: Side, entry: number, exit: number, qty: number): number {
-  if (!(entry > 0) || !(exit > 0) || !(qty > 0)) return 0;
-  return (exit - entry) * qty * (side < 0 ? -1 : 1);
-}
-
-function seal(rows: HourAcc[]): HourPoint[] {
-  return rows.map((r) => ({
-    t: r.t,
-    trades: r.trades,
-    wins: r.wins,
-    losses: r.losses,
-    realized: r.realized,
-    mtm: r.mtm,
-    net: r.realized + r.mtm,
-    pf: r.gl < 1e-12 ? (r.gw > 1e-12 ? 4 : 0) : r.gw / r.gl,
-    openLegs: r.openLegs,
-  }));
-}
-
-function totals(rows: HourPoint[]) {
-  let net = 0;
-  let gw = 0;
-  let gl = 0;
-  let samples = 0;
-  let green = 0;
-  for (const r of rows) {
-    net += r.net;
-    samples += r.trades;
-    if (r.net > 0) green += 1;
-    if (r.realized > 0) gw += r.realized;
-    else if (r.realized < 0) gl -= r.realized;
-  }
-  return { net, samples, green, pf: gl < 1e-12 ? (gw > 1e-12 ? 4 : 0) : gw / gl };
-}
 
 export type ReplaySize = "base" | "block" | "axis" | "both";
 
 export type ReplayOpts = {
   hours?: 12 | 24 | 48;
   size?: ReplaySize;
+  end?: number;
+  costs?: Readonly<Record<string, number>>;
 };
+
+const REPLAY_HOUR = 3_600_000;
+const WARMUP = 22;
+
+function hourAccumulator(t: number): HourAcc {
+  return {
+    t,
+    trades: 0,
+    wins: 0,
+    losses: 0,
+    realized: 0,
+    mtm: 0,
+    grossProfit: 0,
+    grossLoss: 0,
+    openLegs: 0,
+  };
+}
+
+function seal(rows: HourAcc[]): HourPoint[] {
+  return rows.map((row) => ({
+    ...row,
+    net: row.realized + row.mtm,
+    pf: profitFactor(row.grossProfit, row.grossLoss),
+  }));
+}
+
+export function summarizeReplay(rows: HourPoint[]): ReplaySummary {
+  let net = 0;
+  let grossProfit = 0;
+  let grossLoss = 0;
+  let samples = 0;
+  let wins = 0;
+  let green = 0;
+  let peak = 0;
+  let drawdown = 0;
+  for (const row of rows) {
+    net += row.net;
+    samples += row.trades;
+    wins += row.wins;
+    grossProfit += row.grossProfit;
+    grossLoss += row.grossLoss;
+    if (row.net > 1e-9) green += 1;
+    peak = Math.max(peak, net);
+    drawdown = Math.max(drawdown, peak - net);
+  }
+  return {
+    net,
+    samples,
+    wins,
+    green,
+    grossProfit,
+    grossLoss,
+    pf: profitFactor(grossProfit, grossLoss),
+    drawdown,
+  };
+}
+
+function addHours(dst: HourAcc[], src: readonly HourAcc[], scale = 1) {
+  for (const [index, row] of src.entries()) {
+    const out = dst[index]!;
+    out.trades += row.trades;
+    out.wins += row.wins;
+    out.losses += row.losses;
+    out.realized += row.realized * scale;
+    out.mtm += row.mtm * scale;
+    out.grossProfit += row.grossProfit * scale;
+    out.grossLoss += row.grossLoss * scale;
+    out.openLegs += row.openLegs;
+  }
+}
+
+function replayWindow(
+  bars: Bar[],
+  atr: number[],
+  signals: (Side | 0)[],
+  from: number,
+  slots: HourAcc[],
+  notional: number,
+  cost: number,
+  tpAtr: number,
+  slOfTp: number,
+) {
+  let leg: OpenLeg | null = null;
+  let priorMark = 0;
+  for (let offset = 0; offset < slots.length; offset++) {
+    const row = slots[offset]!;
+    const i = from + offset;
+    const bar = bars[i]!;
+    row.trades =
+      row.wins =
+      row.losses =
+      row.realized =
+      row.mtm =
+      row.grossProfit =
+      row.grossLoss =
+      row.openLegs =
+        0;
+    const side = signals[i - 1];
+    if (!leg && offset > 0 && side) {
+      const dist = tpAtr * Math.max(atr[i - 1] ?? 0, bar.o * 0.0004);
+      leg = {
+        side,
+        entry: bar.o,
+        tp: bar.o + side * dist,
+        sl: bar.o - side * dist * slOfTp,
+        qty: notional / bar.o,
+        hold: 0,
+      };
+    }
+    if (leg) {
+      const hit = exitOnBar(leg.side, leg.tp, leg.sl, bar, ++leg.hold);
+      if (hit || offset === slots.length - 1) {
+        const pnl = closePnl(leg.side, leg.entry, hit?.exit ?? bar.c, leg.qty, cost);
+        row.trades = 1;
+        row.realized = pnl;
+        if (pnl > 0) {
+          row.wins = 1;
+          row.grossProfit = pnl;
+        }
+        if (pnl < 0) {
+          row.losses = 1;
+          row.grossLoss = -pnl;
+        }
+        leg = null;
+      }
+    }
+    const mark = leg ? closePnl(leg.side, leg.entry, bar.c, leg.qty, cost) : 0;
+    row.mtm = mark - priorMark;
+    row.openLegs = Number(Boolean(leg));
+    priorMark = mark;
+  }
+}
+
+function rankPre(rows: HourAcc[]) {
+  let gp = 0;
+  let gl = 0;
+  let n = 0;
+  for (const row of rows) {
+    gp += row.grossProfit;
+    gl += row.grossLoss;
+    n += row.trades;
+  }
+  return { n, net: gp - gl, pf: profitFactor(gp, gl) };
+}
 
 export function simulateSessions(
   books: { symbol: string; bars: Bar[] }[],
@@ -822,225 +983,138 @@ export function simulateSessions(
 ): SessionReport {
   const hours = opts?.hours ?? 24;
   const size = opts?.size ?? "both";
-  const span = hours * 2;
-  const closed = books
-    .map((b) => ({ symbol: b.symbol, bars: closedBars(saneBars(b.bars)) }))
-    .filter((b) => b.bars.length >= span + 22);
-  if (closed.length < 1) return emptySession(`Need at least ${span + 22} closed 1h bars for a ${hours}h replay.`);
-  const timeSet = closed.map((b) => new Set(b.bars.map((bar) => bar.t)));
-  const times = [...timeSet[0]!].filter((t) => timeSet.every((s) => s.has(t))).sort((a, b) => a - b);
-  if (times.length < span + 22) return emptySession(`Books do not share ${span + 22} closed hours.`);
-  const aligned = closed.map((b) => {
-    const by = new Map(b.bars.map((bar) => [bar.t, bar]));
-    return { symbol: b.symbol, bars: times.map((t) => by.get(t)!) };
+  const span = WARMUP + hours * 2;
+  const latest = Math.max(0, ...books.map((b) => lastClosedBar(b.bars)?.t ?? 0));
+  const end = opts?.end ?? latest + REPLAY_HOUR;
+  const start = end - span * REPLAY_HOUR;
+  const aligned = books.flatMap((b) => {
+    const bars = closedBars(saneBars(b.bars)).filter((bar) => bar.t >= start && bar.t < end);
+    return bars.length === span && bars.every((bar, i) => bar.t === start + i * REPLAY_HOUR)
+      ? [{ symbol: b.symbol, bars }]
+      : [];
   });
-  const n = times.length;
-  const liveFrom = n - hours;
-  const preFrom = n - span;
+  const present = new Set(aligned.map((b) => b.symbol));
+  const unavailable = books.map((b) => b.symbol).filter((s) => !present.has(s));
+  const clock = (from: number) =>
+    Array.from({ length: aligned.length ? hours : 0 }, (_, i) =>
+      hourAccumulator(start + (from + i) * REPLAY_HOUR),
+    );
+  const replayFrom = WARMUP + hours;
+  const preAcc = clock(WARMUP);
+  const liveAcc = clock(replayFrom);
+  const promotedAcc = clock(replayFrom);
+  const bookPreAcc = clock(WARMUP);
+  const bookLiveAcc = clock(replayFrom);
+  const preWork = clock(WARMUP);
+  const liveWork = clock(replayFrom);
   const notional = positionNotional(equity);
+  const scale =
+    notional > 0
+      ? sizedNotional(notional, {
+          block: size === "block" || size === "both",
+          axis: size === "axis" || size === "both",
+        }) / notional
+      : 1;
+  const selected: SessionReport["selected"] = [];
+  let proven = 0;
   const combos = allShortCombos();
-  const preAcc = times.slice(preFrom, liveFrom).map((t) => hourAcc(t));
-  const liveAcc = times.slice(liveFrom).map((t) => hourAcc(t));
-  const promAcc = times.slice(liveFrom).map((t) => hourAcc(t));
-  const accAt = (i: number): HourAcc | null => {
-    if (i >= liveFrom) return liveAcc[i - liveFrom] ?? null;
-    if (i >= preFrom) return preAcc[i - preFrom] ?? null;
-    return null;
-  };
-  const promAt = (i: number): HourAcc | null => (i >= liveFrom ? (promAcc[i - liveFrom] ?? null) : null);
-
-  let provenN = 0;
-  const picked: { symbol: string; name: string; preNet: number; hourNet: number[]; hourTrades: number[] }[] = [];
-
-  for (const book of aligned) {
-    const series = buildSeries(book.bars);
-    const sideRows = {} as Record<Indication, Array<Side | 0>>;
+  for (const { symbol, bars } of aligned) {
+    const series = buildSeries(bars);
+    const cost = opts?.costs?.[symbol] ?? POSITION_RT_COST_PCT;
+    const bestPre = clock(WARMUP);
+    const bestLive = clock(replayFrom);
+    let bestNet = 0;
+    let name = "";
     for (const indication of INDICATIONS) {
-      const row: Array<Side | 0> = new Array(n).fill(0);
-      for (let i = 22; i < n; i++) row[i] = signalAt(indication, book.bars, series, i);
-      sideRows[indication] = row;
-    }
-    for (const combo of combos) {
-      for (const indication of INDICATIONS) {
-        const cell = blankCell(book.symbol, indication, combo.tpAtr, combo.slOfTp);
-        const sides = sideRows[indication]!;
-        let prevU = 0;
-        let prevPromU = 0;
-        let armed = false;
-        let preN = 0;
-        let preGw = 0;
-        let preGl = 0;
-        const hourNet = new Array<number>(span).fill(0);
-        const hourTrades = new Array<number>(span).fill(0);
-        for (let i = 22; i < n; i++) {
-          const b = book.bars[i]!;
-          const a = Math.max(series.atr[i] ?? 0, b.c * 0.0004);
-          if (!cell.leg) {
-            const side = sides[i] ?? 0;
-            if (side) {
-              const tpDist = cell.tpAtr * a;
-              cell.side = side;
-              cell.leg = {
-                side,
-                entry: b.c,
-                tp: b.c + side * tpDist,
-                sl: b.c - side * cell.slOfTp * tpDist,
-                qty: notional / b.c,
-                hold: 0,
-              };
-            }
-          } else {
-            const leg = cell.leg;
-            leg.hold += 1;
-            const hit = exitOnBar(leg.side, leg.tp, leg.sl, b, leg.hold);
-            if (hit) {
-              const pnl = closePnl(leg.side, leg.entry, hit.exit, leg.qty);
-              pushPnl(cell, pnl);
-              const slot = accAt(i);
-              const wi = i - preFrom;
-              if (wi >= 0 && wi < span) {
-                hourNet[wi] += pnl;
-                hourTrades[wi] += 1;
-                if (wi < hours) {
-                  preN += 1;
-                  if (pnl >= 0) preGw += pnl;
-                  else preGl += -pnl;
-                }
-              }
-              if (slot) {
-                slot.trades += 1;
-                slot.realized += pnl;
-                if (pnl >= 0) {
-                  slot.wins += 1;
-                  slot.gw += pnl;
-                } else {
-                  slot.losses += 1;
-                  slot.gl += -pnl;
-                }
-              }
-              if (armed) {
-                const ps = promAt(i);
-                if (ps) {
-                  ps.trades += 1;
-                  ps.realized += pnl;
-                  if (pnl >= 0) {
-                    ps.wins += 1;
-                    ps.gw += pnl;
-                  } else {
-                    ps.losses += 1;
-                    ps.gl += -pnl;
-                  }
-                }
-              }
-              cell.leg = null;
-            }
-          }
-          if (i === liveFrom - 1) {
-            gateCell(cell, floors);
-            armed = cell.validExec && !cell.disabled && cell.net > 0;
-            if (armed) provenN += 1;
-          }
-          const u = cell.leg ? pricePnl(cell.leg.side, cell.leg.entry, b.c, cell.leg.qty) : 0;
-          const delta = u - prevU;
-          const slot = accAt(i);
-          if (slot) {
-            slot.mtm += delta;
-            if (cell.leg) slot.openLegs += 1;
-          }
-          prevU = u;
-          const wi = i - preFrom;
-          if (wi >= 0 && wi < span) hourNet[wi] += delta;
-          if (armed) {
-            const ps = promAt(i);
-            if (ps) {
-              ps.mtm += u - prevPromU;
-              if (cell.leg) ps.openLegs += 1;
-            }
-            prevPromU = u;
-          } else if (i === liveFrom - 1) {
-            prevPromU = u;
-          }
+      const signals = bars.map((_, i) => signalAt(indication, bars, series, i));
+      for (const { tpAtr, slOfTp } of combos) {
+        replayWindow(bars, series.atr, signals, WARMUP, preWork, notional, cost, tpAtr, slOfTp);
+        const quality = rankPre(preWork);
+        const pass =
+          liveShortOk(tpAtr, slOfTp) &&
+          quality.n >= LASTN.minSamples &&
+          quality.net > 0 &&
+          quality.pf >= Math.max(floors.base, floors.short);
+        const choose = pass && quality.net > bestNet;
+        // The portfolio decision uses only the pre-window data above.
+        addHours(preAcc, preWork);
+        replayWindow(
+          bars,
+          series.atr,
+          signals,
+          replayFrom,
+          liveWork,
+          notional,
+          cost,
+          tpAtr,
+          slOfTp,
+        );
+        addHours(liveAcc, liveWork);
+        if (pass) {
+          proven++;
+          addHours(promotedAcc, liveWork);
         }
-        const preNetCell = hourNet.slice(0, hours).reduce((a, b) => a + b, 0);
-        const prePfCell = preGl < 1e-12 ? (preGw > 1e-12 ? 4 : 0) : preGw / preGl;
-        let upHours = 0;
-        let downHours = 0;
-        for (let k = 0; k < hours; k++) {
-          const v = hourNet[k] ?? 0;
-          if (v > 0) upHours += 1;
-          else if (v < 0) downHours += 1;
-        }
-        if (cell.liveFloor && preN >= 4 && preNetCell > 0 && prePfCell >= floors.short && upHours > downHours) {
-          picked.push({ symbol: book.symbol, name: `${book.symbol} ${indication} ${comboId(combo.tpAtr, combo.slOfTp)}`, preNet: preNetCell, hourNet, hourTrades });
+        if (choose) {
+          bestNet = quality.net;
+          name = `${symbol} ${indication} ${comboId(tpAtr, slOfTp)}`;
+          for (let i = 0; i < hours; i++) {
+            Object.assign(bestPre[i]!, preWork[i]);
+            Object.assign(bestLive[i]!, liveWork[i]);
+          }
         }
       }
     }
+    if (name) {
+      addHours(bookPreAcc, bestPre, scale);
+      addHours(bookLiveAcc, bestLive, scale);
+      selected.push({
+        name,
+        symbol,
+        pre: summarizeReplay(seal(bestPre)),
+        replay: summarizeReplay(seal(bestLive)),
+      });
+    }
   }
-
   const pre = seal(preAcc);
   const live = seal(liveAcc);
-  const promoted = seal(promAcc);
-  const preT = totals(pre);
-  const liveT = totals(live);
-  const promT = totals(promoted);
-  const sized =
-    size === "base" ? notional : size === "block" ? blockQty(notional) : size === "axis" ? axisQty(notional) : sizedNotional(notional, { block: true, axis: true });
-  const scale = notional > 0 ? sized / notional : 1;
-  const best = new Map<string, (typeof picked)[number]>();
-  for (const row of picked) {
-    const cur = best.get(row.symbol);
-    if (!cur || row.preNet > cur.preNet) best.set(row.symbol, row);
-  }
-  const fold = (offset: number, src: HourAcc[]): HourPoint[] =>
-    src.map((slot, k) => {
-      let net = 0;
-      let trades = 0;
-      for (const row of best.values()) {
-        net += (row.hourNet[offset + k] ?? 0) * scale;
-        trades += row.hourTrades[offset + k] ?? 0;
-      }
-      return {
-        t: slot.t,
-        trades,
-        wins: net > 0 ? 1 : 0,
-        losses: net < 0 ? 1 : 0,
-        realized: net,
-        mtm: 0,
-        net,
-        pf: net > 0 ? 4 : 0,
-        openLegs: best.size,
-      };
-    });
-  const bookPre = fold(0, preAcc);
-  const bookLive = fold(hours, liveAcc);
-  const bookPreT = totals(bookPre);
-  const bookLiveT = totals(bookLive);
+  const promoted = seal(promotedAcc);
+  const bookPre = seal(bookPreAcc);
+  const bookLive = seal(bookLiveAcc);
+  const a = summarizeReplay(pre);
+  const b = summarizeReplay(live);
+  const c = summarizeReplay(promoted);
+  const d = summarizeReplay(bookPre);
+  const e = summarizeReplay(bookLive);
   return {
-    ready: true,
-    note: `Pre ${hours}h scores every short-GRID cell on closed BingX hours. The book keeps one live-floor cell per symbol: best pre-window net, at least 4 closes, PF at the short floor. The next ${hours}h replays that frozen book at ${size} size. No lookahead into the replay window.`,
+    ready: aligned.length > 0,
+    note: aligned.length
+      ? `The first ${hours}h select one cell per symbol using realized P&L and PF. The next ${hours}h start flat and use those cells at ${size} size. Entries use the next open and ambiguous candles hit the stop first.`
+      : `Need ${span} contiguous closed BingX hours for a ${hours}h replay.`,
     pre,
     live,
     promoted,
-    proven: provenN,
+    proven,
     symbols: aligned.length,
-    preNet: preT.net,
-    liveNet: liveT.net,
-    promotedNet: promT.net,
-    greenPre: preT.green,
-    greenLive: liveT.green,
-    greenPromoted: promT.green,
-    prePf: preT.pf,
-    livePf: liveT.pf,
-    promotedPf: promT.pf,
-    samplesPre: preT.samples,
-    samplesLive: liveT.samples,
-    samplesPromoted: promT.samples,
+    unavailable,
+    preNet: a.net,
+    liveNet: b.net,
+    promotedNet: c.net,
+    greenPre: a.green,
+    greenLive: b.green,
+    greenPromoted: c.green,
+    prePf: a.pf,
+    livePf: b.pf,
+    promotedPf: c.pf,
+    samplesPre: a.samples,
+    samplesLive: b.samples,
+    samplesPromoted: c.samples,
     bookPre,
     bookLive,
-    bookNetPre: bookPreT.net,
-    bookNetLive: bookLiveT.net,
-    greenBookPre: bookPreT.green,
-    greenBookLive: bookLiveT.green,
-    bookNames: [...best.values()].map((row) => row.name),
+    bookNetPre: d.net,
+    bookNetLive: e.net,
+    greenBookPre: d.green,
+    greenBookLive: e.green,
+    bookNames: selected.map((r) => r.name),
+    selected,
   };
 }

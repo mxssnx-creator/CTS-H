@@ -9,7 +9,7 @@ import {
   POSITION_RT_COST_PCT,
   SHORT_SL,
   SHORT_TP,
-} from "./constants";
+} from "./constants.ts";
 
 export function profitFactor(profit: number, loss: number): number {
   const gp = Number.isFinite(profit) ? Math.max(0, profit) : 0;

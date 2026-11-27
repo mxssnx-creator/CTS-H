@@ -1,0 +1,10 @@
+{
+  "name": "cts-h",
+  "version": "0.1.0",
+  "description": "CTS-H BingX perpetuals trading desk and Grok Build workflow.",
+  "author": { "name": "CTS-H", "url": "https://github.com/mxssnx-creator/CTS-H" },
+  "homepage": "https://github.com/mxssnx-creator/CTS-H",
+  "repository": "https://github.com/mxssnx-creator/CTS-H",
+  "license": "MIT",
+  "keywords": ["bingx", "vst", "trading-desk", "grok-build"]
+}
