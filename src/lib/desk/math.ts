@@ -40,7 +40,8 @@ export function positionRtCost(entry: number, exit: number, qty: number, rtPct =
 export function closePnl(side: number, entry: number, exit: number, qty: number, rtPct = POSITION_RT_COST_PCT): number {
   const signed = side < 0 ? -1 : 1;
   if (!(entry > 0) || !(exit > 0) || !(qty > 0)) return 0;
-  return (exit - entry) * qty * signed - positionRtCost(entry, exit, qty, rtPct);
+  const net = (exit - entry) * qty * signed - positionRtCost(entry, exit, qty, rtPct);
+  return Math.abs(net) <= (entry + exit) * qty * Number.EPSILON ? 0 : net;
 }
 
 export function clampBlockVol(n: number, fallback = BLOCK_ADD): number {
@@ -80,8 +81,8 @@ export function positionNotional(equity: number): number {
   return e * POSITION_COST_PCT;
 }
 
-export function stopCappedQty(notional: number, entry: number, stopDistance: number, roundTripCost: number) {
-  const stopCost = stopDistance + entry * roundTripCost;
+export function stopCappedQty(notional: number, entry: number, stopDistance: number, roundTripCost: number, side = 0) {
+  const stopCost = stopDistance + (entry - side * stopDistance / 2) * roundTripCost;
   return Math.min(notional / entry, notional * MODEL_STOP_RISK / stopCost);
 }
 

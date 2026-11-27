@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_FLOORS } from "./constants.ts";
+import { DEFAULT_FLOORS, INDICATIONS } from "./constants.ts";
 import { blockQty, clampAxisPartial, clampBlockVol } from "./math.ts";
 import { cellRollup, exitOnBar, indicationBoard, markPositions, mergeFills, simulateSessions, sizedNotional, syncBooks, type Bar, type LivePos } from "./process.ts";
 
@@ -37,7 +37,7 @@ test("closed-bar pass scores the short grid on a trend", () => {
   const roll = cellRollup(first.cells);
   assert.equal(roll.samples, first.closes);
   const board = indicationBoard(book.bars);
-  assert.equal(board.length, 8);
+  assert.equal(board.length, INDICATIONS.length);
   assert.ok(board.some((row) => row.side !== 0));
 });
 

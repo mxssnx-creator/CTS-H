@@ -8,16 +8,24 @@ import {
 } from "../src/lib/desk/calibration.ts";
 import type { ReplayProfile } from "../src/lib/desk/config-policy.ts";
 import { BOOK, DEFAULT_FLOORS, POSITION_RT_COST_PCT } from "../src/lib/desk/constants.ts";
-import { HOUR_MS, loadKlines } from "../src/lib/desk/market.server.ts";
+import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/intervals.ts";
+import { loadKlines } from "../src/lib/desk/market.server.ts";
 import { positionNotional } from "../src/lib/desk/math.ts";
 import {
   simulateSessions,
   sizedNotional,
   summarizeReplay,
   type Bar,
+  type ReplayOpts,
   type ReplaySize,
   type SessionReport,
 } from "../src/lib/desk/process.ts";
+import {
+  DEFAULT_STRATEGIES,
+  STRATEGY_LABELS,
+  STRATEGY_TYPES,
+  type StrategySettings,
+} from "../src/lib/desk/strategies.ts";
 
 export type Capture = {
   connection: ConnectionId;
@@ -27,6 +35,7 @@ export type Capture = {
   duration: number;
   books: { symbol: string; bars: Bar[]; error?: string }[];
   contracts: Record<string, unknown>[];
+  interval?: CandleInterval;
 };
 
 export async function captureReplay(
@@ -34,6 +43,7 @@ export async function captureReplay(
   symbols: string[],
   endOverride?: number,
   historyHours = 132,
+  interval: CandleInterval = "1h",
 ): Promise<Capture> {
   const client = new Bingx(requireConnection(connection));
   const { serverTime } = await client.publicGet<{ serverTime: number }>(
@@ -41,12 +51,26 @@ export async function captureReplay(
   );
   if (!Number.isSafeInteger(serverTime) || serverTime <= 0)
     throw new Error("BingX server time is unavailable.");
-  const end = endOverride ?? Math.floor((serverTime - 3_000) / HOUR_MS) * HOUR_MS;
-  if (!(end > 0) || end % HOUR_MS !== 0 || end > serverTime - 3_000)
-    throw new Error("Replay end must be a past, closed UTC hour.");
+  const step = CANDLE_INTERVALS[interval];
+  const end = endOverride ?? Math.floor((serverTime - 3_000) / step) * step;
+  const requested = (historyHours * HOUR_MS) / step;
+  if (!(end > 0) || end % step !== 0 || end > serverTime - 3_000 || !Number.isInteger(requested))
+    throw new Error("History and replay end must align to the closed UTC candle interval.");
   const began = performance.now();
   const built = await Promise.all([
-    Promise.allSettled(symbols.map((symbol) => loadKlines(client, symbol, historyHours, end))),
+    Promise.allSettled(
+      symbols.map(async (symbol) => {
+        const bars: Bar[] = [];
+        let cursor = end - requested * step;
+        while (cursor < end) {
+          const limit = Math.min(1_000, (end - cursor) / step);
+          cursor += limit * step;
+          const page = await loadKlines(client, symbol, limit, cursor, interval);
+          bars.push(...page);
+        }
+        return bars;
+      }),
+    ),
     client.publicGet<unknown>("/openApi/swap/v2/quote/contracts"),
   ]);
   const books = built[0].map((item, i) => ({
@@ -67,12 +91,15 @@ export async function captureReplay(
     serverTime,
     end,
     duration: performance.now() - began,
+    interval,
     books,
     contracts,
   };
 }
 
 const SIZES: ReplaySize[] = ["base", "axis", "block", "both"];
+type ReplayScope = Pick<ReplayOpts, "preHours" | "indication" | "range" | "trailing">;
+const fingerprints = new WeakMap<Capture, Map<number, string>>();
 
 export function replayCosts(capture: Capture, slipBps: number) {
   const rates = new Map(
@@ -94,23 +121,28 @@ export function replayCosts(capture: Capture, slipBps: number) {
 
 export function runReplay(
   capture: Capture,
-  hours: 12 | 24 | 48,
+  hours: number,
   slipBps: number,
   profile: ReplayProfile = "filtered",
+  strategies: StrategySettings = DEFAULT_STRATEGIES,
+  scope: ReplayScope = {},
 ) {
   const { costs, feesEstimated } = replayCosts(capture, slipBps);
   const began = performance.now();
   const report = simulateSessions(capture.books, BOOK, DEFAULT_FLOORS, {
+    ...scope,
     hours,
     end: capture.end,
     costs,
     connection: capture.connection,
     profile,
+    interval: capture.interval ?? "1h",
     size: "base",
+    strategies,
   });
   const elapsed = performance.now() - began;
   const base = positionNotional(BOOK);
-  const variants = SIZES.map((size) => {
+  const variants = (profile === "coordinated" ? SIZES.slice(0, 1) : SIZES).map((size) => {
     const scale =
       sizedNotional(base, {
         axis: size === "axis" || size === "both",
@@ -119,22 +151,46 @@ export function runReplay(
     return {
       size,
       scale,
-      pre: summarizeReplay(scaleHours(report.bookPre, scale)),
-      replay: summarizeReplay(scaleHours(report.bookLive, scale)),
+      pre: {
+        ...summarizeReplay(scaleHours(report.bookPre, scale)),
+        drawdown: report.bookDrawdownPre * scale,
+      },
+      replay: {
+        ...summarizeReplay(scaleHours(report.bookLive, scale)),
+        drawdown: report.bookDrawdownLive * scale,
+      },
     };
   });
-  const evidence = createHash("sha256")
-    .update(
-      JSON.stringify({ origin: capture.origin, end: capture.end, books: capture.books, costs }),
-    )
-    .digest("hex");
+  const byCost = fingerprints.get(capture) ?? new Map<number, string>();
+  let evidence = byCost.get(slipBps);
+  if (!evidence) {
+    evidence = createHash("sha256")
+      .update(
+        JSON.stringify({
+          origin: capture.origin,
+          end: capture.end,
+          interval: capture.interval,
+          books: capture.books,
+          costs,
+        }),
+      )
+      .digest("hex");
+    byCost.set(slipBps, evidence);
+    fingerprints.set(capture, byCost);
+  }
   return {
     connection: capture.connection,
     profile,
+    strategies: profile === "coordinated" ? STRATEGY_TYPES.filter((key) => strategies[key]) : [],
+    strategySettings: profile === "coordinated" ? strategies : null,
     origin: capture.origin,
     end: capture.end,
     requested: capture.books.length,
     hours,
+    preHours: report.preHours,
+    interval: report.interval,
+    indication: scope.indication,
+    range: scope.range,
     slipBps,
     costs,
     feesEstimated,
@@ -173,15 +229,31 @@ const table = (head: string[], body: string) =>
 const pf = (grossProfit: number, grossLoss: number) =>
   grossLoss > 0 ? fmt(grossProfit / grossLoss) : grossProfit > 0 ? "No losses" : "—";
 
-export function renderReplay(runs: ReplayRun[]): string {
-  const filtered = runs.filter((run) => run.profile === "filtered");
-  const comparisons = filtered
+function profileName(run: ReplayRun) {
+  return [run.profile, ...run.strategies.map((key) => STRATEGY_LABELS[key])].join(" + ");
+}
+
+export function renderReplay(runs: ReplayRun[], introduction = ""): string {
+  const comparisons = runs
+    .filter((run) => run.profile !== "baseline")
     .flatMap((after) => {
+      const reference =
+        after.profile === "filtered"
+          ? "baseline"
+          : after.strategies.length
+            ? "coordinated"
+            : "filtered";
       const before = runs.find(
         (run) =>
-          run.profile === "baseline" &&
+          run.profile === reference &&
+          run.strategies.length === 0 &&
           run.connection === after.connection &&
           run.end === after.end &&
+          run.interval === after.interval &&
+          run.preHours === after.preHours &&
+          run.hours === after.hours &&
+          run.indication === after.indication &&
+          run.range === after.range &&
           run.evidence === after.evidence,
       );
       if (!before) return [];
@@ -190,6 +262,9 @@ export function renderReplay(runs: ReplayRun[]): string {
       return row([
         iso(after.end),
         after.connection,
+        after.interval,
+        profileName(before),
+        profileName(after),
         after.report.symbols,
         pf(base.grossProfit, base.grossLoss),
         pf(next.grossProfit, next.grossLoss),
@@ -199,8 +274,8 @@ export function renderReplay(runs: ReplayRun[]): string {
         next.samples,
         base.drawdown,
         next.drawdown,
-        `${base.green}/${after.hours}`,
-        `${next.green}/${after.hours}`,
+        `${base.green}/${before.report.bookLive.length}`,
+        `${next.green}/${after.report.bookLive.length}`,
       ]);
     })
     .join("");
@@ -223,7 +298,8 @@ export function renderReplay(runs: ReplayRun[]): string {
         row([
           iso(run.end),
           run.connection,
-          run.profile,
+          run.interval,
+          profileName(run),
           v.size,
           `${fmt(v.scale)}×`,
           v.pre.samples,
@@ -233,7 +309,9 @@ export function renderReplay(runs: ReplayRun[]): string {
           pf(v.replay.grossProfit, v.replay.grossLoss),
           v.replay.net,
           v.replay.drawdown,
-          `${v.replay.green}/${run.hours} (${fmt((v.replay.green * 100) / run.hours)}%)`,
+          run.report.bookLive.length
+            ? `${v.replay.green}/${run.report.bookLive.length} (${fmt((v.replay.green * 100) / run.report.bookLive.length)}%)`
+            : "—",
         ]),
       ),
     )
@@ -279,18 +357,22 @@ export function renderReplay(runs: ReplayRun[]): string {
             `<div class="bar" title="${iso(h.t)} · ${fmt(h.net)}"><i class="${h.net < 0 ? "down" : "up"}" style="--h:${fmt((Math.abs(h.net) / scale) * 48)}%"></i></div>`,
         )
         .join("");
-      return `<section><h2>${esc(run.connection)} · ${esc(run.profile)} · ${iso(run.end)}</h2>
+      const actions = STRATEGY_TYPES.filter((kind) => run.strategies.includes(kind))
+        .map((kind) => `${STRATEGY_LABELS[kind]} ${raw.strategyActions[kind]}`)
+        .join(" · ");
+      return `<section><details><summary>${esc(run.connection)} · ${esc(run.interval)} · ${esc(profileName(run))} · ${iso(run.end)}</summary>
       <p>${esc(run.origin)} · ${raw.symbols}/${run.requested} symbols with complete coverage · ${raw.proven} configurations cleared preselection · ${raw.selected.length} selected for replay</p>
       <p>${fmt(raw.evaluatedConfigs)} market configurations scored. ${raw.disabledConfigs} market-specific configurations excluded by the published calibration.</p>
-      <p>Pre window starts ${iso(run.end - run.hours * 2 * HOUR_MS)}. Replay starts ${iso(run.end - run.hours * HOUR_MS)} and ends ${iso(run.end)}.</p>
+      <p>Pre window starts ${iso(run.end - (run.hours + run.preHours) * HOUR_MS)}. Replay starts ${iso(run.end - run.hours * HOUR_MS)} and ends ${iso(run.end)}.</p>
       <p>Replay calculation ${fmt(run.replayMs)} ms. Fill win rate ${base.samples ? fmt((base.wins * 100) / base.samples) + "%" : "—"}.</p>
+      ${run.strategySettings ? `<p>Volume ${fmt(run.strategySettings.volumeFactor)}× · ${actions ? "Strategy actions " + esc(actions) : "No strategy sizing overlays"}. ${run.indication ? esc(run.indication) + " indication." : ""} ${run.range ? esc(run.range) + " target grid." : ""}</p>` : ""}
       ${raw.unavailable.length ? `<p>Missing contiguous data for ${esc(raw.unavailable.join(", "))}.</p>` : ""}
       ${run.feesEstimated.length ? `<p>Fee fallback applied to ${esc(run.feesEstimated.join(", "))}.</p>` : ""}
-      <h3>Hourly holdout P&amp;L · base size</h3><div class="chart" role="img" aria-label="Hourly net profit and loss">${bars}</div>
-      ${table(["Decision hour", "Closes", "Wins", "Losses", "Realized", "MTM change", "Net", "Trade PF", "Open"], hourly)}
+      <h3>Holdout P&amp;L</h3><div class="chart" role="img" aria-label="Net profit and loss per reporting period">${bars}</div>
+      ${table(["UTC period", "Closes", "Wins", "Losses", "Realized", "MTM change", "Net", "Trade PF", "Open"], hourly)}
       <h3>Frozen selections</h3>
       ${table(["Symbol and configuration", "Costs", "Pre closes", "Pre PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD"], selected)}
-      <p class="hash">Capture and cost SHA-256 ${run.evidence}</p></section>`;
+      <p class="hash">Capture and cost SHA-256 ${run.evidence}</p></details></section>`;
     })
     .join("");
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -303,11 +385,12 @@ export function renderReplay(runs: ReplayRun[]): string {
   td,th{text-align:right;padding:.6rem .5rem;border-bottom:1px solid #263247}th{color:#72dec9}td:first-child,th:first-child{text-align:left}
   .chart{height:130px;display:flex;gap:3px;background:linear-gradient(transparent 49.5%,#43536b 50%,transparent 50.5%);margin:1rem 0}
   .bar{position:relative;flex:1}.bar i{position:absolute;inset-inline:0;height:var(--h);border-radius:2px}.up{bottom:50%;background:#57d7bf}.down{top:50%;background:#f37c94}.hash{font-size:.8rem;overflow-wrap:anywhere}
-  </style></head><body><main><header><h1>CTS-H · BingX replay</h1><p>Walk-forward result on closed one-hour USDT perpetual candles.</p></header>
-  ${comparisons ? `<section><h2>Matched holdouts · base sizing</h2>${table(["End", "Connection", "Symbols", "Baseline PF", "Filtered PF", "Baseline net", "Filtered net", "Baseline closes", "Filtered closes", "Baseline drawdown", "Filtered drawdown", "Baseline green", "Filtered green"], comparisons)}</section>` : ""}
-  <section><h2>Holdout results by sizing</h2>${table(["End", "Connection", "Profile", "Sizing", "Scale", "Pre closes", "Pre PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD", "Green hours"], variants)}
-  <p>The baseline uses the existing short-grid qualification. The filtered profile adds 0.8–2.0 ATR profit targets and 0.5–1.5× stop-to-target ratios. Position sizing caps modeled stop distance plus costs at 0.8% of planned notional per setup. It omits recurring losers calibrated through ${iso(CALIBRATION_END)} and walks the holdout for eligible pre-window candidates. PF uses realized gains and losses after costs. Drawdown and green hours use hourly portfolio equity. Axis and Block are the desk's sizing multipliers, so they preserve fill count and PF for the same book. P&amp;L and drawdown are in settlement units.</p>
-  <p>Selection used one configuration per symbol from the pre window. Holdout orders start flat, enter at the next candle open, favor the stop on ambiguous candles and flatten at the last close. The model uses taker fees plus ${runs[0]?.slipBps ?? 0} bp slippage per fill. Funding, depth-limited execution and liquidation are outside the model.</p></section>
+  </style></head><body><main><header><h1>CTS-H · BingX replay</h1><p>Walk-forward results on closed USDT perpetual candles.</p></header>
+  ${introduction}
+  ${comparisons ? `<section><h2>Matched holdouts</h2>${table(["End", "Connection", "Candles", "Reference", "Trial", "Symbols", "Reference PF", "Trial PF", "Reference net", "Trial net", "Reference closes", "Trial closes", "Reference drawdown", "Trial drawdown", "Reference green", "Trial green"], comparisons)}</section>` : ""}
+  <section><h2>Holdout results by profile</h2>${table(["End", "Connection", "Candles", "Profile", "Sizing", "Scale", "Pre closes", "Pre PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD", "Green periods"], variants)}
+  <p>The baseline uses the original short grid. The filtered profile adds 0.8–2.0 ATR targets and the calibrated 1h exclusions. The coordinated profile adds two indications, independently qualifies fixed, ATR-trailing and break-even exits, and ranks qualified candidates by positive periods. Modeled stop distance and costs are limited to 0.8% of planned notional per setup in the filtered and coordinated profiles. Legacy Axis and Block multipliers preserve the reference trade sequence. Coordinated overlays execute their own sizing and add rules.</p>
+  <p>Each market advances one prequalified configuration into a flat-start holdout. Entries use the next candle open, ambiguous candles hit the stop first, managed stops update after the candle, and any remaining position closes at the boundary. Time exits use 24 candles. PF uses realized gains and losses after taker fees and ${runs[0]?.slipBps ?? 0} bp slippage per fill. P&amp;L and candle-equity drawdown are in settlement units. Positive periods use hourly equity on intervals up to 1h and four-hour equity on 4h candles. Funding, depth and liquidation are outside the model.</p></section>
   <section><h2>Exclusion evidence</h2>
   <p>Historical calibration cutoffs ${CALIBRATION_CUTOFFS.map(iso).join(" · ")}.</p>
   <p>Each exclusion applies to one connection, symbol, indication and bracket. It required at least 24 closes, at least three losing periods with six or more closes each, zero adequately sampled winning periods and pooled PF no greater than 0.80. Alternate grid configurations share market data and their fills can be correlated.</p>

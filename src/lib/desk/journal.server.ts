@@ -26,6 +26,10 @@ export type Venue = {
   remaining: number;
   stopId: string | null;
   targetId: string | null;
+  stopOverall?: boolean;
+  targetOverall?: boolean;
+  controlFills?: Record<string, number>;
+  observedAt?: number;
 };
 
 export type Phase =
@@ -52,6 +56,17 @@ export type Ticket = {
   phase: Phase;
   risk?: Risk;
   venue?: Venue;
+  targetQuantity?: number;
+  latency?: { preflightMs: number; submitMs: number };
+  protection?: {
+    kind: "stop" | "target";
+    trigger: number;
+    overall: boolean;
+    quantity?: number;
+    oldId: string | null;
+    orderId?: string;
+    beganAt: number;
+  };
 };
 
 const BUSY = new Set<Phase>(["sending", "reconcile", "uncertain", "incident"]);
@@ -90,6 +105,14 @@ export class Journal {
     return JSON.parse(String(row.payload));
   }
 
+  active(connection: SignedConnection): Ticket[] {
+    return this.db
+      .prepare("SELECT payload FROM tickets WHERE connection = ?")
+      .all(connection)
+      .map((row) => JSON.parse(String(row.payload)) as Ticket)
+      .filter(({ phase }) => BUSY.has(phase) || phase === "open");
+  }
+
   private neighbors(ticket: Ticket): Ticket[] {
     return this.db
       .prepare("SELECT payload FROM tickets WHERE connection = ? AND symbol = ?")
@@ -116,6 +139,14 @@ export class Journal {
       .run(ticket.id, Date.now(), ticket.phase, detail);
   }
 
+  private save(ticket: Ticket, detail: string) {
+    this.db
+      .prepare("UPDATE tickets SET payload=? WHERE id=?")
+      .run(JSON.stringify(ticket), ticket.id);
+    this.event(ticket, detail);
+    return ticket;
+  }
+
   create(ticket: Ticket): Ticket {
     return this.transaction(() => {
       this.db
@@ -130,28 +161,80 @@ export class Journal {
     return this.transaction(() => {
       const before = this.get(id);
       if (!from.includes(before.phase)) throw new Error(`Ticket ${id} is at ${before.phase}.`);
-      const next = update(before);
-      this.db.prepare("UPDATE tickets SET payload=? WHERE id=?").run(JSON.stringify(next), id);
-      this.event(next, detail);
-      return next;
+      return this.save(update(before), detail);
     });
   }
 
   claim(id: string, now: number): Ticket {
-    return this.change(id, ["approved"], "One send claimed and persisted", (ticket) => {
-      if (!ticket.risk || ticket.risk.expiresAt <= now)
-        throw new Error("Risk sign-off expired. Refresh risk and approve the new limit.");
-      const neighbors = this.neighbors(ticket);
-      if (neighbors.some((row) => BUSY.has(row.phase) && row.id !== ticket.parent)) {
-        throw new Error("Resolve the outstanding ticket on this connection and symbol.");
-      }
-      const open = neighbors.filter((row) => !row.parent && row.phase === "open");
-      if (ticket.parent ? open.length !== 1 || open[0]?.id !== ticket.parent : open.length > 0) {
-        throw new Error(
-          "This symbol is already assigned to another ticket or the parent is no longer open.",
-        );
-      }
-      return { ...ticket, phase: "sending" };
+    return this.transaction(() => this.reserve(this.get(id), now));
+  }
+
+  claimBatch(approved: Ticket[], now: number): Ticket[] {
+    return this.transaction(() =>
+      approved.map((previous) => {
+        const current = this.get(previous.id);
+        if (JSON.stringify(current.risk) !== JSON.stringify(previous.risk))
+          throw new Error("Approval changed during batch preflight.");
+        return this.reserve(current, now);
+      }),
+    );
+  }
+
+  private reserve(ticket: Ticket, now: number): Ticket {
+    if (ticket.phase !== "approved") throw new Error(`Ticket ${ticket.id} is at ${ticket.phase}.`);
+    if (!ticket.risk || ticket.risk.expiresAt <= now)
+      throw new Error("Risk sign-off expired. Refresh risk and approve the new limit.");
+    const neighbors = this.neighbors(ticket);
+    if (neighbors.some((row) => BUSY.has(row.phase) && row.id !== ticket.parent)) {
+      throw new Error("Resolve the outstanding ticket on this connection and symbol.");
+    }
+    const open = neighbors.filter(
+      (row) =>
+        !row.parent &&
+        (row.phase === "open" ||
+          (row.id === ticket.parent &&
+            row.phase === "incident" &&
+            !row.protection &&
+            row.venue?.positionId)),
+    );
+    if (ticket.parent ? open.length !== 1 || open[0]?.id !== ticket.parent : open.length > 0) {
+      throw new Error("This symbol is assigned to another ticket or the parent has changed.");
+    }
+    return this.save({ ...ticket, phase: "sending" }, "One send claimed and persisted");
+  }
+
+  claimProtection(id: string, previous: Ticket, intent: NonNullable<Ticket["protection"]>) {
+    return this.change(id, ["open", "incident"], "Protection change claimed", (current) => {
+      if (
+        current.protection ||
+        JSON.stringify(current.venue) !== JSON.stringify(previous.venue) ||
+        this.neighbors(current).some((row) => BUSY.has(row.phase))
+      )
+        throw new Error("Owned position changed or another action is in flight.");
+      return { ...current, phase: "incident", protection: intent };
+    });
+  }
+
+  observeClose(
+    child: Ticket,
+    parent: Ticket,
+    next: Ticket,
+    detail: string,
+    parentPhase: Phase,
+    parentVenue: Venue,
+  ) {
+    return this.transaction(() => {
+      const current = this.get(child.id);
+      const owner = this.get(parent.id);
+      if (
+        current.phase !== child.phase ||
+        JSON.stringify(current.venue) !== JSON.stringify(child.venue) ||
+        owner.phase !== parent.phase ||
+        JSON.stringify(owner.venue) !== JSON.stringify(parent.venue)
+      )
+        throw new Error("A newer close or position observation is already recorded.");
+      this.save({ ...owner, phase: parentPhase, venue: parentVenue }, detail);
+      return this.save(next, detail);
     });
   }
 
@@ -159,11 +242,12 @@ export class Journal {
     const children = this.neighbors(parent).filter(
       (row) => row.parent === parent.id && row.id !== omit,
     );
-    return Math.max(
+    const ownCloses = children.reduce((sum, row) => sum + (row.venue?.filled ?? 0), 0);
+    const controlCloses = Object.values(parent.venue?.controlFills ?? {}).reduce(
+      (a, b) => a + b,
       0,
-      (parent.venue?.filled ?? 0) -
-        children.reduce((sum, row) => sum + (row.venue?.filled ?? 0), 0),
     );
+    return (parent.venue?.filled ?? 0) - ownCloses - controlCloses;
   }
 
   review(id: string, detail: string) {

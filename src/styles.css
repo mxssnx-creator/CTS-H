@@ -672,6 +672,56 @@
   height: 16px;
   accent-color: #a6baff;
 }
+.strategy-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 365px), 1fr));
+  gap: 16px;
+}
+.strategy-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+.strategy-switch input {
+  width: 17px;
+  height: 17px;
+  accent-color: #a6baff;
+}
+.strategy-results,
+.stop-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 138px), 1fr));
+  gap: 12px;
+}
+.strategy-results > div {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid #2e3e56;
+  border-radius: 8px;
+  background: #182334;
+}
+.strategy-results span {
+  color: var(--color-muted);
+  font-size: 13px;
+}
+.stop-options {
+  margin-bottom: 16px;
+}
+.reduce-order {
+  display: flex;
+  gap: 6px;
+}
+.reduce-order select {
+  padding: 6px;
+  border: 1px solid #3f4e65;
+  border-radius: 6px;
+  background: #101927;
+  color: #eef3fb;
+}
 .positive {
   color: var(--color-bid) !important;
 }
