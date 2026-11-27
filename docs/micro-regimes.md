@@ -49,3 +49,24 @@ Rules, fixed before the run.
 - Brackets, grid, windows, regime labels and walk rule as Experiment B.
 - Validation: the test windows are split in time. First half: test windows 12 to 30. Second half: test windows 31 to 48. The direction table in Experiment B was computed over all windows, so this experiment is a test only in the time split, and the report says so.
 - Success: out-of-sample pooled PF above 1.00 in each half of the time split, and above 1.00 in each regime with at least five traded windows. Anything else is reported as not profitable.
+
+## Experiment C result: trend-filtered entries, 4 hours (recorded)
+
+- Out of sample: pooled PF 0.77, net −383, traded 31 of 37 windows. Without the filter it was PF 0.75 and net −1,536.
+- Bear windows: PF 1.13, net +74. Bull windows: PF 0.45. Chop windows: PF 0.66.
+- Time split, pre-registered criterion (PF above 1.00 in each half): not met. First half (windows 12 to 30): net −180, median window PF 0.81, positive in 7 of 19 windows. Second half (windows 31 to 48): net −203 over 12 traded windows, median window PF 1.24, positive in 7 of 12.
+- Reading: the instrument's own trend does not separate bull from bear markets, which are market-wide. The filter helps in bear windows and does not help elsewhere.
+
+## Experiment D: market-breadth direction gate, 4 hours (pre-registered before the run)
+
+- Breadth at each bar: the share of the 48 markets whose close is above their close 60 bars earlier (10 days), computed from closed bars only.
+- Gate: a long is allowed when breadth is at least 0.60. A short is allowed when breadth is at most 0.40. Between the two, no entry.
+- Brackets, grid, windows, regime labels, walk rule and time-split criterion as Experiment C.
+
+## Experiment D result: market-breadth direction gate, 4 hours (recorded)
+
+- Out of sample: pooled PF 1.007, net +8, traded 37 of 37 windows, no flat windows. The median window PF is 1.00, so the result is breakeven.
+- Time split: first half (windows 12 to 30) net −62, median window PF 1.00, positive in 10 of 19 windows. Second half (windows 31 to 48) net +70, median window PF 1.01, positive in 11 of 18 windows.
+- Regimes: BULL PF 1.21 (7 windows, net +41), BEAR PF 1.20 (13 windows, net +90), CHOP PF 0.80 (17 windows, net −123).
+- Pre-registered criterion: not met. The first half is negative and CHOP is below 1.00. The best result so far is breakeven overall, with the bull and bear sides both positive.
+- The walk picked eight different sets across 37 windows, which is the signature of selection noise rather than one stable edge.

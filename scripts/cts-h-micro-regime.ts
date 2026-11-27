@@ -59,15 +59,39 @@ for (let j = 0; ; j++) {
 }
 const K = spans.length;
 // TREND=on (Experiment C): +1 or -1 by the sign of the return over the last TREND_BARS closed bars, causal.
-const trendOn = process.env.TREND === "on";
+const trendMode = process.env.TREND ?? "off";
+const trendOn = trendMode === "on" || trendMode === "breadth";
 const trendBars = Math.round((10 * 24 * HOUR_MS) / step);
-for (const market of markets) {
-  market.book = buildMicroBook(market.bars, interval);
-  if (trendOn) {
+for (const market of markets) market.book = buildMicroBook(market.bars, interval);
+if (trendMode === "on") {
+  // Experiment C: each instrument's own 10-day trend sign.
+  for (const market of markets) {
     const trend = new Int8Array(market.bars.length);
     for (let i = trendBars; i < market.bars.length; i++) {
       const change = market.bars[i]!.c - market.bars[i - trendBars]!.c;
       trend[i] = change > 0 ? 1 : change < 0 ? -1 : 0;
+    }
+    market.trend = trend;
+  }
+} else if (trendMode === "breadth") {
+  // Experiment D: the share of markets up over the last 10 days, from closed bars only. Long at 0.60 or more, short at 0.40 or less.
+  const counts = new Map<number, { up: number; n: number }>();
+  for (const market of markets) {
+    for (let i = trendBars; i < market.bars.length; i++) {
+      const t = market.bars[i]!.t;
+      const up = market.bars[i]!.c > market.bars[i - trendBars]!.c;
+      const entry = counts.get(t) ?? { up: 0, n: 0 };
+      entry.n += 1;
+      if (up) entry.up += 1;
+      counts.set(t, entry);
+    }
+  }
+  for (const market of markets) {
+    const trend = new Int8Array(market.bars.length);
+    for (let i = trendBars; i < market.bars.length; i++) {
+      const count = counts.get(market.bars[i]!.t)!;
+      const breadth = count.up / count.n;
+      trend[i] = breadth >= 0.6 ? 1 : breadth <= 0.4 ? -1 : 0;
     }
     market.trend = trend;
   }
@@ -257,7 +281,7 @@ const result = {
   seconds: Math.round((Date.now() - started) / 1000),
 };
 mkdirSync(outDir, { recursive: true });
-writeFileSync(join(outDir, `regime-${interval}${atrBrackets ? "-atr" : ""}${trendOn ? "-trend" : ""}.json`), JSON.stringify(result, null, 1));
+writeFileSync(join(outDir, `regime-${interval}${atrBrackets ? "-atr" : ""}${trendMode === "on" ? "-trend" : trendMode === "breadth" ? "-breadth" : ""}.json`), JSON.stringify(result, null, 1));
 console.log(`${interval}: ${S} sets, ${markets.length} markets, ${windows.length} windows (${JSON.stringify(result.regimeCounts)}), ${result.seconds}s`);
 console.log(`  out of sample pooled PF ${result.oosPooled.pf}, net ${result.oosPooled.net}, traded ${result.oosPooled.tradedWindows}, flat ${result.oosPooled.flatWindows}`);
 for (const [regime, row] of Object.entries(result.oosByRegime)) console.log(`  ${regime}: traded ${row.tradedWindows}, flat ${row.flatWindows}, PF ${row.pf}, net ${row.net}`);
