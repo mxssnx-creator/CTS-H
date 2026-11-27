@@ -3,17 +3,17 @@ import { join } from "node:path";
 import { Bingx } from "../src/lib/desk/bingx.server.ts";
 import { requireConnection } from "../src/lib/desk/connections.ts";
 import { BOOK, INDICATIONS, POSITION_RT_COST_PCT, type Indication } from "../src/lib/desk/constants.ts";
-import { CANDLE_INTERVALS, type CandleInterval } from "../src/lib/desk/intervals.ts";
+import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/intervals.ts";
 import { positionNotional } from "../src/lib/desk/math.ts";
 import { buildSeries, signalAt, type Bar, type Side } from "../src/lib/desk/process.ts";
 import {
-  bookFill,
   buildMicroBook,
   enumerateMicroSets,
   type Fill,
   MICRO_GRID,
+  type MicroAcc,
+  MicroRun,
   type MicroSet,
-  MicroState,
   newMicroAcc,
   simulateMicro,
   summarizeMicro,
@@ -21,10 +21,10 @@ import {
 
 // Forward runner for micro sets on a BingX connection.
 //   live|replay <connection> <outDir> <interval> <setIdsFile> <symbols> <cycles> <history> <volumeFactor>
-// live waits for each candle boundary before it fetches. replay walks the same candles without waiting, one
-// candle per cycle, for a fast plumbing check. Both feed every closed candle through MicroState, the same state
-// machine the batch simulator uses. At the end the batch simulator runs on the stored candles and each fill is
-// compared with the streamed fill.
+// live waits for each candle boundary before it fetches. replay walks the same candles without waiting, one candle per
+// cycle, for a fast plumbing check. Both feed every closed candle through MicroRun, the state machine and accounting the
+// batch simulator uses. At the end the batch simulator runs on the stored candles and each fill is compared with the
+// streamed fill. The accumulator carries the bar-close equity, so the drawdown includes open positions.
 
 const [mode = "live", connection = "bingx-x02", outDir = "", intervalText = "5m", setsPath = "", symbolsText = "100", cyclesText = "12", historyText = "300", volumeText = "0.1"] = process.argv.slice(2);
 if (mode !== "live" && mode !== "replay") throw new Error("Choose live or replay.");
@@ -35,8 +35,9 @@ const history = Number(historyText);
 const symbolCount = Number(symbolsText);
 const notional = positionNotional(BOOK) * Number(volumeText);
 const SETTLE_MS = 20_000;
-const HOURS = 24 * 40;
 const SPACING_MS = 1_250;
+const HOURS = 24 * 40;
+const SLOTS = (HOURS * HOUR_MS) / step;
 
 const client = new Bingx(requireConnection(connection));
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -67,9 +68,7 @@ async function klines(symbol: string, startTime: number, endTime: number, limit:
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
       await pace();
-      const rows = rowsOf(
-        await client.publicGet<unknown>("/openApi/swap/v3/quote/klines", { symbol, interval, startTime, endTime, limit }),
-      );
+      const rows = rowsOf(await client.publicGet<unknown>("/openApi/swap/v3/quote/klines", { symbol, interval, startTime, endTime, limit }));
       return rows
         .map((row) => ({ t: Number(row.time), o: Number(row.open), h: Number(row.high), l: Number(row.low), c: Number(row.close), v: Number(row.volume), closed: true }))
         .filter((bar) => bar.t >= startTime && bar.t < endTime && bar.t % step === 0 && Number.isFinite(bar.c))
@@ -86,9 +85,9 @@ async function klines(symbol: string, startTime: number, endTime: number, limit:
 type Live = {
   symbol: string;
   bars: Bar[];
-  // Signals of the newest closed bar, delivered to every state when the next bar arrives.
+  // Signals of the newest closed bar, delivered to every run when the next bar arrives.
   pending: Record<Indication, Side | 0>;
-  states: MicroState[];
+  runs: MicroRun[];
   tradeFrom: number;
   gaps: number;
 };
@@ -97,24 +96,22 @@ const wantedIds = new Set<string>(JSON.parse(readFileSync(setsPath, "utf8")) as 
 const sets: MicroSet[] = enumerateMicroSets({ ...MICRO_GRID, intervals: [interval] }).filter((set) => wantedIds.has(set.id));
 if (sets.length === 0) throw new Error("No set ids matched the interval.");
 
-const runDir = outDir;
-mkdirSync(runDir, { recursive: true });
-const decisionsPath = join(runDir, "decisions.jsonl");
+mkdirSync(outDir, { recursive: true });
+const decisionsPath = join(outDir, "decisions.jsonl");
 writeFileSync(decisionsPath, "");
-const statusPath = join(runDir, "status.json");
+const statusPath = join(outDir, "status.json");
 const errors: string[] = [];
-const liveAcc = new Map<string, ReturnType<typeof newMicroAcc>>();
+const liveAcc = new Map<string, MicroAcc>();
 const liveFills = new Map<string, Fill[]>();
 let firedFills = 0;
 
-function emitFor(symbol: string, set: MicroSet) {
+function sinkFor(symbol: string, set: MicroSet): (fill: Fill) => void {
   const key = `${symbol}|${set.id}`;
   const fills = liveFills.get(key) ?? [];
   liveFills.set(key, fills);
   return (fill: Fill) => {
     fills.push(fill);
     firedFills += 1;
-    bookFill(liveAcc.get(set.id)!, fill);
     appendFileSync(decisionsPath, `${JSON.stringify({ symbol, set: set.id, ...fill })}\n`);
   };
 }
@@ -127,29 +124,29 @@ function signalsOf(bars: Bar[]): Record<Indication, Side | 0> {
   return out;
 }
 
-// Feeds one closed candle: the states see the signal of the previous candle, then the new candle's signals are
-// computed for the next one. Only candles up to this one are read, so a live run and a batch run agree.
-function feed(live: Live, bar: Bar, emitters: Map<MicroSet, (fill: Fill) => void>): void {
+// Feeds one closed candle. Each run sees the signal of the previous candle, then the new candle's signals are computed
+// for the next one. Only candles up to this one are read, so a live run and a batch run agree.
+function feed(live: Live, bar: Bar): void {
   if (live.bars.length > 0 && bar.t !== live.bars[live.bars.length - 1]!.t + step) live.gaps += 1;
   live.bars.push(bar);
   const index = live.bars.length - 1;
-  for (const state of live.states) {
-    const signal = live.pending[state.set.indication] ?? 0;
-    state.onBar(bar, index, signal, false, null, emitters.get(state.set)!);
+  for (const run of live.runs) {
+    const set = run.state.set;
+    run.step(bar, index, live.pending[set.indication] ?? 0, false, null, liveAcc.get(set.id)!, undefined);
   }
   live.pending = signalsOf(live.bars);
 }
 
+function openCount(lives: Live[]): number {
+  return lives.reduce((n, live) => n + live.runs.filter((run) => !run.flat).length, 0);
+}
+
 async function main(): Promise<void> {
   const started = Date.now();
-  const now = Date.now();
-  const currentStart = Math.floor(now / step) * step;
+  const currentStart = Math.floor(Date.now() / step) * step;
   // replay: history ends `cycles` candles before the current one, and each cycle replays one of those candles.
   const anchor = mode === "replay" ? currentStart - cycles * step : currentStart;
-  // Accumulators start at the anchor, so hourly buckets line up with the candles.
-  for (const set of sets) {
-    liveAcc.set(set.id, newMicroAcc(anchor, HOURS));
-  }
+  for (const set of sets) liveAcc.set(set.id, newMicroAcc(anchor, step, SLOTS));
   const symbols = await universe(symbolCount);
   console.log(`${mode} ${connection} ${interval}: ${symbols.length} symbols, ${sets.length} sets, notional ${notional.toFixed(4)} per position, anchor ${new Date(anchor).toISOString()}`);
 
@@ -161,24 +158,17 @@ async function main(): Promise<void> {
         errors.push(`${symbol}: only ${bars.length} history candles`);
         continue;
       }
-      const live: Live = { symbol, bars: [], pending: {} as Record<Indication, Side | 0>, states: [], tradeFrom: 0, gaps: 0 };
-      for (const bar of bars) live.bars.push(bar);
+      const live: Live = { symbol, bars: [], pending: {} as Record<Indication, Side | 0>, runs: [], tradeFrom: 0, gaps: 0 };
+      live.bars.push(...bars);
       live.pending = signalsOf(live.bars);
       live.tradeFrom = live.bars.length;
-      live.states = sets.map((set) => new MicroState(set, interval, { notional, cost: POSITION_RT_COST_PCT }));
+      live.runs = sets.map((set) => new MicroRun(set, interval, { notional, cost: POSITION_RT_COST_PCT, sink: sinkFor(symbol, set) }));
       lives.push(live);
     } catch (error) {
       errors.push(`${symbol}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   console.log(`history loaded for ${lives.length} symbols`);
-
-  const emitters = new Map<string, Map<MicroSet, (fill: Fill) => void>>();
-  for (const live of lives) {
-    const map = new Map<MicroSet, (fill: Fill) => void>();
-    for (const set of sets) map.set(set, emitFor(live.symbol, set));
-    emitters.set(live.symbol, map);
-  }
 
   for (let cycle = 1; cycle <= cycles; cycle++) {
     const target = anchor + cycle * step;
@@ -191,47 +181,47 @@ async function main(): Promise<void> {
         const since = live.bars[live.bars.length - 1]!.t + step;
         if (since >= target) continue;
         const fresh = await klines(live.symbol, since, target, 5);
-        for (const bar of fresh) feed(live, bar, emitters.get(live.symbol)!);
+        for (const bar of fresh) feed(live, bar);
       } catch (error) {
         errors.push(`cycle ${cycle} ${live.symbol}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    const perSet = Object.fromEntries(
-      sets.map((set) => {
-        const acc = liveAcc.get(set.id);
-        return [set.id, acc ? summarizeMicro(acc) : null];
-      }),
-    );
+    const perSet = Object.fromEntries(sets.map((set) => [set.id, summarizeMicro(liveAcc.get(set.id)!)]));
     writeFileSync(
       statusPath,
       JSON.stringify(
-        { mode, connection, interval, cycle, cycles, symbols: lives.length, fills: firedFills, open: lives.reduce((n, live) => n + live.states.filter((state) => !state.flat).length, 0), gaps: lives.reduce((n, live) => n + live.gaps, 0), errors: errors.length, perSet, elapsedSeconds: Math.round((Date.now() - started) / 1000) },
+        { mode, connection, interval, cycle, cycles, symbols: lives.length, fills: firedFills, open: openCount(lives), gaps: lives.reduce((n, live) => n + live.gaps, 0), errors: errors.length, perSet, elapsedSeconds: Math.round((Date.now() - started) / 1000) },
         null,
         1,
       ),
     );
-    console.log(`cycle ${cycle}/${cycles}: fills ${firedFills}, open ${lives.reduce((n, live) => n + live.states.filter((state) => !state.flat).length, 0)}, errors ${errors.length}`);
+    console.log(`cycle ${cycle}/${cycles}: fills ${firedFills}, open ${openCount(lives)}, errors ${errors.length}`);
   }
 
   // Batch check: the same bars through the batch simulator, compared fill by fill with what the stream produced.
+  // The batch's final-bar closes are a window artifact, so they are dropped from the comparison and only the streamed
+  // open positions are checked against them.
   let matched = 0;
   let mismatched = 0;
   const mismatches: string[] = [];
-  const batchAcc = new Map<string, ReturnType<typeof newMicroAcc>>();
+  const batchNet = new Map<string, { net: number; legs: number }>();
   for (const live of lives) {
     const book = buildMicroBook(live.bars, interval);
     for (const set of sets) {
       const trace: Fill[] = [];
-      const acc = batchAcc.get(set.id) ?? newMicroAcc(anchor, HOURS);
-      batchAcc.set(set.id, acc);
-      simulateMicro(book, set, live.tradeFrom, live.bars.length, newMicroAcc(0, 1), { notional, cost: POSITION_RT_COST_PCT, trace });
+      simulateMicro(book, set, live.tradeFrom, live.bars.length, newMicroAcc(anchor, step, SLOTS), { notional, cost: POSITION_RT_COST_PCT, trace });
       const batch = trace.filter((fill) => fill.reason !== "end");
-      for (const fill of batch) bookFill(acc, fill);
       const streamed = liveFills.get(`${live.symbol}|${set.id}`) ?? [];
       const same = streamed.length === batch.length && streamed.every((fill, i) => {
         const other = batch[i]!;
         return fill.reason === other.reason && fill.exitBar === other.exitBar && Math.abs(fill.price - other.price) < 1e-9 && Math.abs(fill.pnl - other.pnl) < 1e-9 && fill.side === other.side;
       });
+      const entry = batchNet.get(set.id) ?? { net: 0, legs: 0 };
+      for (const fill of batch) {
+        entry.net += fill.pnl;
+        entry.legs += 1;
+      }
+      batchNet.set(set.id, entry);
       if (same) matched += 1;
       else {
         mismatched += 1;
@@ -241,22 +231,14 @@ async function main(): Promise<void> {
   }
 
   const summary = Object.fromEntries(
-    sets.map((set) => [
-      set.id,
-      {
-        live: liveAcc.get(set.id) ? summarizeMicro(liveAcc.get(set.id)!) : null,
-        batch: batchAcc.get(set.id) ? summarizeMicro(batchAcc.get(set.id)!) : null,
-      },
-    ]),
+    sets.map((set) => [set.id, { live: summarizeMicro(liveAcc.get(set.id)!), batchBookedNet: batchNet.get(set.id)?.net ?? 0, batchBookedLegs: batchNet.get(set.id)?.legs ?? 0 }]),
   );
   const report = { mode, connection, interval, notional, symbols: lives.length, sets: sets.length, cycles, comparisons: { matched, mismatched, mismatches }, gaps: lives.reduce((n, live) => n + live.gaps, 0), errors, summary, elapsedSeconds: Math.round((Date.now() - started) / 1000) };
-  writeFileSync(join(runDir, "comparison.json"), JSON.stringify(report, null, 1));
-  console.log(`streamed fills ${firedFills}; sim-vs-live (symbol × set) matched ${matched}, mismatched ${mismatched}; errors ${errors.length}`);
+  writeFileSync(join(outDir, "comparison.json"), JSON.stringify(report, null, 1));
+  console.log(`streamed fills ${firedFills}; sim-vs-live (symbol x set) matched ${matched}, mismatched ${mismatched}; errors ${errors.length}`);
   for (const set of sets) {
-    const live = liveAcc.get(set.id);
-    if (!live) continue;
-    const s = summarizeMicro(live);
-    console.log(`${set.id}: positions ${s.positions} net ${s.net.toFixed(4)} PF ${s.pf.toFixed(2)} DD ${s.maxDrawdown.toFixed(4)} hourly ${s.hourlySuccess.toFixed(0)}%`);
+    const s = summarizeMicro(liveAcc.get(set.id)!);
+    console.log(`${set.id}: positions ${s.positions} net ${s.net.toFixed(4)} PF ${s.pf.toFixed(2)} max DD ${s.maxDrawdown.toFixed(4)} equity ${s.equityEnd.toFixed(4)} hourly ${s.hourlySuccess.toFixed(0)}%`);
   }
 }
 

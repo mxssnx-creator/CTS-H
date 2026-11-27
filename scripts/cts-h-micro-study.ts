@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildPlan, DEFAULT_LANE_POLICY, verdict } from "../src/lib/desk/lanes.ts";
+import { DEFAULT_FLOORS } from "../src/lib/desk/constants.ts";
 import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/intervals.ts";
+import { buildPlan, DEFAULT_LANE_POLICY, verdict } from "../src/lib/desk/lanes.ts";
 import {
   aggregateBars,
   barIndexAt,
@@ -9,7 +10,6 @@ import {
   type Closes,
   enumerateMicroSets,
   MICRO_GRID,
-  mergeMicroAcc,
   type MicroBook,
   type MicroGrid,
   type MicroSet,
@@ -19,32 +19,36 @@ import {
   summarizeMicro,
   trailLabel,
 } from "../src/lib/desk/micro.ts";
-import type { Bar } from "../src/lib/desk/process.ts";
+import { gateState, gateStateOf, type Bar } from "../src/lib/desk/process.ts";
+import { normalizeStrategies } from "../src/lib/desk/strategies.ts";
 
 // Micro study over one-minute captures.
-//   run <captureDir> <outDir> <interval> [markets]                 full grid, ungated, three 10-day windows
-//   gated <captureDir> <outDir> <interval> <topN> [markets]         top sets from the ungated run, behind the lane gate
-//   select <outDir> <interval> [suffix]                             choose by the two research windows; holdout reported
+//   run <captureDirs> <outDir> <interval> [markets]           full grid, ungated, every 10-day window the data allows
+//   gated <captureDirs> <outDir> <interval> <topN> [markets]  candidates behind a lane gate (GATE=validated|noveto|lastnet|legacy)
+//   merge <outDir> <interval>                                 join SHARD outputs into the interval file
+//   walk <outDir> <interval> [suffix]                         walk-forward selection, rule fixed in advance
 //
-// Windows are anchored to the capture end on a 4-hour grid: R1 and R2 are research, H is the holdout. Selection reads
-// only R1 and R2. H is reported after the choice and is never used to choose.
-// GRID=quick runs a reduced grid for timing and smoke tests.
+// captureDirs is one directory or several separated by commas: an older and a newer segment of the same markets are
+// merged by symbol. Windows are anchored to the latest capture end on a four-hour grid. The last window is the holdout
+// H. The others are research windows R1, R2, ... oldest first. Each window has 240 hours, and every window keeps 48
+// hours of history before it, so indicator series have converged. Environment: SHARD=i/n splits the grid, GRID=quick
+// runs a reduced grid for timing, COST=0 measures gross edge, MIN_POSITIONS sets the eligibility floor.
 
 const WINDOW_HOURS = 240;
 const WINDOW_MS = WINDOW_HOURS * HOUR_MS;
 const ANCHOR_MS = 4 * HOUR_MS;
+const WARMUP_MS = 48 * HOUR_MS;
 const MIN_POSITIONS = Number(process.env.MIN_POSITIONS ?? 100);
-const TOP = Number(process.env.TOP ?? 10);
 
 type CaptureFile = {
   symbol: string;
+  start: number;
   end: number;
   complete: boolean;
   bars: { time: number; open: number; high: number; low: number; close: number; volume: number }[];
 };
 type Market = { symbol: string; end: number; bars1m: Bar[] };
-type WindowName = "R1" | "R2" | "H";
-type Window = { name: WindowName; start: number; end: number };
+type Window = { name: string; start: number; end: number; research: boolean };
 type Row = Record<string, string>;
 
 const QUICK_GRID: MicroGrid = {
@@ -85,33 +89,57 @@ const HEADER = [
   "exitEnd",
   "grossProfit",
   "grossLoss",
+  "equityEnd",
 ].join(",");
 
-function loadMarkets(dir: string, limit: number): Market[] {
-  const files = readdirSync(dir)
-    .filter((name) => name.endsWith(".json") && name !== "_summary.json")
-    .sort();
-  const markets: Market[] = [];
-  for (const name of files) {
-    if (markets.length >= limit) break;
-    const file = JSON.parse(readFileSync(join(dir, name), "utf8")) as CaptureFile;
-    if (!file.complete) continue;
-    markets.push({
-      symbol: file.symbol,
-      end: file.end,
-      bars1m: file.bars.map((row) => ({ t: row.time, o: row.open, h: row.high, l: row.low, c: row.close, v: row.volume, closed: true })),
-    });
+function loadMarkets(dirs: string[], limit: number): { markets: Market[]; excluded: string[] } {
+  const bySymbol = new Map<string, { end: number; bars: Bar[] }>();
+  for (const dir of dirs) {
+    for (const name of readdirSync(dir).filter((item) => item.endsWith(".json") && item !== "_summary.json").sort()) {
+      const file = JSON.parse(readFileSync(join(dir, name), "utf8")) as CaptureFile;
+      if (!file.complete) continue;
+      const entry = bySymbol.get(file.symbol) ?? { end: 0, bars: [] };
+      entry.end = Math.max(entry.end, file.end);
+      for (const row of file.bars) entry.bars.push({ t: row.time, o: row.open, h: row.high, l: row.low, c: row.close, v: row.volume, closed: true });
+      bySymbol.set(file.symbol, entry);
+    }
   }
-  return markets;
+  const markets: Market[] = [];
+  const excluded: string[] = [];
+  for (const symbol of [...bySymbol.keys()].sort()) {
+    if (markets.length >= limit) break;
+    const entry = bySymbol.get(symbol)!;
+    entry.bars.sort((a, b) => a.t - b.t);
+    const bars: Bar[] = [];
+    for (const bar of entry.bars) if (bars.length === 0 || bars[bars.length - 1]!.t !== bar.t) bars.push(bar);
+    const expected = (entry.end - bars[0]!.t) / 60_000;
+    // A market with more than 1% of its minutes missing is excluded, so every window stays comparable.
+    if (bars.length < 0.99 * expected) {
+      excluded.push(symbol);
+      continue;
+    }
+    markets.push({ symbol, end: entry.end, bars1m: bars });
+  }
+  return { markets, excluded };
 }
 
-function windowsFor(end: number): Window[] {
+// The holdout H is the last window before the anchor. Research windows are added while their history allows.
+function windowsFor(end: number, dataStart: number): Window[] {
   const anchor = Math.floor(end / ANCHOR_MS) * ANCHOR_MS;
-  return [
-    { name: "R1", start: anchor - 3 * WINDOW_MS, end: anchor - 2 * WINDOW_MS },
-    { name: "R2", start: anchor - 2 * WINDOW_MS, end: anchor - WINDOW_MS },
-    { name: "H", start: anchor - WINDOW_MS, end: anchor },
-  ];
+  const windows: Window[] = [{ name: "H", start: anchor - WINDOW_MS, end: anchor, research: false }];
+  let start = anchor - 2 * WINDOW_MS;
+  while (start - WARMUP_MS >= dataStart) {
+    windows.unshift({ name: "", start, end: start + WINDOW_MS, research: true });
+    start -= WINDOW_MS;
+  }
+  let r = 0;
+  for (const window of windows) {
+    if (window.research) {
+      r += 1;
+      window.name = `R${r}`;
+    }
+  }
+  return windows;
 }
 
 function bookFor(market: Market, interval: CandleInterval): MicroBook {
@@ -151,6 +179,7 @@ function csvRow(set: MicroSet, window: Window, summary: ReturnType<typeof summar
     summary.exits.end,
     summary.grossProfit.toFixed(4),
     summary.grossLoss.toFixed(4),
+    summary.equityEnd.toFixed(4),
   ].join(",");
 }
 
@@ -164,24 +193,37 @@ function loadRows(path: string): Row[] {
   });
 }
 
-function run(captureDir: string, outDir: string, interval: CandleInterval, limit: number): void {
+function shardOf(): { index: number; count: number } | null {
+  const value = process.env.SHARD;
+  if (!value) return null;
+  const [index, count] = value.split("/").map(Number);
+  if (!Number.isInteger(index) || !Number.isInteger(count) || count < 1 || index! < 0 || index! >= count!) throw new Error("SHARD must be i/n with 0 <= i < n.");
+  return { index: index!, count: count! };
+}
+
+function run(dirs: string[], outDir: string, interval: CandleInterval, limit: number): void {
   const started = Date.now();
-  const markets = loadMarkets(captureDir, limit);
-  if (markets.length === 0) throw new Error(`No complete markets in ${captureDir}.`);
+  const { markets, excluded } = loadMarkets(dirs, limit);
+  if (markets.length === 0) throw new Error("No complete markets in the capture directories.");
   const end = Math.min(...markets.map((market) => market.end));
-  const windows = windowsFor(end);
+  const dataStart = Math.max(...markets.map((market) => market.bars1m[0]!.t));
+  const windows = windowsFor(end, dataStart);
+  const step = CANDLE_INTERVALS[interval];
+  const slots = WINDOW_MS / step;
   const quick = process.env.GRID === "quick";
   const grid: MicroGrid = { ...(quick ? QUICK_GRID : MICRO_GRID), intervals: [interval] };
-  const sets = enumerateMicroSets(grid);
+  let sets = enumerateMicroSets(grid);
+  const shard = shardOf();
+  if (shard) sets = sets.filter((_, index) => index % shard.count === shard.index);
   const books = markets.map((market) => bookFor(market, interval));
   const ranges = books.map((book) => windows.map((window) => ({ from: barIndexAt(book.bars, window.start), to: barIndexAt(book.bars, window.end) })));
-  const portfolio = windows.map(() => newMicroAcc(0, WINDOW_HOURS));
-  const scratch = newMicroAcc(0, WINDOW_HOURS);
-  const rows: string[] = [HEADER];
-  // COST=0 measures the gross edge before the round-trip cost; its output carries a -gross suffix.
+  const portfolio = windows.map((window) => newMicroAcc(window.start, step, slots));
   const costOption = process.env.COST === undefined ? {} : { cost: Number(process.env.COST) };
-  const suffix = process.env.COST === undefined ? "" : "-gross";
-  console.log(`${interval}${suffix}: ${markets.length} markets, ${sets.length} sets${quick ? " (quick grid)" : ""}, windows ${windows.map((w) => `${w.name} ${new Date(w.start).toISOString()}`).join(", ")}`);
+  const suffix = `${process.env.COST === undefined ? "" : "-gross"}${shard ? `.shard${shard.index}` : ""}`;
+  const rows: string[] = [HEADER];
+  console.log(
+    `${interval}${suffix}: ${markets.length} markets (excluded ${excluded.length}), ${sets.length} sets, windows ${windows.map((w) => `${w.name} ${new Date(w.start).toISOString()}`).join(", ")}`,
+  );
 
   sets.forEach((set, index) => {
     windows.forEach((window, w) => {
@@ -192,17 +234,15 @@ function run(captureDir: string, outDir: string, interval: CandleInterval, limit
       books.forEach((book, m) => {
         const range = ranges[m]![w]!;
         if (range.to - range.from < 2) return;
-        resetMicroAcc(scratch, window.start);
-        simulateMicro(book, set, range.from, range.to, scratch, costOption);
-        mergeMicroAcc(acc, scratch);
-        if (scratch.legs > 0) withLegs += 1;
-        if (scratch.net > 0) positive += 1;
+        const legsBefore = acc.legs;
+        const netBefore = acc.net;
+        simulateMicro(book, set, range.from, range.to, acc, costOption);
+        if (acc.legs > legsBefore) withLegs += 1;
+        if (acc.net - netBefore > 0) positive += 1;
       });
       rows.push(csvRow(set, window, summarizeMicro(acc), markets.length, withLegs, positive));
     });
-    if ((index + 1) % 2000 === 0) {
-      console.log(`  ${index + 1}/${sets.length} sets, ${((Date.now() - started) / 1000).toFixed(0)}s`);
-    }
+    if ((index + 1) % 2000 === 0) console.log(`  ${index + 1}/${sets.length} sets, ${((Date.now() - started) / 1000).toFixed(0)}s`);
   });
 
   mkdirSync(outDir, { recursive: true });
@@ -211,38 +251,42 @@ function run(captureDir: string, outDir: string, interval: CandleInterval, limit
 }
 
 // Gated run: each market's cell keeps its own evidence (every closed leg, booked or shadow), replayed in time order
-// from the earliest available bar. The gate validates an entry with the final-stage lanes, using only evidence that
-// closed before that entry. The lane policy is the shipped default and is not tuned on any window.
-function gated(captureDir: string, outDir: string, interval: CandleInterval, topN: number, limit: number): void {
+// from the earliest available bar. Entries are gated by the chosen rule, using only evidence that closed before them.
+function gated(dirs: string[], outDir: string, interval: CandleInterval, topN: number, limit: number): void {
   const started = Date.now();
   const ungated = loadRows(join(outDir, `${interval}.csv`));
-  const byId = new Map<string, Partial<Record<WindowName, Row>>>();
+  const byId = new Map<string, Partial<Record<string, Row>>>();
   for (const row of ungated) {
     const entry = byId.get(row.id!) ?? {};
-    entry[row.window as WindowName] = row;
+    entry[row.window!] = row;
     byId.set(row.id!, entry);
   }
+  // Candidates are ranked on research windows only; the holdout H never chooses anything.
+  const researchNames = [...new Set(ungated.map((row) => row.window!))].filter((name) => name !== "H");
   const ranked = [...byId.entries()]
     .flatMap(([id, windowsByName]) => {
-      const r1 = windowsByName.R1;
-      const r2 = windowsByName.R2;
-      if (!r1 || !r2 || Number(r1.positions) < MIN_POSITIONS || Number(r2.positions) < MIN_POSITIONS) return [];
-      return [{ id, score: Math.min(Number(r1.pf), Number(r2.pf)) }];
+      const rows = researchNames.map((name) => windowsByName[name]);
+      if (rows.some((row) => !row || Number(row.positions) < MIN_POSITIONS)) return [];
+      return [{ id, score: Math.min(...rows.map((row) => Number(row!.pf))) }];
     })
     .sort((a, b) => b.score - a.score)
     .slice(0, topN);
   const wanted = new Set(ranked.map((item) => item.id));
   const sets = enumerateMicroSets({ ...MICRO_GRID, intervals: [interval] }).filter((set) => wanted.has(set.id));
 
-  const markets = loadMarkets(captureDir, limit);
+  const { markets } = loadMarkets(dirs, limit);
   const end = Math.min(...markets.map((market) => market.end));
-  const windows = windowsFor(end);
+  const dataStart = Math.max(...markets.map((market) => market.bars1m[0]!.t));
+  const windows = windowsFor(end, dataStart);
+  const step = CANDLE_INTERVALS[interval];
+  const slots = WINDOW_MS / step;
   const books = markets.map((market) => bookFor(market, interval));
   const ranges = books.map((book) => windows.map((window) => ({ from: barIndexAt(book.bars, window.start), to: barIndexAt(book.bars, window.end) })));
   const finalLanes = buildPlan(2, DEFAULT_LANE_POLICY).at(-1)!.lanes;
+  const settings = normalizeStrategies();
   const gateName = process.env.GATE ?? "validated";
-  // validated: no veto and at least one confirmation (the shipped rule). noveto: only a veto blocks. lastnet: the
-  // cell's last 20 closes, shadows included, net positive.
+  // validated: no veto and at least one confirmation (the shipped lane rule). noveto: only a veto blocks. lastnet: the
+  // cell's last 20 closes, shadows included, net positive. legacy: the per-cell last-N gate the coordinated engine uses.
   const gate = (closes: Closes): boolean => {
     if (gateName === "lastnet") {
       const n = closes.pnls.length;
@@ -251,33 +295,35 @@ function gated(captureDir: string, outDir: string, interval: CandleInterval, top
       for (let i = Math.max(0, n - 20); i < n; i++) sum += closes.pnls[i]!;
       return sum > 0;
     }
+    if (gateName === "legacy") return gateState(gateStateOf(closes.pnls), DEFAULT_FLOORS, settings).validExec;
     const verdicted = verdict(closes, finalLanes, true);
     return gateName === "noveto" ? verdicted.vetoed === 0 : verdicted.validated;
   };
 
   const rows: string[] = [HEADER];
-  console.log(`${interval} gated: ${sets.length} sets from the ungated top ${topN}, ${markets.length} markets`);
+  console.log(`${interval} gated ${gateName}: ${sets.length} candidate sets, ${markets.length} markets`);
   for (const set of sets) {
-    const portfolio = windows.map((window) => newMicroAcc(window.start, WINDOW_HOURS));
+    const portfolio = windows.map((window) => newMicroAcc(window.start, step, slots));
     const withLegs = windows.map(() => 0);
     const positive = windows.map(() => 0);
-    const scratch = newMicroAcc(0, WINDOW_HOURS);
+    const throwaway = newMicroAcc(0, step, 1);
     books.forEach((book, m) => {
       const closes: Closes = { pnls: [], costs: [] };
       const first = ranges[m]![0]!;
-      // Evidence from the bars before the first research window, not booked.
+      // Evidence from the bars before the first window: simulated, not booked.
       if (first.from > 0) {
-        resetMicroAcc(scratch, 0);
-        simulateMicro(book, set, 0, first.from, scratch, { closes, gate });
+        resetMicroAcc(throwaway, 0);
+        simulateMicro(book, set, 0, first.from, throwaway, { closes, gate });
       }
       windows.forEach((window, w) => {
         const range = ranges[m]![w]!;
         if (range.to - range.from < 2) return;
-        resetMicroAcc(scratch, window.start);
-        simulateMicro(book, set, range.from, range.to, scratch, { closes, gate });
-        mergeMicroAcc(portfolio[w]!, scratch);
-        if (scratch.legs > 0) withLegs[w] = withLegs[w]! + 1;
-        if (scratch.net > 0) positive[w] = positive[w]! + 1;
+        const acc = portfolio[w]!;
+        const legsBefore = acc.legs;
+        const netBefore = acc.net;
+        simulateMicro(book, set, range.from, range.to, acc, { closes, gate });
+        if (acc.legs > legsBefore) withLegs[w] = withLegs[w]! + 1;
+        if (acc.net - netBefore > 0) positive[w] = positive[w]! + 1;
       });
     });
     windows.forEach((window, w) => {
@@ -288,66 +334,128 @@ function gated(captureDir: string, outDir: string, interval: CandleInterval, top
   console.log(`${interval} gated ${gateName}: wrote ${rows.length - 1} rows in ${((Date.now() - started) / 1000).toFixed(0)}s`);
 }
 
-function select(outDir: string, interval: CandleInterval, suffix: string): void {
+function merge(outDir: string, interval: CandleInterval): void {
+  const shards = readdirSync(outDir)
+    .filter((name) => name.startsWith(`${interval}.shard`) && name.endsWith(".csv"))
+    .sort();
+  if (shards.length === 0) throw new Error(`No shards for ${interval} in ${outDir}.`);
+  const lines = [HEADER];
+  for (const name of shards) {
+    const body = readFileSync(join(outDir, name), "utf8").trim().split("\n").slice(1);
+    lines.push(...body);
+  }
+  writeFileSync(join(outDir, `${interval}.csv`), `${lines.join("\n")}\n`);
+  console.log(`${interval}: merged ${shards.length} shards, ${lines.length - 1} rows`);
+}
+
+// The walk-forward rule, fixed before any walk result is read:
+//   - Test windows are every window after the first two, so each has at least two windows of training.
+//   - A set is eligible for a test window when every training window has at least MIN_POSITIONS booked positions,
+//     positive booked net, and a PF of at least 1.00.
+//   - The score is the lowest PF across the training windows. Ties go to the lower largest drawdown.
+//   - The selected set runs on the test window, and that result is reported without change.
+function walk(outDir: string, interval: CandleInterval, suffix: string): void {
   const rows = loadRows(join(outDir, `${interval}${suffix}.csv`));
-  const baseline = suffix === "" ? null : new Map(loadRows(join(outDir, `${interval}.csv`)).map((row) => [`${row.id}|${row.window}`, row] as const));
-  const byId = new Map<string, Partial<Record<WindowName, Row>>>();
+  const names = [...new Set(rows.map((row) => row.window!))];
+  const byId = new Map<string, Partial<Record<string, Row>>>();
   for (const row of rows) {
     const entry = byId.get(row.id!) ?? {};
-    entry[row.window as WindowName] = row;
+    entry[row.window!] = row;
     byId.set(row.id!, entry);
   }
-
-  // Research rule: enough positions in both research windows, positive net in both, ranked by the lower of the two PFs.
-  const candidates: { id: string; score: number; drawdown: number; r1: Row; r2: Row; h: Row | undefined }[] = [];
-  for (const [id, windowsByName] of byId) {
-    const r1 = windowsByName.R1;
-    const r2 = windowsByName.R2;
-    if (!r1 || !r2) continue;
-    if (Number(r1.positions) < MIN_POSITIONS || Number(r2.positions) < MIN_POSITIONS) continue;
-    if (Number(r1.net) <= 0 || Number(r2.net) <= 0) continue;
-    candidates.push({
-      id,
-      score: Math.min(Number(r1.pf), Number(r2.pf)),
-      drawdown: Math.max(Number(r1.maxDD), Number(r2.maxDD)),
-      r1,
-      r2,
-      h: windowsByName.H,
+  const results: {
+    testWindow: string;
+    trainingWindows: string[];
+    eligible: number;
+    selected: string | null;
+    trainingMinPf: number | null;
+    trainingMaxDrawdown: number | null;
+    test: { positions: number; net: number; pf: number; grossProfit: number; grossLoss: number; maxDD: number; hourlySuccess: number } | null;
+  }[] = [];
+  for (let k = 2; k < names.length; k++) {
+    const training = names.slice(0, k);
+    const testName = names[k]!;
+    let best: { id: string; score: number; drawdown: number } | null = null;
+    let eligible = 0;
+    for (const [id, windowsByName] of byId) {
+      const rowsTrain = training.map((name) => windowsByName[name]);
+      if (rowsTrain.some((row) => !row)) continue;
+      const ok = rowsTrain.every((row) => Number(row!.positions) >= MIN_POSITIONS && Number(row!.net) > 0 && Number(row!.pf) >= 1);
+      if (!ok) continue;
+      eligible += 1;
+      const score = Math.min(...rowsTrain.map((row) => Number(row!.pf)));
+      const drawdown = Math.max(...rowsTrain.map((row) => Number(row!.maxDD)));
+      if (!best || score > best.score || (score === best.score && drawdown < best.drawdown)) best = { id, score, drawdown };
+    }
+    const test = best ? byId.get(best.id)?.[testName] ?? null : null;
+    results.push({
+      testWindow: testName,
+      trainingWindows: training,
+      eligible,
+      selected: best?.id ?? null,
+      trainingMinPf: best?.score ?? null,
+      trainingMaxDrawdown: best?.drawdown ?? null,
+      test: test
+        ? {
+            positions: Number(test.positions),
+            net: Number(test.net),
+            pf: Number(test.pf),
+            grossProfit: Number(test.grossProfit),
+            grossLoss: Number(test.grossLoss),
+            maxDD: Number(test.maxDD),
+            hourlySuccess: Number(test.hourlySuccess),
+          }
+        : null,
     });
   }
-  candidates.sort((a, b) => b.score - a.score || a.drawdown - b.drawdown);
-  const top = candidates.slice(0, TOP);
-  const fmt = (row: Row | undefined) =>
-    row ? `pos ${row.positions.padStart(5)} net ${Number(row.net).toFixed(2).padStart(9)} PF ${Number(row.pf).toFixed(2)} DD ${Number(row.maxDD).toFixed(2).padStart(7)} hrs ${Number(row.hourlySuccess).toFixed(0).padStart(3)}% mkts+ ${row.marketsPositive}/${row.markets}` : "-";
-  console.log(`${interval}${suffix}: ${candidates.length} sets pass the research rule (of ${byId.size}); top ${top.length}`);
-  for (const item of top) {
-    console.log(item.id);
-    console.log(`  R1 ${fmt(item.r1)}`);
-    console.log(`  R2 ${fmt(item.r2)}`);
-    console.log(`  H  ${fmt(item.h)}`);
-    if (baseline) console.log(`  H, ungated ${fmt(baseline.get(`${item.id}|H`))}`);
+  const traded = results.filter((item) => item.test !== null);
+  const gp = traded.reduce((total, item) => total + item.test!.grossProfit, 0);
+  const gl = traded.reduce((total, item) => total + item.test!.grossLoss, 0);
+  const summary = {
+    interval,
+    suffix,
+    rule: { minPositions: MIN_POSITIONS, eachTrainingWindowPositiveNetAndPfAtLeastOne: true, rankBy: "min PF over training windows", tieBreak: "lower max drawdown over training windows" },
+    windows: names,
+    tests: results,
+    outOfSample: {
+      windowsTraded: traded.length,
+      windowsFlat: results.length - traded.length,
+      pf: gl > 0 ? gp / gl : 1,
+      net: traded.reduce((total, item) => total + item.test!.net, 0),
+      positions: traded.reduce((total, item) => total + item.test!.positions, 0),
+      worstTestDrawdown: Math.max(0, ...traded.map((item) => item.test!.maxDD)),
+      selectedTrainingMinPf: traded.map((item) => item.trainingMinPf),
+    },
+  };
+  writeFileSync(join(outDir, `walk-${interval}${suffix}.json`), JSON.stringify(summary, null, 1));
+  for (const item of results) {
+    const test = item.test;
+    const detail =
+      item.trainingMinPf === null || test === null
+        ? ""
+        : ` | in-sample min PF ${item.trainingMinPf.toFixed(2)} -> test PF ${test.pf.toFixed(2)}, net ${test.net.toFixed(2)}, ${test.positions} positions, max DD ${test.maxDD.toFixed(2)}`;
+    console.log(`${interval}${suffix} ${item.testWindow}: eligible ${item.eligible}, selected ${item.selected ?? "none (flat)"}${detail}`);
   }
-  const holdoutPositive = top.filter((item) => item.h && Number(item.h.net) > 0).length;
-  console.log(`holdout net > 0 for ${holdoutPositive}/${top.length} of the research top set`);
-  writeFileSync(
-    join(outDir, `${interval}${suffix}-selection.json`),
-    JSON.stringify({ interval, suffix, rule: { minPositions: MIN_POSITIONS, netPositiveResearch: true, rankBy: "min(PF R1, PF R2)", tieBreak: "max(maxDD R1, maxDD R2)" }, candidates: candidates.length, top: top.map((item) => ({ id: item.id, score: item.score, research: { R1: item.r1, R2: item.r2 }, holdout: item.h ?? null })) }, null, 1),
-  );
+  console.log(`${interval}${suffix} out of sample: ${summary.outOfSample.windowsTraded} windows traded, PF ${summary.outOfSample.pf.toFixed(3)}, net ${summary.outOfSample.net.toFixed(2)}`);
 }
 
 const [mode = "run", ...args] = process.argv.slice(2);
 if (mode === "run") {
-  const [captureDir, outDir, interval, limit = "50"] = args;
-  if (!captureDir || !outDir || !interval) throw new Error("Usage: run <captureDir> <outDir> <interval> [markets]");
-  run(captureDir, outDir, interval as CandleInterval, Number(limit));
+  const [captureDirs, outDir, interval, limit = "50"] = args;
+  if (!captureDirs || !outDir || !interval) throw new Error("Usage: run <captureDirs> <outDir> <interval> [markets]");
+  run(captureDirs.split(",").map((item) => item.trim()), outDir, interval as CandleInterval, Number(limit));
 } else if (mode === "gated") {
-  const [captureDir, outDir, interval, topN = "200", limit = "50"] = args;
-  if (!captureDir || !outDir || !interval) throw new Error("Usage: gated <captureDir> <outDir> <interval> <topN> [markets]");
-  gated(captureDir, outDir, interval as CandleInterval, Number(topN), Number(limit));
-} else if (mode === "select") {
+  const [captureDirs, outDir, interval, topN = "200", limit = "50"] = args;
+  if (!captureDirs || !outDir || !interval) throw new Error("Usage: gated <captureDirs> <outDir> <interval> <topN> [markets]");
+  gated(captureDirs.split(",").map((item) => item.trim()), outDir, interval as CandleInterval, Number(topN), Number(limit));
+} else if (mode === "merge") {
+  const [outDir, interval] = args;
+  if (!outDir || !interval) throw new Error("Usage: merge <outDir> <interval>");
+  merge(outDir, interval as CandleInterval);
+} else if (mode === "walk") {
   const [outDir, interval, suffix = ""] = args;
-  if (!outDir || !interval) throw new Error("Usage: select <outDir> <interval> [suffix]");
-  select(outDir, interval as CandleInterval, suffix);
+  if (!outDir || !interval) throw new Error("Usage: walk <outDir> <interval> [suffix]");
+  walk(outDir, interval as CandleInterval, suffix);
 } else {
-  throw new Error("Choose run, gated or select.");
+  throw new Error("Choose run, gated, merge or walk.");
 }

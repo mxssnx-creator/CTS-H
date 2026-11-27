@@ -6,12 +6,17 @@ import { buildSeries, signalAt, type Bar, type Side } from "./process.ts";
 // Micro sets: one indication on one timeframe, with a target and a protective stop given in percent beyond the
 // round-trip cost, a fixed or dynamic trail, a time stop and an optional partial close at the first target.
 //
-// One state machine, MicroState, runs the rules bar by bar. The batch simulator and the live runner both use it, so
-// a backtest and a live run on the same candles produce the same fills.
+// One state machine, MicroState, runs the rules bar by bar. MicroRun wraps it with the accounting. The batch
+// simulator and the live runner both use MicroRun, so a backtest and a live run on the same candles produce the same
+// fills and the same equity.
 //
 // Causality: a signal read on closed bar i opens at the open of bar i+1. Every exit decision on bar b reads only
 // bars up to b. Within one bar the protective stop is checked before the target, because the order of the high and
 // the low inside a bar is unknown; the stop therefore wins a tie.
+//
+// Equity: realized P&L of booked legs plus the mark-to-market of the booked open position at each bar close. Both are
+// posted to the slot of the bar on which they occur, so drawdown is measured at bar resolution and includes open
+// losses. Shadow positions are never part of equity.
 
 export const MICRO_NOTIONAL = 100;
 export const MICRO_TP = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
@@ -176,7 +181,7 @@ export function buildMicroBook(bars: Bar[], interval: CandleInterval, indication
 export type Closes = { pnls: number[]; costs: number[] };
 
 // One fill: a partial close, or the close that ends a position. `booked` is false for a shadow position, one the
-// lane gate blocked at entry: it is tracked but never counts as booked P&L or as evidence.
+// lane gate blocked at entry: it is tracked but never counts as booked P&L or as equity.
 export type Fill = {
   reason: ExitReason;
   exitBar: number;
@@ -255,6 +260,12 @@ export class MicroState {
   get position(): { side: Side; entry: number; entryBar: number; stop: number; target: number; remaining: number; held: number } | null {
     if (!this.open) return null;
     return { side: this.side, entry: this.entry, entryBar: this.entryBar, stop: this.stop, target: this.target, remaining: this.remaining, held: this.held };
+  }
+
+  // Unrealized net P&L of the open position at `price`, if it is booked. Shadows and flat states mark to zero.
+  mark(price: number): number {
+    if (!this.open || !this.booked) return 0;
+    return closePnl(this.side, this.entry, price, this.qty * this.remaining, this.cost);
   }
 
   // Feeds one closed bar. `signal` is the indication's signal on the bar before this one (0 for none); a flat state
@@ -347,9 +358,10 @@ export class MicroState {
 
 export type MicroAcc = {
   t0: number;
-  // Booked net P&L and leg counts per hour of the window, by exit time.
-  hourNet: Float64Array;
-  hourLegs: Int32Array;
+  // Slot size: the interval of the book the accumulator is run on.
+  stepMs: number;
+  // Equity change per bar slot: booked realized P&L plus the change of the booked open mark at bar closes.
+  slotDelta: Float64Array;
   positions: number;
   legs: number;
   wins: number;
@@ -365,11 +377,11 @@ function emptyExits(): Record<ExitReason, number> {
   return { tp: 0, partial: 0, sl: 0, time: 0, end: 0 };
 }
 
-export function newMicroAcc(t0: number, hours: number): MicroAcc {
+export function newMicroAcc(t0: number, stepMs: number, slots: number): MicroAcc {
   return {
     t0,
-    hourNet: new Float64Array(hours),
-    hourLegs: new Int32Array(hours),
+    stepMs,
+    slotDelta: new Float64Array(slots),
     positions: 0,
     legs: 0,
     wins: 0,
@@ -384,8 +396,7 @@ export function newMicroAcc(t0: number, hours: number): MicroAcc {
 
 export function resetMicroAcc(acc: MicroAcc, t0: number): void {
   acc.t0 = t0;
-  acc.hourNet.fill(0);
-  acc.hourLegs.fill(0);
+  acc.slotDelta.fill(0);
   acc.positions = 0;
   acc.legs = 0;
   acc.wins = 0;
@@ -397,24 +408,12 @@ export function resetMicroAcc(acc: MicroAcc, t0: number): void {
   acc.exits = emptyExits();
 }
 
-export function mergeMicroAcc(into: MicroAcc, from: MicroAcc): void {
-  for (let h = 0; h < into.hourNet.length; h++) {
-    into.hourNet[h] = into.hourNet[h]! + from.hourNet[h]!;
-    into.hourLegs[h] = into.hourLegs[h]! + from.hourLegs[h]!;
-  }
-  into.positions += from.positions;
-  into.legs += from.legs;
-  into.wins += from.wins;
-  into.grossProfit += from.grossProfit;
-  into.grossLoss += from.grossLoss;
-  into.net += from.net;
-  into.shadows += from.shadows;
-  into.shadowNet += from.shadowNet;
-  for (const key of Object.keys(into.exits) as ExitReason[]) into.exits[key] += from.exits[key];
+function slotOf(acc: MicroAcc, t: number): number {
+  return Math.floor((t - acc.t0) / acc.stepMs);
 }
 
-// Books one fill into the window accumulator. Every closed leg, booked or shadow, is evidence for the lane gate: a
-// blocked cell keeps being tracked, so it can earn its way back in. Only booked legs count as P&L.
+// Books one fill. Every closed leg, booked or shadow, is evidence for the lane gate: a blocked cell keeps being
+// tracked, so it can earn its way back in. Only booked legs count as P&L and as equity.
 export function bookFill(acc: MicroAcc, fill: Fill, closes?: Closes): void {
   if (closes) {
     closes.pnls.push(fill.pnl);
@@ -432,14 +431,46 @@ export function bookFill(acc: MicroAcc, fill: Fill, closes?: Closes): void {
   acc.net += fill.pnl;
   if (fill.pnl > 0) acc.grossProfit += fill.pnl;
   else if (fill.pnl < 0) acc.grossLoss -= fill.pnl;
-  const hour = Math.floor((fill.t - acc.t0) / HOUR_MS);
-  if (hour >= 0 && hour < acc.hourNet.length) {
-    acc.hourNet[hour] = acc.hourNet[hour]! + fill.pnl;
-    acc.hourLegs[hour] = acc.hourLegs[hour]! + 1;
-  }
+  const slot = slotOf(acc, fill.t);
+  if (slot >= 0 && slot < acc.slotDelta.length) acc.slotDelta[slot] = acc.slotDelta[slot]! + fill.pnl;
   if (fill.closed) {
     acc.positions += 1;
     if (fill.positionNet > 0) acc.wins += 1;
+  }
+}
+
+export type MicroRunOptions = MicroStateOptions & { sink?: (fill: Fill) => void };
+
+// One set on one market: the state machine plus the accounting. Batch and live runs both go through this class.
+export class MicroRun {
+  readonly state: MicroState;
+  private readonly sink: ((fill: Fill) => void) | undefined;
+  private acc: MicroAcc | null = null;
+  private closes: Closes | undefined;
+  private lastMark = 0;
+  private readonly emit = (fill: Fill): void => {
+    bookFill(this.acc!, fill, this.closes);
+    this.sink?.(fill);
+  };
+
+  constructor(set: MicroSet, interval: CandleInterval, options: MicroRunOptions = {}) {
+    this.state = new MicroState(set, interval, options);
+    this.sink = options.sink;
+  }
+
+  get flat(): boolean {
+    return this.state.flat;
+  }
+
+  // Feeds one closed bar, books its fills, and posts the change of the booked open mark to the bar's slot.
+  step(bar: Bar, index: number, signal: Side | 0, last: boolean, allow: (() => boolean) | null, acc: MicroAcc, closes?: Closes): void {
+    this.acc = acc;
+    this.closes = closes;
+    this.state.onBar(bar, index, signal, last, allow, this.emit);
+    const mark = this.state.mark(bar.c);
+    const slot = slotOf(acc, bar.t);
+    if (slot >= 0 && slot < acc.slotDelta.length) acc.slotDelta[slot] = acc.slotDelta[slot]! + (mark - this.lastMark);
+    this.lastMark = mark;
   }
 }
 
@@ -449,20 +480,22 @@ export function simulateMicro(book: MicroBook, set: MicroSet, from: number, to: 
   if (options.gate && !options.closes) throw new Error("A gate reads closes, so pass the closes it reads.");
   const events = book.signals[set.indication];
   if (!events) return;
+  if (acc.stepMs !== CANDLE_INTERVALS[book.interval]) throw new Error("The accumulator slot must match the book interval.");
   const bars = book.bars;
-  const state = new MicroState(set, book.interval, options);
   const closes = options.closes;
   const gate = options.gate;
   const allow = gate && closes ? () => gate(closes) : null;
-  const emit = (fill: Fill) => {
-    bookFill(acc, fill, closes);
-    options.trace?.push(fill);
-  };
+  const trace = options.trace;
+  const run = new MicroRun(set, book.interval, {
+    notional: options.notional,
+    cost: options.cost,
+    sink: trace ? (fill) => trace.push(fill) : undefined,
+  });
   const n = events.at.length;
   let k = 0;
   let b = from;
   while (b < to) {
-    if (state.flat) {
+    if (run.flat) {
       while (k < n && events.at[k]! + 1 < b) k++;
       if (k >= n || events.at[k]! + 1 >= to) break;
       b = Math.max(b, events.at[k]! + 1);
@@ -473,7 +506,7 @@ export function simulateMicro(book: MicroBook, set: MicroSet, from: number, to: 
       signal = events.side[k]! as Side;
       k++;
     }
-    state.onBar(bars[b]!, b, signal, b === to - 1, allow, emit);
+    run.step(bars[b]!, b, signal, b === to - 1, allow, acc, closes);
     b++;
   }
 }
@@ -484,7 +517,10 @@ export type MicroSummary = {
   net: number;
   pf: number;
   winRate: number;
+  // Largest peak-to-trough fall of bar-close equity, including open-position marks.
   maxDrawdown: number;
+  equityEnd: number;
+  // Share of active buckets whose equity rose. A bucket is one hour, or one bar when the bar is longer than an hour.
   hourlySuccess: number;
   activeHours: number;
   shadows: number;
@@ -494,22 +530,27 @@ export type MicroSummary = {
   exits: Record<ExitReason, number>;
 };
 
-// Summary of a window. Drawdown is measured on the cumulative hourly net of booked legs, so it is a closed-trade
-// drawdown: open-position mark-to-market is not included. Hourly success is the share of active hours whose net is positive.
-export function summarizeMicro(acc: MicroAcc): MicroSummary {
-  let cumulative = 0;
+export function summarizeMicro(acc: MicroAcc, bucketMs = Math.max(acc.stepMs, HOUR_MS)): MicroSummary {
+  const perBucket = Math.max(1, Math.round(bucketMs / acc.stepMs));
+  const slots = acc.slotDelta.length;
+  let equity = 0;
   let peak = 0;
   let maxDrawdown = 0;
+  let bucketSum = 0;
   let active = 0;
   let green = 0;
-  for (let h = 0; h < acc.hourNet.length; h++) {
-    const net = acc.hourNet[h]!;
-    cumulative += net;
-    peak = Math.max(peak, cumulative);
-    maxDrawdown = Math.max(maxDrawdown, peak - cumulative);
-    if (acc.hourLegs[h]! > 0) {
-      active += 1;
-      if (net > 0) green += 1;
+  for (let s = 0; s < slots; s++) {
+    const delta = acc.slotDelta[s]!;
+    equity += delta;
+    if (equity > peak) peak = equity;
+    if (peak - equity > maxDrawdown) maxDrawdown = peak - equity;
+    bucketSum += delta;
+    if ((s + 1) % perBucket === 0 || s === slots - 1) {
+      if (Math.abs(bucketSum) > 1e-12) {
+        active += 1;
+        if (bucketSum > 0) green += 1;
+      }
+      bucketSum = 0;
     }
   }
   return {
@@ -519,6 +560,7 @@ export function summarizeMicro(acc: MicroAcc): MicroSummary {
     pf: profitFactor(acc.grossProfit, acc.grossLoss),
     winRate: acc.positions ? (acc.wins / acc.positions) * 100 : 0,
     maxDrawdown,
+    equityEnd: equity,
     hourlySuccess: active ? (green / active) * 100 : 0,
     activeHours: active,
     shadows: acc.shadows,

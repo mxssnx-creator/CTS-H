@@ -7,11 +7,9 @@ import {
   buildMicroBook,
   enumerateMicroSets,
   MICRO_GRID,
-  mergeMicroAcc,
   microSetId,
   MicroState,
   newMicroAcc,
-  resetMicroAcc,
   simulateMicro,
   summarizeMicro,
   type Closes,
@@ -25,6 +23,7 @@ import {
 import type { Bar } from "./process.ts";
 
 const MINUTE = 60_000;
+const HOUR_MS = 3_600_000;
 const bar = (index: number, o: number, h: number, l: number, c: number, v = 1): Bar => ({ t: index * MINUTE, o, h, l, c, v, closed: true });
 
 // A book with one signal: the indication fires on closed bar `signalAt` with `side`, so entry is the next bar's open.
@@ -52,7 +51,7 @@ function setOf(overrides: Partial<Omit<MicroSet, "id">> & { trail?: Trail } = {}
 }
 
 function run(book: MicroBook, set: MicroSet, to: number, options: MicroOptions = {}) {
-  const acc = newMicroAcc(book.bars[0]!.t, 240);
+  const acc = newMicroAcc(0, MINUTE, book.bars.length);
   const trace: MicroLegTrace[] = [];
   simulateMicro(book, set, 0, to, acc, { ...options, trace: options.trace ?? trace });
   return { acc, trace: options.trace ?? trace };
@@ -192,28 +191,29 @@ test("a long-only set ignores a short signal and a window starts flat", () => {
   assert.equal(longOnly.trace.length, 0);
 });
 
-test("a window accumulates hourly drawdown on booked legs, and merged windows add up", () => {
-  const hours = 3;
-  const a = newMicroAcc(0, hours);
-  a.hourNet.set([1, -3, 1]);
-  a.hourLegs.set([1, 1, 1]);
-  a.net = -1;
-  a.grossProfit = 2;
-  a.grossLoss = 3;
-  a.positions = 3;
-  const summary = summarizeMicro(a);
-  // Cumulative 1, −2, −1: the peak is 1 and the trough is −2, a drawdown of 3.
+test("drawdown is the largest peak-to-trough fall of the equity, and hourly success counts buckets whose equity rose", () => {
+  const acc = newMicroAcc(0, HOUR_MS, 3);
+  acc.slotDelta.set([1, -3, 1]);
+  const summary = summarizeMicro(acc);
+  // Equity 1, -2, -1: the peak is 1 and the trough is -2.
   assert.equal(summary.maxDrawdown, 3);
-  assert.ok(Math.abs(summary.hourlySuccess - (200 / 3)) < 1e-9);
-  const b = newMicroAcc(0, hours);
-  resetMicroAcc(b, 0);
-  b.hourNet.set([2, 0, 0]);
-  b.hourLegs.set([1, 0, 0]);
-  b.net = 2;
-  b.grossProfit = 2;
-  mergeMicroAcc(a, b);
-  assert.equal(a.net, 1);
-  assert.equal(a.hourNet[0], 3);
+  assert.equal(summary.equityEnd, -1);
+  // Three active hours, two of them rising.
+  assert.ok(Math.abs(summary.hourlySuccess - 200 / 3) < 1e-9);
+  assert.equal(summary.activeHours, 3);
+});
+
+test("an open position that is underwater shows in drawdown before it closes, even when the trade ends as a winner", () => {
+  // Entry 100 with a wide stop (99.08) and a 0.2% target (100.32). The price dips to a mark of about -0.62 before the
+  // target fills at 100.32. Closed trades alone would show no drawdown at all.
+  const bars = [bar(0, 100, 100, 100, 100), bar(1, 100, 100.1, 99.5, 99.6), bar(2, 99.6, 99.8, 99.4, 99.5), bar(3, 99.5, 100.4, 99.4, 100.4)];
+  const { acc } = run(bookWith(bars, 0, 1), setOf({ tp: 0.2, sl: 0.8, holdMinutes: 60 }), 4);
+  const summary = summarizeMicro(acc);
+  assert.ok(summary.net > 0.19 && summary.net < 0.2, "the trade nets about 0.2 after cost");
+  // The bar-2 mark is -0.5 - 99.75 x 0.0012 = -0.6197, and nothing realized is negative.
+  assert.ok(Math.abs(summary.maxDrawdown - 0.6197) < 1e-9, `drawdown ${summary.maxDrawdown}`);
+  assert.equal(summary.grossLoss, 0);
+  assert.ok(Math.abs(summary.equityEnd - summary.net) < 1e-9);
 });
 
 test("barIndexAt returns the first bar at or after a time", () => {
@@ -287,7 +287,9 @@ test("the streaming state gives the same fills as the batch run on the same bars
   ];
   for (const set of variants) {
     const batchFills: Fill[] = [];
-    simulateMicro(book, set, 0, bars.length, newMicroAcc(0, 24), { trace: batchFills });
+    const batchAcc = newMicroAcc(0, MINUTE, bars.length);
+    simulateMicro(book, set, 0, bars.length, batchAcc, { trace: batchFills });
+    assert.ok(Math.abs(summarizeMicro(batchAcc).equityEnd - batchAcc.net) < 1e-9, `${set.id} equity ends at the booked net`);
     const streaming = new MicroState(set, "1m");
     const streamFills: Fill[] = [];
     for (let b = 0; b < bars.length; b++) {
