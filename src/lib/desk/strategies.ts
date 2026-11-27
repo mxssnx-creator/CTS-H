@@ -13,6 +13,9 @@ export const STRATEGY_LABELS: Record<StrategyType, string> = {
 
 export const STRATEGY_LIMITS = {
   volumeFactor: [0.1, 10, 0.1],
+  minimumPf: [1, 4, 0.05],
+  autoPfPenalty: [0, 2, 0.05],
+  autoPfSamples: [4, 15, 1],
   trailActivation: [0.25, 0.85, 0.05],
   trailDistance: [0.2, 0.8, 0.05],
   axisRatio: [0, 0.5, 0.05],
@@ -43,12 +46,19 @@ export type StrategySettings = TrailSettings &
     enabledIndications: readonly Indication[];
     shortRange: boolean;
     wideRange: boolean;
+    autoPf: boolean;
+    autoPfRecent: boolean;
   };
 
 export const DEFAULT_STRATEGIES: StrategySettings = {
   ...DEFAULT_TRAILS,
   volumeFactor: 1,
-  enabledIndications: INDICATIONS,
+  minimumPf: 1,
+  autoPf: true,
+  autoPfRecent: true,
+  autoPfPenalty: 0.15,
+  autoPfSamples: 4,
+  enabledIndications: ["break", "ema", "rangeFade"],
   shortRange: true,
   wideRange: true,
   axis: false,
@@ -85,6 +95,8 @@ export function normalizeStrategies(input?: Partial<StrategySettings>): Strategy
     "breakeven",
     "shortRange",
     "wideRange",
+    "autoPf",
+    "autoPfRecent",
   ] as const) {
     const value = input[key];
     if (typeof value === "boolean") config[key] = value;
@@ -120,6 +132,18 @@ export function normalizeStrategies(input?: Partial<StrategySettings>): Strategy
     config.relateScope = input.relateScope;
   }
   return config;
+}
+
+export type PfSettings = Pick<
+  StrategySettings,
+  "minimumPf" | "autoPf" | "autoPfPenalty" | "autoPfSamples" | "autoPfRecent"
+>;
+
+export function requiredPf(floor: number, samples: number, settings?: PfSettings) {
+  const minimum = Math.max(floor, settings?.minimumPf ?? 0);
+  if (!settings?.autoPf) return minimum;
+  const support = Math.max(settings.autoPfSamples, samples);
+  return minimum + settings.autoPfPenalty * Math.sqrt(settings.autoPfSamples / support);
 }
 
 export type StrategyActions = Record<StrategyType, number>;

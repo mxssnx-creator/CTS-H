@@ -43,6 +43,7 @@ import {
 } from "./management.ts";
 
 import {
+  DEFAULT_STRATEGIES,
   STRATEGY_TYPES,
   RelationLedger,
   adjustPosition,
@@ -50,6 +51,8 @@ import {
   newStrategyActions,
   recordRelationClose,
   relationKey,
+  requiredPf,
+  type PfSettings,
   type ScalePlan,
   type StrategyActions,
   type StrategySettings,
@@ -82,6 +85,7 @@ export type Cell = {
   net: number;
   pf: number;
   validExec: boolean;
+  requiredRecentPf?: number;
   disabled: boolean;
   lastN: number[];
   cursorT: number;
@@ -509,31 +513,44 @@ function pushPnl(cell: Cell, pnl: number) {
   cell.pf = cell.gl < 1e-12 ? (cell.gw > 1e-12 ? 4 : 0) : cell.gw / cell.gl;
 }
 
-export function gateCell(cell: Cell, floors: Floors) {
+export function gateCell(cell: Cell, floors: Floors, settings?: PfSettings) {
   const recent = Math.max(0, cell.lastN.length - LASTN.valid);
   const suspension = Math.max(0, cell.lastN.length - LASTN.disable);
   let gains = 0;
   let losses = 0;
   let net = 0;
   let suspensionNet = 0;
+  let recentGains = 0;
+  let recentLosses = 0;
   for (let i = recent; i < cell.lastN.length; i++) {
     const pnl = cell.lastN[i]!;
     net += pnl;
     if (pnl > 0) gains += pnl;
     else if (pnl < 0) losses -= pnl;
-    if (i >= suspension) suspensionNet += pnl;
+    if (i >= suspension) {
+      suspensionNet += pnl;
+      if (pnl > 0) recentGains += pnl;
+      else if (pnl < 0) recentLosses -= pnl;
+    }
   }
-  const pass =
-    cell.lastN.length - recent >= LASTN.minSamples &&
-    profitFactor(gains, losses) >= floors.short &&
-    net >= 0;
+  const samples = cell.lastN.length - recent;
+  const required = settings?.autoPf ? settings.autoPfSamples : LASTN.minSamples;
+  const recentFloor = requiredPf(floors.short, samples, settings);
+  cell.requiredRecentPf = recentFloor;
+  const pass = samples >= required && profitFactor(gains, losses) >= recentFloor && net >= 0;
+  const lifetimeFloor = requiredPf(Math.max(floors.base, floors.overall), cell.n, settings);
   const proven =
     cell.n >= 6 &&
-    cell.pf >= Math.max(floors.base, floors.overall) &&
+    cell.pf >= lifetimeFloor &&
     cell.net > 0 &&
     !(cell.pf >= PF_NO_LOSS_NEAR && cell.net <= 1e-6);
-  cell.validExec =
-    cell.liveFloor && cell.n >= LASTN.minSamples && (cell.n < 6 ? pass : proven && pass);
+  const followThrough =
+    !settings?.autoPf ||
+    !settings.autoPfRecent ||
+    cell.lastN.length - suspension < Math.max(3, Math.ceil(required / 2)) ||
+    (suspensionNet > 0 &&
+      profitFactor(recentGains, recentLosses) >= Math.max(floors.base, floors.short, 1));
+  cell.validExec = cell.liveFloor && pass && followThrough && (cell.n < 6 || proven);
   cell.disabled =
     !cell.validExec && cell.lastN.length - suspension >= LASTN.minSamples && suspensionNet < 0;
 }
@@ -742,7 +759,7 @@ export function syncBooks(
         push,
       );
       closes += cell.n - before;
-      gateCell(cell, floors);
+      gateCell(cell, floors, options?.coordinated ? options.trailRules : undefined);
       cells.push(cell);
     }
   }
@@ -752,10 +769,10 @@ export function syncBooks(
   return { cells, internFills, closes, valid, symbols };
 }
 
-export function applyFloors(cells: Cell[], floors: Floors): Cell[] {
+export function applyFloors(cells: Cell[], floors: Floors, settings?: PfSettings): Cell[] {
   return cells.map((c) => {
     const next = { ...c, lastN: c.lastN, leg: c.leg };
-    gateCell(next, floors);
+    gateCell(next, floors, settings);
     return next;
   });
 }
@@ -1110,6 +1127,7 @@ export type SessionReport = {
   replayHours: number;
   evaluatedConfigs: number;
   disabledConfigs: number;
+  rejectedPf: number;
   strategyActions: StrategyActions;
   unavailable: string[];
   preNet: number;
@@ -1133,7 +1151,13 @@ export type SessionReport = {
   greenBookPre: number;
   greenBookLive: number;
   bookNames: string[];
-  selected: { name: string; symbol: string; pre: ReplaySummary; replay: ReplaySummary }[];
+  selected: {
+    name: string;
+    symbol: string;
+    requiredPf: number;
+    pre: ReplaySummary;
+    replay: ReplaySummary;
+  }[];
 };
 
 export type ReplaySize = "base" | "block" | "axis" | "both";
@@ -1349,17 +1373,27 @@ function replayWindow(
   }
 }
 
-function rankPre(rows: HourAcc[], byHour = false) {
+function rankPre(rows: HourAcc[], byHour = false, checkRecent = false) {
   let green = 0;
   let gp = 0;
   let gl = 0;
   let n = 0;
   let interval = -1;
   let equityChange = 0;
-  for (const row of rows) {
+  const split = Math.floor(rows.length / 2);
+  let recentGains = 0;
+  let recentLosses = 0;
+  let recentSamples = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
     gp += row.grossProfit;
     gl += row.grossLoss;
     n += row.trades;
+    if (checkRecent && i >= split) {
+      recentGains += row.grossProfit;
+      recentLosses += row.grossLoss;
+      recentSamples += row.trades;
+    }
     if (byHour) {
       const hour = Math.floor(row.t / REPLAY_HOUR);
       if (hour !== interval) {
@@ -1371,7 +1405,17 @@ function rankPre(rows: HourAcc[], byHour = false) {
     }
   }
   if (equityChange > 1e-9) green++;
-  return { n, green, net: gp - gl, pf: profitFactor(gp, gl), grossProfit: gp, grossLoss: gl };
+  return {
+    n,
+    green,
+    net: gp - gl,
+    pf: profitFactor(gp, gl),
+    grossProfit: gp,
+    grossLoss: gl,
+    recentSamples,
+    recentNet: recentGains - recentLosses,
+    recentPf: profitFactor(recentGains, recentLosses),
+  };
 }
 
 type ManagedReplayInput = {
@@ -1493,6 +1537,17 @@ export function simulateSessions(
   const profile = opts?.profile ?? "filtered";
   const baseline = profile === "baseline";
   const coordinated = profile === "coordinated";
+  const saved = opts?.strategies ?? DEFAULT_STRATEGIES;
+  const preferences = !coordinated
+    ? undefined
+    : opts?.indication || opts?.range
+      ? {
+          ...saved,
+          enabledIndications: opts.indication ? [opts.indication] : saved.enabledIndications,
+          shortRange: opts.range === "short" || saved.shortRange,
+          wideRange: opts.range === "wide" || saved.wideRange,
+        }
+      : saved;
   const size = coordinated ? "base" : (opts?.size ?? "both");
   const span = WARMUP + preLength + replayLength;
   const latest = Math.max(0, ...books.map((b) => lastClosedBar(b.bars)?.t ?? 0));
@@ -1511,7 +1566,7 @@ export function simulateSessions(
   const availableConfigs = baseline
     ? STRATEGY_CONFIGS
     : coordinated
-      ? coordinatedConfigs(opts?.trailing !== false, opts?.strategies)
+      ? coordinatedConfigs(opts?.trailing !== false, preferences)
       : EXECUTION_CONFIGS;
   const configs =
     opts?.indication || opts?.range
@@ -1523,9 +1578,11 @@ export function simulateSessions(
       : availableConfigs;
   const indications = new Set(configs.map((config) => config.indication));
   const strategies =
-    coordinated && opts?.strategies && STRATEGY_TYPES.some((type) => opts.strategies?.[type])
-      ? opts.strategies
-      : null;
+    preferences && STRATEGY_TYPES.some((type) => preferences[type]) ? preferences : null;
+  const qualification = preferences;
+  const minSamples = qualification?.autoPf ? qualification.autoPfSamples : LASTN.minSamples;
+  const recentGate = qualification?.autoPf && qualification.autoPfRecent;
+  const minPf = Math.max(floors.base, floors.short);
   const strategyActions = newStrategyActions();
   const managed: ManagedReplayInput[] = [];
   const present = new Set(aligned.map((b) => b.symbol));
@@ -1542,8 +1599,7 @@ export function simulateSessions(
   const bookLiveAcc = clock(replayFrom);
   const preWork = clock(WARMUP);
   const liveWork = clock(replayFrom);
-  const notional =
-    positionNotional(equity) * (coordinated ? (opts?.strategies?.volumeFactor ?? 1) : 1);
+  const notional = positionNotional(equity) * (preferences?.volumeFactor ?? 1);
   const scale =
     notional > 0
       ? sizedNotional(notional, {
@@ -1554,6 +1610,7 @@ export function simulateSessions(
   const selected: SessionReport["selected"] = [];
   let proven = 0;
   let disabledConfigs = 0;
+  let rejectedPf = 0;
   for (const { symbol, bars } of aligned) {
     const series = buildSeries(bars);
     const cost = opts?.costs?.[symbol] ?? POSITION_RT_COST_PCT;
@@ -1561,6 +1618,7 @@ export function simulateSessions(
     const bestLive = clock(replayFrom);
     let bestNet = 0;
     let bestGreen = -1;
+    let selectedFloor = minPf;
     let winner: (typeof COORDINATED_CONFIGS)[number] | undefined;
     let name = "";
     const signalsByIndication = new Map(
@@ -1589,15 +1647,22 @@ export function simulateSessions(
         !baseline,
         config.coordination,
         coordinated,
-        opts?.strategies,
+        preferences,
       );
-      const quality = rankPre(preWork, coordinated);
+      const quality = rankPre(preWork, coordinated, recentGate);
+      const threshold = requiredPf(minPf, quality.n, qualification);
+      const followThrough =
+        !recentGate ||
+        quality.recentSamples < Math.max(3, Math.ceil(minSamples / 2)) ||
+        (quality.recentNet > 0 && quality.recentPf >= Math.max(minPf, 1));
       const pass =
         config.liveFloor &&
-        quality.n >= LASTN.minSamples &&
+        quality.n >= minSamples &&
         quality.net > 0 &&
-        quality.pf >= Math.max(floors.base, floors.short);
+        quality.pf >= threshold &&
+        followThrough;
       addHours(preAcc, preWork);
+      if (config.liveFloor && !pass) rejectedPf++;
       if (!pass && !baseline) continue;
       replayWindow(
         bars,
@@ -1612,7 +1677,7 @@ export function simulateSessions(
         !baseline,
         config.coordination,
         coordinated,
-        opts?.strategies,
+        preferences,
       );
       addHours(liveAcc, liveWork);
       if (!pass) continue;
@@ -1635,6 +1700,7 @@ export function simulateSessions(
       ) {
         bestNet = quality.net;
         bestGreen = quality.green;
+        selectedFloor = threshold;
         winner = config;
         name = `${symbol} ${indication} ${comboId(tpAtr, slOfTp)}${coordinated ? ` ${config.coordination}` : ""}`;
         for (let i = 0; i < preLength; i++) Object.assign(bestPre[i]!, preWork[i]);
@@ -1659,6 +1725,7 @@ export function simulateSessions(
       selected.push({
         name,
         symbol,
+        requiredPf: selectedFloor,
         pre: summarizeCandles(bestPre, step),
         replay: summarizeCandles(bestLive, step),
       });
@@ -1705,6 +1772,7 @@ export function simulateSessions(
     replayHours: hours,
     evaluatedConfigs: configs.length * aligned.length - disabledConfigs,
     disabledConfigs,
+    rejectedPf,
     strategyActions,
     unavailable,
     preNet: a.net,

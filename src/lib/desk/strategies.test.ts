@@ -11,12 +11,26 @@ import {
   newStrategyActions,
   recordRelationClose,
   relationKey,
+  requiredPf,
   RelationLedger,
 } from "./strategies.ts";
 
 const cost = 0.0012;
 const winners = [-2, 2, 1, 3, 1, 2];
 const entry = { notional: 100, entry: 100, stop: 95, target: 110, cost };
+
+test("Auto PF applies an independent small-sample margin above the configured floor", () => {
+  const settings = normalizeStrategies({
+    autoPf: true,
+    minimumPf: 1.2,
+    autoPfPenalty: 0.4,
+    autoPfSamples: 4,
+  });
+  assert.equal(requiredPf(1, 4, settings), 1.6);
+  assert.ok(Math.abs(requiredPf(1, 16, settings) - 1.4) < 1e-12);
+  assert.equal(requiredPf(1.35, 16, settings), 1.55);
+  assert.equal(requiredPf(1.35, 16, { ...settings, autoPf: false }), 1.35);
+});
 
 test("normalized volume factor uses tenths and invalid strategy preferences stay bounded", () => {
   assert.equal(normalizeStrategies().volumeFactor, 1);
@@ -181,4 +195,17 @@ test("asymmetric sub-hour replays score only the selected lane and preserve hour
   assert.deepEqual(replay.bookNames, original.bookNames);
   assert.deepEqual(replay.bookPre, original.bookPre);
   assert.ok(original.bookDrawdownLive >= 0);
+
+  const strict = simulateSessions([{ symbol: "ETH-USDT", bars }], BOOK, DEFAULT_FLOORS, {
+    ...options,
+    strategies: normalizeStrategies({
+      autoPf: true,
+      autoPfSamples: 8,
+      minimumPf: 2,
+      autoPfPenalty: 0.4,
+    }),
+  });
+  assert.equal(strict.evaluatedConfigs, original.evaluatedConfigs);
+  assert.ok(strict.rejectedPf >= original.rejectedPf);
+  assert.ok(strict.selected.every(({ requiredPf }) => requiredPf > 2));
 });

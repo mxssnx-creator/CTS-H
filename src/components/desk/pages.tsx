@@ -707,6 +707,7 @@ export function IndicationsPage() {
                   <th>SL / TP</th>
                   <th>Closes</th>
                   <th>PF</th>
+                  <th>Required recent PF</th>
                   <th>Net</th>
                 </tr>
               </thead>
@@ -719,6 +720,7 @@ export function IndicationsPage() {
                     <td>{cell.slOfTp}</td>
                     <td>{cell.n}</td>
                     <td>{PFText(cell.gw, cell.gl)}</td>
+                    <td>{cell.requiredRecentPf?.toFixed(2) ?? "—"}</td>
                     <td className={tone(cell.net)}>{sign(cell.net)}</td>
                   </tr>
                 ))}
@@ -879,7 +881,8 @@ export function ReplayPage() {
             </p>
             <p className="muted detail-copy">
               {num.format(report.evaluatedConfigs)} market configurations scored.{" "}
-              {report.disabledConfigs} calibrated market configurations excluded.
+              {num.format(report.rejectedPf)} failed preselection. {report.disabledConfigs}{" "}
+              calibrated market configurations excluded.
             </p>
             {report.unavailable.length ? (
               <p className="warn detail-copy">
@@ -909,6 +912,7 @@ export function ReplayPage() {
                     <thead>
                       <tr>
                         <th>Configuration</th>
+                        <th>Required pre PF</th>
                         <th>Closes</th>
                         <th>PF</th>
                         <th>Net</th>
@@ -918,6 +922,7 @@ export function ReplayPage() {
                       {report.selected.map((item) => (
                         <tr key={item.name}>
                           <td>{item.name}</td>
+                          <td>{item.requiredPf.toFixed(2)}</td>
                           <td>{item.replay.samples}</td>
                           <td>{PFText(item.replay.grossProfit, item.replay.grossLoss)}</td>
                           <td className={tone(item.replay.net)}>{sign(item.replay.net)}</td>
@@ -1026,7 +1031,15 @@ const STRATEGY_CARDS = {
   },
 } as const;
 
-function StrategyField({ name, label }: { name: StrategyNumber; label: string }) {
+function StrategyField({
+  name,
+  label,
+  disabled = false,
+}: {
+  name: StrategyNumber;
+  label: string;
+  disabled?: boolean;
+}) {
   const connection = useDesk((s) => s.connection);
   const value = useDesk((s) => s.strategies[name]);
   const [min, max, step] = STRATEGY_LIMITS[name];
@@ -1040,6 +1053,7 @@ function StrategyField({ name, label }: { name: StrategyNumber; label: string })
         max={max}
         step={step}
         defaultValue={value}
+        disabled={disabled}
         onBlur={(event) => {
           const state = useDesk.getState();
           if (state.connection === connection)
@@ -1174,6 +1188,49 @@ export function SettingsPage() {
           </div>
         </Panel>
       </div>
+      <Panel title="Auto PF">
+        <p className="detail-copy">
+          The required PF starts at the configured minimum. Auto PF adds a larger margin when a
+          configuration has fewer closed trades.
+        </p>
+        <div className="option-list">
+          <label>
+            <span>Auto PF qualification</span>
+            <input
+              type="checkbox"
+              checked={strategies.autoPf}
+              disabled={!allow.change_floors}
+              onChange={(event) => setStrategies({ autoPf: event.currentTarget.checked })}
+            />
+          </label>
+          <label>
+            <span>Check recent closes</span>
+            <input
+              type="checkbox"
+              checked={strategies.autoPfRecent}
+              disabled={!allow.change_floors || !strategies.autoPf}
+              onChange={(event) => setStrategies({ autoPfRecent: event.currentTarget.checked })}
+            />
+          </label>
+        </div>
+        <div className="form-grid stop-fields">
+          <StrategyField
+            name="minimumPf"
+            label="Coordinated minimum PF"
+            disabled={!allow.change_floors}
+          />
+          <StrategyField
+            name="autoPfSamples"
+            label="Minimum closes"
+            disabled={!allow.change_floors || !strategies.autoPf}
+          />
+          <StrategyField
+            name="autoPfPenalty"
+            label="Small-sample PF margin"
+            disabled={!allow.change_floors || !strategies.autoPf}
+          />
+        </div>
+      </Panel>
       <Panel
         title="Position sizing and stops"
         aside={
@@ -1206,7 +1263,17 @@ export function SettingsPage() {
         ))}
       </div>
       <div className="columns-even">
-        <Panel title="Indications">
+        <Panel
+          title="Indications"
+          aside={
+            <button
+              className="desk-button"
+              onClick={() => setStrategies({ enabledIndications: INDICATIONS })}
+            >
+              Enable all indications
+            </button>
+          }
+        >
           <div className="option-list">
             {INDICATIONS.map((kind) => (
               <label key={kind}>

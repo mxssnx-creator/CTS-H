@@ -41,8 +41,9 @@ const HELP = `CTS-H BingX Trading Desk
   brief [--connection bingx-x02] [--symbol ETH-USDT]
   replay [--connection bingx-x01|bingx-x02|both] [--hours 48] [--pre-hours 48] [--interval 1m|5m|15m|30m|1h|4h]
          [--symbols BTC-USDT,ETH-USDT] [--end ISO] [--history-hours 132] [--input candles.json] [--capture candles.json]
-         [--profile coordinated|filtered|baseline|both|all] [--indication NAME] [--range short|wide]
-         [--strategies none|axis,block,dca,relate] [--strategy-settings config.json] [--volume-factor 1.0] [--html report.html]
+         [--profile coordinated|filtered|baseline|both|all] [--indication NAME|all] [--range short|wide]
+         [--strategies none|axis,block,dca,relate] [--min-pf 1.0] [--auto-pf on|off]
+         [--strategy-settings config.json] [--volume-factor 1.0] [--html report.html]
   doctor
   account --connection bingx-x02
   propose --connection bingx-x02 --symbol ETH-USDT --side long --qty N --stop N --target N --why TEXT
@@ -131,6 +132,8 @@ async function main() {
       strategies: { type: "string" },
       "strategy-settings": { type: "string" },
       "volume-factor": { type: "string" },
+      "min-pf": { type: "string" },
+      "auto-pf": { type: "string" },
       "control-mode": { type: "string" },
       "history-hours": { type: "string" },
       profile: { type: "string" },
@@ -218,7 +221,7 @@ async function main() {
         : profile === "all"
           ? ["baseline", "filtered", "coordinated"]
           : [profile as ReplayProfile];
-    const indication = values.indication;
+    const indication = values.indication === "all" ? undefined : values.indication;
     const range = values.range === "short" || values.range === "wide" ? values.range : undefined;
     if (indication && !INDICATIONS.includes(indication as Indication))
       throw new Error(`Choose an indication from ${INDICATIONS.join(", ")}.`);
@@ -239,10 +242,17 @@ async function main() {
         ? {}
         : Object.fromEntries(STRATEGY_TYPES.map((key) => [key, chosen.includes(key)]));
     const volume = values["volume-factor"];
+    const minimumPf = values["min-pf"];
+    const autoPf = values["auto-pf"];
+    if (autoPf && autoPf !== "on" && autoPf !== "off")
+      throw new Error("Choose on or off for Auto PF.");
     const strategies = normalizeStrategies({
       ...configured,
       ...activated,
       ...(volume === undefined ? {} : { volumeFactor: number(volume, "volume factor", [0.1, 10]) }),
+      ...(minimumPf === undefined ? {} : { minimumPf: number(minimumPf, "minimum PF", [1, 4]) }),
+      ...(autoPf === undefined ? {} : { autoPf: autoPf === "on" }),
+      ...(values.indication === "all" ? { enabledIndications: INDICATIONS } : {}),
     });
     const slip = number(values["slip-bps"] ?? "1", "slippage basis points", [0, 200]);
     const source = values.connection ?? "bingx-x01";
@@ -304,6 +314,7 @@ async function main() {
         qualifying: report.proven,
         evaluatedConfigs: report.evaluatedConfigs,
         disabledConfigs: report.disabledConfigs,
+        rejectedPf: report.rejectedPf,
         strategyActions: report.strategyActions,
         chosen: report.bookNames,
       })),

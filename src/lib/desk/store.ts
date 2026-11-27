@@ -283,7 +283,16 @@ export const useDesk = create<DeskState>((set, get) => ({
     }),
   setStrategies: (patch) =>
     set((s) => {
-      const strategies = normalizeStrategies({ ...s.strategies, ...patch });
+      const accepted = { ...patch };
+      const qualificationKeys = [
+        "minimumPf",
+        "autoPf",
+        "autoPfRecent",
+        "autoPfPenalty",
+        "autoPfSamples",
+      ] as const;
+      if (!s.allow.change_floors) for (const key of qualificationKeys) delete accepted[key];
+      const strategies = normalizeStrategies({ ...s.strategies, ...accepted });
       writePreferences(s.connection, { ...s, strategies });
       const rescore =
         strategies.dynamic !== s.strategies.dynamic ||
@@ -293,7 +302,12 @@ export const useDesk = create<DeskState>((set, get) => ({
         strategies.enabledIndications.join() !== s.strategies.enabledIndications.join() ||
         strategies.trailActivation !== s.strategies.trailActivation ||
         strategies.trailDistance !== s.strategies.trailDistance;
-      return { strategies, ...(rescore ? { cells: [], barSig: "" } : {}) };
+      if (rescore) return { strategies, cells: [], barSig: "" };
+      const requalify = qualificationKeys.some((key) => strategies[key] !== s.strategies[key]);
+      return {
+        strategies,
+        cells: requalify ? applyFloors(s.cells, s.floors, strategies) : s.cells,
+      };
     }),
   setFloor: (k, value) =>
     set((s) => {
@@ -303,7 +317,7 @@ export const useDesk = create<DeskState>((set, get) => ({
       writePreferences(s.connection, { ...s, floors });
       return {
         floors,
-        cells: s.cells.length ? applyFloors(s.cells, floors) : s.cells,
+        cells: s.cells.length ? applyFloors(s.cells, floors, s.strategies) : s.cells,
         events: log(s.events, "allow", `floor ${k} ${value}`),
       };
     }),

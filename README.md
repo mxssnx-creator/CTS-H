@@ -57,6 +57,10 @@ The CLI accepts 1m, 5m, 15m, 30m, 1h and 4h candles. The engine warms indicators
 
 The default **coordinated** profile qualifies each enabled indication, bracket and stop mode independently. It ranks eligible candidates by profitable periods and uses realized P&L to break ties. It adds EMA pullback and range fade. The **filtered** profile adds 0.8–2.0 ATR targets with 0.5–1.5× stop-to-target ratios to the execution-eligible short grid. The **baseline** preserves the original grid. Filtered and coordinated sizing cap modeled stop risk plus costs at 0.8% of planned position notional. Coordinated sizing reduces entry size after two consecutive losses.
 
+The default coordinated candidate set uses range breakout, EMA cross and range fade. Settings can enable the other indications individually or enable the full set. The CLI offers the same broad comparison through `--indication all`.
+
+Auto PF defaults to four closed trades and a 1.00 minimum with a 0.15 margin at four closes. The margin decreases with the square root of the sample size. The recent-close check is enabled by default and requires positive follow-through when the recent sample is large enough. Replay freezes the eligible selections before the holdout. Paper scoring rechecks its own recent and lifetime evidence. Use `--min-pf` and `--auto-pf on|off` for direct comparisons.
+
 Published exclusions apply to calibrated 1h configurations on their own connection, symbol, indication and bracket. An exclusion required at least 24 closes, pooled PF no greater than 0.80, at least three losing periods with six or more closes each and zero adequately sampled winning periods. The rules take effect after the last calibration cutoff.
 
 Rebuild the evidence from a continuous capture. The optional `--policy` argument exports the lists to a new TypeScript file.

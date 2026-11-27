@@ -230,7 +230,8 @@ const pf = (grossProfit: number, grossLoss: number) =>
   grossLoss > 0 ? fmt(grossProfit / grossLoss) : grossProfit > 0 ? "No losses" : "—";
 
 function profileName(run: ReplayRun) {
-  return [run.profile, ...run.strategies.map((key) => STRATEGY_LABELS[key])].join(" + ");
+  const label = [run.profile, ...run.strategies.map((key) => STRATEGY_LABELS[key])].join(" + ");
+  return run.strategySettings?.autoPf ? `${label} · Auto PF` : label;
 }
 
 export function renderReplay(runs: ReplayRun[], introduction = ""): string {
@@ -342,6 +343,7 @@ export function renderReplay(runs: ReplayRun[], introduction = ""): string {
             `${fmt(run.costs[item.symbol]! * 100)}%`,
             item.pre.samples,
             pf(item.pre.grossProfit, item.pre.grossLoss),
+            item.requiredPf ?? "—",
             item.pre.net,
             item.replay.samples,
             pf(item.replay.grossProfit, item.replay.grossLoss),
@@ -362,7 +364,7 @@ export function renderReplay(runs: ReplayRun[], introduction = ""): string {
         .join(" · ");
       return `<section><details><summary>${esc(run.connection)} · ${esc(run.interval)} · ${esc(profileName(run))} · ${iso(run.end)}</summary>
       <p>${esc(run.origin)} · ${raw.symbols}/${run.requested} symbols with complete coverage · ${raw.proven} configurations cleared preselection · ${raw.selected.length} selected for replay</p>
-      <p>${fmt(raw.evaluatedConfigs)} market configurations scored. ${raw.disabledConfigs} market-specific configurations excluded by the published calibration.</p>
+      <p>${fmt(raw.evaluatedConfigs)} market configurations scored. ${raw.rejectedPf === undefined ? "" : `${fmt(raw.rejectedPf)} failed preselection. `}${raw.disabledConfigs} market-specific configurations excluded by the published calibration.</p>
       <p>Pre window starts ${iso(run.end - (run.hours + run.preHours) * HOUR_MS)}. Replay starts ${iso(run.end - run.hours * HOUR_MS)} and ends ${iso(run.end)}.</p>
       <p>Replay calculation ${fmt(run.replayMs)} ms. Fill win rate ${base.samples ? fmt((base.wins * 100) / base.samples) + "%" : "—"}.</p>
       ${run.strategySettings ? `<p>Volume ${fmt(run.strategySettings.volumeFactor)}× · ${actions ? "Strategy actions " + esc(actions) : "No strategy sizing overlays"}. ${run.indication ? esc(run.indication) + " indication." : ""} ${run.range ? esc(run.range) + " target grid." : ""}</p>` : ""}
@@ -371,7 +373,7 @@ export function renderReplay(runs: ReplayRun[], introduction = ""): string {
       <h3>Holdout P&amp;L</h3><div class="chart" role="img" aria-label="Net profit and loss per reporting period">${bars}</div>
       ${table(["UTC period", "Closes", "Wins", "Losses", "Realized", "MTM change", "Net", "Trade PF", "Open"], hourly)}
       <h3>Frozen selections</h3>
-      ${table(["Symbol and configuration", "Costs", "Pre closes", "Pre PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD"], selected)}
+      ${table(["Symbol and configuration", "Costs", "Pre closes", "Pre PF", "Required PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD"], selected)}
       <p class="hash">Capture and cost SHA-256 ${run.evidence}</p></details></section>`;
     })
     .join("");
