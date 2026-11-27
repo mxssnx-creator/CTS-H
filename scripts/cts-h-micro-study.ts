@@ -1,10 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { buildPlan, DEFAULT_LANE_POLICY, verdict } from "../src/lib/desk/lanes.ts";
 import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/intervals.ts";
 import {
   aggregateBars,
   barIndexAt,
   buildMicroBook,
+  type Closes,
   enumerateMicroSets,
   MICRO_GRID,
   mergeMicroAcc,
@@ -20,10 +22,11 @@ import {
 import type { Bar } from "../src/lib/desk/process.ts";
 
 // Micro study over one-minute captures.
-//   run <captureDir> <outDir> <interval> [markets]    full grid for one timeframe, three 10-day windows
-//   select <outDir> <interval>                        choose by the two research windows; report the holdout
+//   run <captureDir> <outDir> <interval> [markets]                 full grid, ungated, three 10-day windows
+//   gated <captureDir> <outDir> <interval> <topN> [markets]         top sets from the ungated run, behind the lane gate
+//   select <outDir> <interval> [suffix]                             choose by the two research windows; holdout reported
 //
-// Windows, anchored to the capture end on a 4-hour grid: R1 and R2 are research, H is the holdout. Selection reads
+// Windows are anchored to the capture end on a 4-hour grid: R1 and R2 are research, H is the holdout. Selection reads
 // only R1 and R2. H is reported after the choice and is never used to choose.
 // GRID=quick runs a reduced grid for timing and smoke tests.
 
@@ -42,6 +45,7 @@ type CaptureFile = {
 type Market = { symbol: string; end: number; bars1m: Bar[] };
 type WindowName = "R1" | "R2" | "H";
 type Window = { name: WindowName; start: number; end: number };
+type Row = Record<string, string>;
 
 const QUICK_GRID: MicroGrid = {
   ...MICRO_GRID,
@@ -150,6 +154,16 @@ function csvRow(set: MicroSet, window: Window, summary: ReturnType<typeof summar
   ].join(",");
 }
 
+function loadRows(path: string): Row[] {
+  if (!existsSync(path)) throw new Error(`Missing ${path}. Run the study first.`);
+  const lines = readFileSync(path, "utf8").trim().split("\n");
+  const keys = lines[0]!.split(",");
+  return lines.slice(1).map((line) => {
+    const cells = line.split(",");
+    return Object.fromEntries(keys.map((key, i) => [key, cells[i] ?? ""])) as Row;
+  });
+}
+
 function run(captureDir: string, outDir: string, interval: CandleInterval, limit: number): void {
   const started = Date.now();
   const markets = loadMarkets(captureDir, limit);
@@ -164,7 +178,10 @@ function run(captureDir: string, outDir: string, interval: CandleInterval, limit
   const portfolio = windows.map(() => newMicroAcc(0, WINDOW_HOURS));
   const scratch = newMicroAcc(0, WINDOW_HOURS);
   const rows: string[] = [HEADER];
-  console.log(`${interval}: ${markets.length} markets, ${sets.length} sets${quick ? " (quick grid)" : ""}, windows ${windows.map((w) => `${w.name} ${new Date(w.start).toISOString()}`).join(", ")}`);
+  // COST=0 measures the gross edge before the round-trip cost; its output carries a -gross suffix.
+  const costOption = process.env.COST === undefined ? {} : { cost: Number(process.env.COST) };
+  const suffix = process.env.COST === undefined ? "" : "-gross";
+  console.log(`${interval}${suffix}: ${markets.length} markets, ${sets.length} sets${quick ? " (quick grid)" : ""}, windows ${windows.map((w) => `${w.name} ${new Date(w.start).toISOString()}`).join(", ")}`);
 
   sets.forEach((set, index) => {
     windows.forEach((window, w) => {
@@ -176,7 +193,7 @@ function run(captureDir: string, outDir: string, interval: CandleInterval, limit
         const range = ranges[m]![w]!;
         if (range.to - range.from < 2) return;
         resetMicroAcc(scratch, window.start);
-        simulateMicro(book, set, range.from, range.to, scratch);
+        simulateMicro(book, set, range.from, range.to, scratch, costOption);
         mergeMicroAcc(acc, scratch);
         if (scratch.legs > 0) withLegs += 1;
         if (scratch.net > 0) positive += 1;
@@ -189,21 +206,93 @@ function run(captureDir: string, outDir: string, interval: CandleInterval, limit
   });
 
   mkdirSync(outDir, { recursive: true });
-  writeFileSync(join(outDir, `${interval}.csv`), `${rows.join("\n")}\n`);
-  console.log(`${interval}: wrote ${rows.length - 1} rows in ${((Date.now() - started) / 1000).toFixed(0)}s`);
+  writeFileSync(join(outDir, `${interval}${suffix}.csv`), `${rows.join("\n")}\n`);
+  console.log(`${interval}${suffix}: wrote ${rows.length - 1} rows in ${((Date.now() - started) / 1000).toFixed(0)}s`);
 }
 
-type Row = Record<string, string>;
-
-function select(outDir: string, interval: CandleInterval): void {
-  const path = join(outDir, `${interval}.csv`);
-  if (!existsSync(path)) throw new Error(`Missing ${path}. Run the study first.`);
-  const lines = readFileSync(path, "utf8").trim().split("\n");
-  const keys = lines[0]!.split(",");
+// Gated run: each market's cell keeps its own evidence (every closed leg, booked or shadow), replayed in time order
+// from the earliest available bar. The gate validates an entry with the final-stage lanes, using only evidence that
+// closed before that entry. The lane policy is the shipped default and is not tuned on any window.
+function gated(captureDir: string, outDir: string, interval: CandleInterval, topN: number, limit: number): void {
+  const started = Date.now();
+  const ungated = loadRows(join(outDir, `${interval}.csv`));
   const byId = new Map<string, Partial<Record<WindowName, Row>>>();
-  for (const line of lines.slice(1)) {
-    const cells = line.split(",");
-    const row = Object.fromEntries(keys.map((key, i) => [key, cells[i] ?? ""])) as Row;
+  for (const row of ungated) {
+    const entry = byId.get(row.id!) ?? {};
+    entry[row.window as WindowName] = row;
+    byId.set(row.id!, entry);
+  }
+  const ranked = [...byId.entries()]
+    .flatMap(([id, windowsByName]) => {
+      const r1 = windowsByName.R1;
+      const r2 = windowsByName.R2;
+      if (!r1 || !r2 || Number(r1.positions) < MIN_POSITIONS || Number(r2.positions) < MIN_POSITIONS) return [];
+      return [{ id, score: Math.min(Number(r1.pf), Number(r2.pf)) }];
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topN);
+  const wanted = new Set(ranked.map((item) => item.id));
+  const sets = enumerateMicroSets({ ...MICRO_GRID, intervals: [interval] }).filter((set) => wanted.has(set.id));
+
+  const markets = loadMarkets(captureDir, limit);
+  const end = Math.min(...markets.map((market) => market.end));
+  const windows = windowsFor(end);
+  const books = markets.map((market) => bookFor(market, interval));
+  const ranges = books.map((book) => windows.map((window) => ({ from: barIndexAt(book.bars, window.start), to: barIndexAt(book.bars, window.end) })));
+  const finalLanes = buildPlan(2, DEFAULT_LANE_POLICY).at(-1)!.lanes;
+  const gateName = process.env.GATE ?? "validated";
+  // validated: no veto and at least one confirmation (the shipped rule). noveto: only a veto blocks. lastnet: the
+  // cell's last 20 closes, shadows included, net positive.
+  const gate = (closes: Closes): boolean => {
+    if (gateName === "lastnet") {
+      const n = closes.pnls.length;
+      if (n < 4) return false;
+      let sum = 0;
+      for (let i = Math.max(0, n - 20); i < n; i++) sum += closes.pnls[i]!;
+      return sum > 0;
+    }
+    const verdicted = verdict(closes, finalLanes, true);
+    return gateName === "noveto" ? verdicted.vetoed === 0 : verdicted.validated;
+  };
+
+  const rows: string[] = [HEADER];
+  console.log(`${interval} gated: ${sets.length} sets from the ungated top ${topN}, ${markets.length} markets`);
+  for (const set of sets) {
+    const portfolio = windows.map((window) => newMicroAcc(window.start, WINDOW_HOURS));
+    const withLegs = windows.map(() => 0);
+    const positive = windows.map(() => 0);
+    const scratch = newMicroAcc(0, WINDOW_HOURS);
+    books.forEach((book, m) => {
+      const closes: Closes = { pnls: [], costs: [] };
+      const first = ranges[m]![0]!;
+      // Evidence from the bars before the first research window, not booked.
+      if (first.from > 0) {
+        resetMicroAcc(scratch, 0);
+        simulateMicro(book, set, 0, first.from, scratch, { closes, gate });
+      }
+      windows.forEach((window, w) => {
+        const range = ranges[m]![w]!;
+        if (range.to - range.from < 2) return;
+        resetMicroAcc(scratch, window.start);
+        simulateMicro(book, set, range.from, range.to, scratch, { closes, gate });
+        mergeMicroAcc(portfolio[w]!, scratch);
+        if (scratch.legs > 0) withLegs[w] = withLegs[w]! + 1;
+        if (scratch.net > 0) positive[w] = positive[w]! + 1;
+      });
+    });
+    windows.forEach((window, w) => {
+      rows.push(csvRow(set, window, summarizeMicro(portfolio[w]!), markets.length, withLegs[w]!, positive[w]!));
+    });
+  }
+  writeFileSync(join(outDir, `${interval}-gated-${gateName}.csv`), `${rows.join("\n")}\n`);
+  console.log(`${interval} gated ${gateName}: wrote ${rows.length - 1} rows in ${((Date.now() - started) / 1000).toFixed(0)}s`);
+}
+
+function select(outDir: string, interval: CandleInterval, suffix: string): void {
+  const rows = loadRows(join(outDir, `${interval}${suffix}.csv`));
+  const baseline = suffix === "" ? null : new Map(loadRows(join(outDir, `${interval}.csv`)).map((row) => [`${row.id}|${row.window}`, row] as const));
+  const byId = new Map<string, Partial<Record<WindowName, Row>>>();
+  for (const row of rows) {
     const entry = byId.get(row.id!) ?? {};
     entry[row.window as WindowName] = row;
     byId.set(row.id!, entry);
@@ -230,18 +319,19 @@ function select(outDir: string, interval: CandleInterval): void {
   const top = candidates.slice(0, TOP);
   const fmt = (row: Row | undefined) =>
     row ? `pos ${row.positions.padStart(5)} net ${Number(row.net).toFixed(2).padStart(9)} PF ${Number(row.pf).toFixed(2)} DD ${Number(row.maxDD).toFixed(2).padStart(7)} hrs ${Number(row.hourlySuccess).toFixed(0).padStart(3)}% mkts+ ${row.marketsPositive}/${row.markets}` : "-";
-  console.log(`${interval}: ${candidates.length} sets pass the research rule (of ${byId.size}); top ${top.length}`);
+  console.log(`${interval}${suffix}: ${candidates.length} sets pass the research rule (of ${byId.size}); top ${top.length}`);
   for (const item of top) {
-    console.log(`${item.id}`);
+    console.log(item.id);
     console.log(`  R1 ${fmt(item.r1)}`);
     console.log(`  R2 ${fmt(item.r2)}`);
     console.log(`  H  ${fmt(item.h)}`);
+    if (baseline) console.log(`  H, ungated ${fmt(baseline.get(`${item.id}|H`))}`);
   }
   const holdoutPositive = top.filter((item) => item.h && Number(item.h.net) > 0).length;
   console.log(`holdout net > 0 for ${holdoutPositive}/${top.length} of the research top set`);
   writeFileSync(
-    join(outDir, `${interval}-selection.json`),
-    JSON.stringify({ interval, rule: { minPositions: MIN_POSITIONS, netPositiveResearch: true, rankBy: "min(PF R1, PF R2)", tieBreak: "max(maxDD R1, maxDD R2)" }, candidates: candidates.length, top: top.map((item) => ({ id: item.id, score: item.score, research: { R1: item.r1, R2: item.r2 }, holdout: item.h ?? null })) }, null, 1),
+    join(outDir, `${interval}${suffix}-selection.json`),
+    JSON.stringify({ interval, suffix, rule: { minPositions: MIN_POSITIONS, netPositiveResearch: true, rankBy: "min(PF R1, PF R2)", tieBreak: "max(maxDD R1, maxDD R2)" }, candidates: candidates.length, top: top.map((item) => ({ id: item.id, score: item.score, research: { R1: item.r1, R2: item.r2 }, holdout: item.h ?? null })) }, null, 1),
   );
 }
 
@@ -250,10 +340,14 @@ if (mode === "run") {
   const [captureDir, outDir, interval, limit = "50"] = args;
   if (!captureDir || !outDir || !interval) throw new Error("Usage: run <captureDir> <outDir> <interval> [markets]");
   run(captureDir, outDir, interval as CandleInterval, Number(limit));
+} else if (mode === "gated") {
+  const [captureDir, outDir, interval, topN = "200", limit = "50"] = args;
+  if (!captureDir || !outDir || !interval) throw new Error("Usage: gated <captureDir> <outDir> <interval> <topN> [markets]");
+  gated(captureDir, outDir, interval as CandleInterval, Number(topN), Number(limit));
 } else if (mode === "select") {
-  const [outDir, interval] = args;
-  if (!outDir || !interval) throw new Error("Usage: select <outDir> <interval>");
-  select(outDir, interval as CandleInterval);
+  const [outDir, interval, suffix = ""] = args;
+  if (!outDir || !interval) throw new Error("Usage: select <outDir> <interval> [suffix]");
+  select(outDir, interval as CandleInterval, suffix);
 } else {
-  throw new Error("Choose run or select.");
+  throw new Error("Choose run, gated or select.");
 }

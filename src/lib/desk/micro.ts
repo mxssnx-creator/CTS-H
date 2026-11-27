@@ -6,6 +6,9 @@ import { buildSeries, signalAt, type Bar, type Side } from "./process.ts";
 // Micro sets: one indication on one timeframe, with a target and a protective stop given in percent beyond the
 // round-trip cost, a fixed or dynamic trail, a time stop and an optional partial close at the first target.
 //
+// One state machine, MicroState, runs the rules bar by bar. The batch simulator and the live runner both use it, so
+// a backtest and a live run on the same candles produce the same fills.
+//
 // Causality: a signal read on closed bar i opens at the open of bar i+1. Every exit decision on bar b reads only
 // bars up to b. Within one bar the protective stop is checked before the target, because the order of the high and
 // the low inside a bar is unknown; the stop therefore wins a tie.
@@ -172,6 +175,176 @@ export function buildMicroBook(bars: Bar[], interval: CandleInterval, indication
 
 export type Closes = { pnls: number[]; costs: number[] };
 
+// One fill: a partial close, or the close that ends a position. `booked` is false for a shadow position, one the
+// lane gate blocked at entry: it is tracked but never counts as booked P&L or as evidence.
+export type Fill = {
+  reason: ExitReason;
+  exitBar: number;
+  t: number;
+  price: number;
+  fraction: number;
+  pnl: number;
+  cost: number;
+  side: Side;
+  entry: number;
+  entryBar: number;
+  booked: boolean;
+  closed: boolean;
+  // Net P&L of the whole position, set on the closing fill only.
+  positionNet: number;
+};
+
+export type MicroLegTrace = Fill;
+
+export type MicroOptions = {
+  notional?: number;
+  cost?: number;
+  // Lane gate: decides whether an entry is booked, reading the closes booked so far.
+  gate?: (closes: Closes) => boolean;
+  closes?: Closes;
+  trace?: Fill[];
+};
+
+export type MicroStateOptions = { notional?: number; cost?: number };
+
+// The rules for one set on one market, one closed bar at a time.
+export class MicroState {
+  readonly set: MicroSet;
+  private readonly notional: number;
+  private readonly cost: number;
+  private readonly maxHold: number;
+  private readonly tpFrac: number;
+  private readonly slFrac: number;
+  private readonly dynamic: boolean;
+  private readonly retrace: number;
+  private readonly partial: number;
+  private readonly onlySide: 0 | 1 | -1;
+  private open = false;
+  private side: Side = 1;
+  private entry = 0;
+  private entryBar = 0;
+  private qty = 0;
+  private target = 0;
+  private stop = 0;
+  private remaining = 1;
+  private activated = false;
+  private partialTaken = false;
+  private peak = 0;
+  private held = 0;
+  private booked = true;
+  private positionNet = 0;
+
+  constructor(set: MicroSet, interval: CandleInterval, options: MicroStateOptions = {}) {
+    this.set = set;
+    this.notional = options.notional ?? MICRO_NOTIONAL;
+    this.cost = options.cost ?? POSITION_RT_COST_PCT;
+    this.maxHold = Math.max(1, Math.round((set.holdMinutes * 60_000) / CANDLE_INTERVALS[interval]));
+    this.tpFrac = set.tp / 100;
+    this.slFrac = set.sl / 100;
+    this.dynamic = set.trail.kind === "dynamic";
+    this.retrace = set.trail.kind === "dynamic" ? set.trail.retrace : 0;
+    this.partial = set.partial;
+    this.onlySide = set.direction === "long" ? 1 : set.direction === "short" ? -1 : 0;
+  }
+
+  get flat(): boolean {
+    return !this.open;
+  }
+
+  // The open position for display, or null when flat.
+  get position(): { side: Side; entry: number; entryBar: number; stop: number; target: number; remaining: number; held: number } | null {
+    if (!this.open) return null;
+    return { side: this.side, entry: this.entry, entryBar: this.entryBar, stop: this.stop, target: this.target, remaining: this.remaining, held: this.held };
+  }
+
+  // Feeds one closed bar. `signal` is the indication's signal on the bar before this one (0 for none); a flat state
+  // opens at this bar's open. `last` closes any open position at this bar's close. `allow`, when given, is asked at
+  // entry and decides whether the position is booked.
+  onBar(bar: Bar, index: number, signal: Side | 0, last: boolean, allow: (() => boolean) | null, emit: (fill: Fill) => void): void {
+    if (!this.open) {
+      if (signal === 0) return;
+      if (this.onlySide !== 0 && signal !== this.onlySide) return;
+      const entry = bar.o;
+      if (!(entry > 0)) return;
+      const side = signal;
+      this.open = true;
+      this.side = side;
+      this.entry = entry;
+      this.entryBar = index;
+      this.booked = allow ? allow() : true;
+      this.positionNet = 0;
+      this.qty = this.notional / entry;
+      // Target and stop sit percent beyond the round-trip cost, on both sides of the entry.
+      const costAbs = entry * this.cost;
+      this.target = entry + side * (entry * this.tpFrac + costAbs);
+      this.stop = entry - side * (entry * this.slFrac + costAbs);
+      this.remaining = 1;
+      this.activated = false;
+      this.partialTaken = false;
+      this.peak = entry;
+      this.held = 0;
+    }
+    const side = this.side;
+    this.held += 1;
+    const stopHit = side > 0 ? bar.l <= this.stop : bar.h >= this.stop;
+    if (stopHit) {
+      // A gap through the stop fills at the open, which is worse than the stop itself.
+      this.leg("sl", side > 0 ? Math.min(bar.o, this.stop) : Math.max(bar.o, this.stop), this.remaining, bar, index, emit);
+      return;
+    }
+    const targetHit = side > 0 ? bar.h >= this.target : bar.l <= this.target;
+    if (targetHit) {
+      if (!this.dynamic && this.partial === 0) {
+        this.leg("tp", this.target, this.remaining, bar, index, emit);
+        return;
+      }
+      if (this.partial > 0 && !this.partialTaken) {
+        this.leg("partial", this.target, this.partial, bar, index, emit);
+        this.partialTaken = true;
+        // The rest of the position is protected at break-even.
+        this.stop = side > 0 ? Math.max(this.stop, this.entry) : Math.min(this.stop, this.entry);
+      }
+      if (this.dynamic) this.activated = true;
+    }
+    if (this.activated) {
+      // The trail follows the best price reached, and only ever tightens.
+      this.peak = side > 0 ? Math.max(this.peak, bar.h) : Math.min(this.peak, bar.l);
+      const trail = side > 0 ? this.peak - this.retrace * (this.peak - this.entry) : this.peak + this.retrace * (this.entry - this.peak);
+      this.stop = side > 0 ? Math.max(this.stop, trail) : Math.min(this.stop, trail);
+    }
+    if (this.held >= this.maxHold) {
+      this.leg("time", bar.c, this.remaining, bar, index, emit);
+      return;
+    }
+    if (last) this.leg("end", bar.c, this.remaining, bar, index, emit);
+  }
+
+  private leg(reason: ExitReason, price: number, fraction: number, bar: Bar, index: number, emit: (fill: Fill) => void): void {
+    const legQty = this.qty * fraction;
+    const pnl = closePnl(this.side, this.entry, price, legQty, this.cost);
+    const cost = positionRtCost(this.entry, price, legQty, this.cost);
+    this.remaining -= fraction;
+    this.positionNet += pnl;
+    const closed = reason !== "partial";
+    emit({
+      reason,
+      exitBar: index,
+      t: bar.t,
+      price,
+      fraction,
+      pnl,
+      cost,
+      side: this.side,
+      entry: this.entry,
+      entryBar: this.entryBar,
+      booked: this.booked,
+      closed,
+      positionNet: closed ? this.positionNet : 0,
+    });
+    if (closed) this.open = false;
+  }
+}
+
 export type MicroAcc = {
   t0: number;
   // Booked net P&L and leg counts per hour of the window, by exit time.
@@ -240,166 +413,68 @@ export function mergeMicroAcc(into: MicroAcc, from: MicroAcc): void {
   for (const key of Object.keys(into.exits) as ExitReason[]) into.exits[key] += from.exits[key];
 }
 
-export type MicroLegTrace = {
-  entryBar: number;
-  exitBar: number;
-  side: Side;
-  entry: number;
-  price: number;
-  fraction: number;
-  reason: ExitReason;
-  pnl: number;
-  cost: number;
-  booked: boolean;
-};
+// Books one fill into the window accumulator. Every closed leg, booked or shadow, is evidence for the lane gate: a
+// blocked cell keeps being tracked, so it can earn its way back in. Only booked legs count as P&L.
+export function bookFill(acc: MicroAcc, fill: Fill, closes?: Closes): void {
+  if (closes) {
+    closes.pnls.push(fill.pnl);
+    closes.costs.push(fill.cost);
+  }
+  if (!fill.booked) {
+    if (fill.closed) {
+      acc.shadows += 1;
+      acc.shadowNet += fill.positionNet;
+    }
+    return;
+  }
+  acc.legs += 1;
+  acc.exits[fill.reason] += 1;
+  acc.net += fill.pnl;
+  if (fill.pnl > 0) acc.grossProfit += fill.pnl;
+  else if (fill.pnl < 0) acc.grossLoss -= fill.pnl;
+  const hour = Math.floor((fill.t - acc.t0) / HOUR_MS);
+  if (hour >= 0 && hour < acc.hourNet.length) {
+    acc.hourNet[hour] = acc.hourNet[hour]! + fill.pnl;
+    acc.hourLegs[hour] = acc.hourLegs[hour]! + 1;
+  }
+  if (fill.closed) {
+    acc.positions += 1;
+    if (fill.positionNet > 0) acc.wins += 1;
+  }
+}
 
-export type MicroOptions = {
-  notional?: number;
-  cost?: number;
-  // Lane gate: decides whether an entry is booked. A blocked entry becomes a shadow position.
-  gate?: (closes: Closes) => boolean;
-  closes?: Closes;
-  trace?: MicroLegTrace[];
-};
-
-type Leg = { reason: ExitReason; bar: number; price: number; fraction: number; pnl: number; cost: number };
-
-// Simulates one set over bars [from, to) of the book, with one position at a time per market.
-// A window starts flat and closes any open position on its last bar, so each window stands alone.
+// Batch run of one set over bars [from, to). A window starts flat and closes any open position on its last bar, so
+// each window stands alone. While flat it jumps straight to the next signal, which keeps long histories cheap.
 export function simulateMicro(book: MicroBook, set: MicroSet, from: number, to: number, acc: MicroAcc, options: MicroOptions = {}): void {
   if (options.gate && !options.closes) throw new Error("A gate reads closes, so pass the closes it reads.");
   const events = book.signals[set.indication];
   if (!events) return;
   const bars = book.bars;
-  const notional = options.notional ?? MICRO_NOTIONAL;
-  const cost = options.cost ?? POSITION_RT_COST_PCT;
-  const maxHold = Math.max(1, Math.round((set.holdMinutes * 60_000) / CANDLE_INTERVALS[book.interval]));
-  const tpFrac = set.tp / 100;
-  const slFrac = set.sl / 100;
-  const dynamic = set.trail.kind === "dynamic";
-  const retrace = set.trail.kind === "dynamic" ? set.trail.retrace : 0;
-  const onlySide = set.direction === "long" ? 1 : set.direction === "short" ? -1 : 0;
-  const partial = set.partial;
-  const hours = acc.hourNet.length;
+  const state = new MicroState(set, book.interval, options);
   const closes = options.closes;
-  let nextFree = from;
-
-  for (let k = 0; k < events.at.length; k++) {
-    const side = events.side[k]! as Side;
-    if (onlySide !== 0 && side !== onlySide) continue;
-    const entryBar = events.at[k]! + 1;
-    if (entryBar >= to) break;
-    if (entryBar < from || entryBar < nextFree) continue;
-    const entry = bars[entryBar]!.o;
-    if (!(entry > 0)) continue;
-
-    // Target and stop sit percent beyond the round-trip cost, on both sides of the entry.
-    const costAbs = entry * cost;
-    const qty = notional / entry;
-    const target = entry + side * (entry * tpFrac + costAbs);
-    let stop = entry - side * (entry * slFrac + costAbs);
-    let remaining = 1;
-    let activated = false;
-    let partialTaken = false;
-    let peak = entry;
-    let exitBar = to - 1;
-    const legs: Leg[] = [];
-
-    const leg = (price: number, fraction: number, reason: ExitReason, bar: number) => {
-      const legQty = qty * fraction;
-      legs.push({
-        reason,
-        bar,
-        price,
-        fraction,
-        pnl: closePnl(side, entry, price, legQty, cost),
-        cost: positionRtCost(entry, price, legQty, cost),
-      });
-      remaining -= fraction;
-    };
-
-    for (let b = entryBar; b < to; b++) {
-      const bar = bars[b]!;
-      const stopHit = side > 0 ? bar.l <= stop : bar.h >= stop;
-      if (stopHit) {
-        // A gap through the stop fills at the open, which is worse than the stop itself.
-        leg(side > 0 ? Math.min(bar.o, stop) : Math.max(bar.o, stop), remaining, "sl", b);
-        exitBar = b;
-        break;
-      }
-      const targetHit = side > 0 ? bar.h >= target : bar.l <= target;
-      if (targetHit) {
-        if (!dynamic && partial === 0) {
-          leg(target, remaining, "tp", b);
-          exitBar = b;
-          break;
-        }
-        if (partial > 0 && !partialTaken) {
-          leg(target, partial, "partial", b);
-          partialTaken = true;
-          // The rest of the position is protected at break-even.
-          stop = side > 0 ? Math.max(stop, entry) : Math.min(stop, entry);
-        }
-        if (dynamic) activated = true;
-      }
-      if (activated) {
-        // The trail follows the best price reached, and only ever tightens.
-        peak = side > 0 ? Math.max(peak, bar.h) : Math.min(peak, bar.l);
-        const trail = side > 0 ? peak - retrace * (peak - entry) : peak + retrace * (entry - peak);
-        stop = side > 0 ? Math.max(stop, trail) : Math.min(stop, trail);
-      }
-      if (b - entryBar + 1 >= maxHold) {
-        leg(bar.c, remaining, "time", b);
-        exitBar = b;
-        break;
-      }
-      if (b === to - 1) {
-        leg(bar.c, remaining, "end", b);
-        exitBar = b;
-        break;
-      }
+  const gate = options.gate;
+  const allow = gate && closes ? () => gate(closes) : null;
+  const emit = (fill: Fill) => {
+    bookFill(acc, fill, closes);
+    options.trace?.push(fill);
+  };
+  const n = events.at.length;
+  let k = 0;
+  let b = from;
+  while (b < to) {
+    if (state.flat) {
+      while (k < n && events.at[k]! + 1 < b) k++;
+      if (k >= n || events.at[k]! + 1 >= to) break;
+      b = Math.max(b, events.at[k]! + 1);
     }
-
-    const allowed = options.gate ? options.gate(closes!) : true;
-    let positionNet = 0;
-    for (const item of legs) {
-      positionNet += item.pnl;
-      options.trace?.push({
-        entryBar,
-        exitBar: item.bar,
-        side,
-        entry,
-        price: item.price,
-        fraction: item.fraction,
-        reason: item.reason,
-        pnl: item.pnl,
-        cost: item.cost,
-        booked: allowed,
-      });
-      if (!allowed) continue;
-      if (closes) {
-        closes.pnls.push(item.pnl);
-        closes.costs.push(item.cost);
-      }
-      acc.legs += 1;
-      acc.exits[item.reason] += 1;
-      acc.net += item.pnl;
-      if (item.pnl > 0) acc.grossProfit += item.pnl;
-      else if (item.pnl < 0) acc.grossLoss -= item.pnl;
-      const hour = Math.floor((bars[item.bar]!.t - acc.t0) / HOUR_MS);
-      if (hour >= 0 && hour < hours) {
-        acc.hourNet[hour] = acc.hourNet[hour]! + item.pnl;
-        acc.hourLegs[hour] = acc.hourLegs[hour]! + 1;
-      }
+    while (k < n && events.at[k]! < b - 1) k++;
+    let signal: Side | 0 = 0;
+    if (k < n && events.at[k]! === b - 1) {
+      signal = events.side[k]! as Side;
+      k++;
     }
-    if (allowed) {
-      acc.positions += 1;
-      if (positionNet > 0) acc.wins += 1;
-    } else {
-      acc.shadows += 1;
-      acc.shadowNet += positionNet;
-    }
-    nextFree = exitBar + 1;
+    state.onBar(bars[b]!, b, signal, b === to - 1, allow, emit);
+    b++;
   }
 }
 

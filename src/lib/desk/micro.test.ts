@@ -9,11 +9,13 @@ import {
   MICRO_GRID,
   mergeMicroAcc,
   microSetId,
+  MicroState,
   newMicroAcc,
   resetMicroAcc,
   simulateMicro,
   summarizeMicro,
   type Closes,
+  type Fill,
   type MicroBook,
   type MicroLegTrace,
   type MicroOptions,
@@ -165,14 +167,16 @@ test("a time stop closes at the close after the hold, and the last bar of a wind
   assert.equal(ended.trace[0]!.exitBar, 2);
 });
 
-test("a blocked entry is a shadow: it is tracked but neither booked nor counted as evidence", () => {
+test("a blocked entry is a shadow: not booked, but its close is evidence so the cell can earn its way back", () => {
   const bars = [bar(0, 100, 100, 100, 100), bar(1, 100, 100, 100, 100), bar(2, 100, 100.5, 99.9, 100.4)];
   const closes: Closes = { pnls: [], costs: [] };
   const blocked = run(bookWith(bars, 0, 1), setOf(), 3, { closes, gate: () => false });
   assert.equal(blocked.acc.positions, 0);
+  assert.equal(blocked.acc.legs, 0);
   assert.equal(blocked.acc.shadows, 1);
   assert.ok(blocked.acc.shadowNet > 0);
-  assert.deepEqual(closes.pnls, []);
+  assert.equal(closes.pnls.length, 1, "the shadow close is evidence");
+  assert.ok(closes.pnls[0]! > 0);
   assert.equal(blocked.trace[0]!.booked, false);
   const allowedCloses: Closes = { pnls: [], costs: [] };
   const allowed = run(bookWith(bars, 0, 1), setOf(), 3, { closes: allowedCloses, gate: () => true });
@@ -243,5 +247,55 @@ test("indicator signals on a prefix match the full history, so no signal reads a
     const keep = [...whole.at].map((at, k) => ({ at, side: whole.side[k]! })).filter((item) => item.at < 400);
     assert.deepEqual([...part.at], keep.map((item) => item.at), `${indication} indices`);
     assert.deepEqual([...part.side], keep.map((item) => item.side), `${indication} sides`);
+  }
+});
+
+test("the streaming state gives the same fills as the batch run on the same bars", () => {
+  let state = 11;
+  const random = () => {
+    state = (state * 1_103_515_245 + 12_345) & 0x7fffffff;
+    return state / 0x7fffffff;
+  };
+  let price = 100;
+  const bars: Bar[] = Array.from({ length: 900 }, (_, i) => {
+    const o = price;
+    const c = o + (random() - 0.5) * 0.5;
+    const h = Math.max(o, c) + random() * 0.15;
+    const l = Math.min(o, c) - random() * 0.15;
+    price = c;
+    return { t: i * MINUTE, o, h, l, c, v: 1, closed: true };
+  });
+  // About one closed bar in twelve fires, with a random side, so positions open, close and re-open.
+  const at: number[] = [];
+  const side: number[] = [];
+  bars.forEach((_, i) => {
+    if (i > 25 && random() < 1 / 12) {
+      at.push(i);
+      side.push(random() < 0.5 ? 1 : -1);
+    }
+  });
+  const signalOn = new Int8Array(bars.length);
+  at.forEach((index, k) => {
+    signalOn[index] = side[k]!;
+  });
+  const book: MicroBook = { interval: "1m", bars, signals: { volumeBreak: { at: Int32Array.from(at), side: Int8Array.from(side) } } };
+  const variants: MicroSet[] = [
+    setOf({ tp: 0.2, sl: 0.2, holdMinutes: 30 }),
+    setOf({ tp: 0.5, sl: 0.3, trail: { kind: "dynamic", retrace: 0.4 }, holdMinutes: 120, partial: 0.5 }),
+    setOf({ tp: 0.3, sl: 0.6, trail: { kind: "fixed" }, holdMinutes: 60, partial: 0.5, direction: "short" }),
+    setOf({ tp: 0.8, sl: 0.2, trail: { kind: "dynamic", retrace: 0.6 }, holdMinutes: 240, direction: "long" }),
+  ];
+  for (const set of variants) {
+    const batchFills: Fill[] = [];
+    simulateMicro(book, set, 0, bars.length, newMicroAcc(0, 24), { trace: batchFills });
+    const streaming = new MicroState(set, "1m");
+    const streamFills: Fill[] = [];
+    for (let b = 0; b < bars.length; b++) {
+      const signal = b === 0 ? 0 : signalOn[b - 1]!;
+      streaming.onBar(bars[b]!, b, signal as 0 | 1 | -1, b === bars.length - 1, null, (fill) => streamFills.push(fill));
+    }
+    assert.ok(batchFills.length > 0, `${set.id} has fills`);
+    assert.deepEqual(streamFills, batchFills, set.id);
+    assert.ok(streaming.flat, "the window end leaves the state flat");
   }
 });
