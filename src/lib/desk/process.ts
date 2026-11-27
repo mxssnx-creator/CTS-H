@@ -19,6 +19,7 @@ import {
   type Indication,
 } from "./constants.ts";
 import { configurationKey, excludedConfigurations, type ReplayProfile } from "./config-policy.ts";
+import type { StagedSummary } from "./lanes.ts";
 import type { ConnectionId } from "./connections.ts";
 import { saneBars } from "./heal.ts";
 import { CANDLE_INTERVALS, HOUR_MS as REPLAY_HOUR, type CandleInterval } from "./intervals.ts";
@@ -243,7 +244,7 @@ const MICRO_EXTRA_CONFIGS = INDICATIONS.flatMap((indication) =>
   ),
 );
 
-function coordinatedConfigs(trailing: boolean, preferences?: StrategySettings, step = REPLAY_HOUR) {
+export function coordinatedConfigs(trailing: boolean, preferences?: StrategySettings, step = REPLAY_HOUR) {
   const base =
     step <= 15 * 60_000 && preferences?.microExtended
       ? [...COORDINATED_CONFIGS, ...MICRO_EXTRA_CONFIGS]
@@ -742,7 +743,7 @@ export function lastClosedBar(bars: Bar[]): Bar | undefined {
     : last;
 }
 
-function closedBars(bars: Bar[]): Bar[] {
+export function closedBars(bars: Bar[]): Bar[] {
   return lastClosedBar(bars) === bars.at(-1) ? bars : bars.slice(0, -1);
 }
 
@@ -1382,7 +1383,7 @@ export type HourPoint = {
   openLegs: number;
 };
 
-type HourAcc = Omit<HourPoint, "net" | "pf">;
+export type HourAcc = Omit<HourPoint, "net" | "pf">;
 type ReplayGate = { cell: Cell; floors: Floors; settings: StrategySettings };
 type EquityStats = { net: number; peak: number; trough: number; drawdown: number };
 type IndicationSummary = ReplaySummary & {
@@ -1443,6 +1444,7 @@ export type SessionReport = {
   greenBookLive: number;
   bookNames: string[];
   coverage: CoverageRow[];
+  staged?: StagedSummary;
   selected: {
     name: string;
     symbol: string;
@@ -1507,7 +1509,7 @@ export type ReplayOpts = {
   fixed?: { indication: Indication; tpAtr: number; slOfTp: number; coordination?: Coordination };
 };
 
-function hourAccumulator(t: number): HourAcc {
+export function hourAccumulator(t: number): HourAcc {
   return {
     t,
     trades: 0,
@@ -1560,7 +1562,7 @@ export function summarizeReplay(rows: HourPoint[]): ReplaySummary {
   };
 }
 
-function addHours(dst: HourAcc[], src: readonly HourAcc[], scale = 1) {
+export function addHours(dst: HourAcc[], src: readonly HourAcc[], scale = 1) {
   const count = src.length;
   for (let index = 0; index < count; index++) {
     const row = src[index]!;
@@ -1578,7 +1580,7 @@ function addHours(dst: HourAcc[], src: readonly HourAcc[], scale = 1) {
   }
 }
 
-function clockHours(rows: HourAcc[], step: number) {
+export function clockHours(rows: HourAcc[], step: number) {
   if (step >= REPLAY_HOUR) return seal(rows);
   const hourly: HourAcc[] = [];
   for (const row of rows) {
@@ -1633,7 +1635,16 @@ function replayGate(
   return { cell, floors, settings };
 }
 
-function replayWindow(
+// Lane gate for position-history evaluation. Closes are evidence; `allow` decides whether a new
+// entry books or opens a shadow position that is tracked but not booked.
+export type LanedReplay = {
+  closes: number[];
+  allow: (closes: readonly number[]) => boolean;
+  shadows: number;
+  shadowPnl: number[];
+};
+
+export function replayWindow(
   bars: Bar[],
   atr: number[],
   signals: (Side | 0)[],
@@ -1651,6 +1662,7 @@ function replayWindow(
   gate?: ReplayGate,
   gateAtBar?: boolean[],
   ledger?: TradeLeg[],
+  laned?: LanedReplay,
 ) {
   let leg: OpenLeg | null = null;
   let priorMark = 0;
@@ -1683,6 +1695,8 @@ function replayWindow(
       const tp = bar.o + side * dist;
       const sl = bar.o - side * stopDistance;
       if (tp > 0 && sl > 0) {
+        const active = laned ? laned.allow(laned.closes) : (gate?.cell.validExec ?? true);
+        if (laned && !active) laned.shadows += 1;
         leg = {
           side,
           entry: bar.o,
@@ -1692,7 +1706,7 @@ function replayWindow(
             ? stopCappedQty(planned, bar.o, stopDistance, cost, throttle ? side : 0)
             : notional / bar.o,
           hold: 0,
-          active: gate?.cell.validExec ?? true,
+          active,
         };
       }
     }
@@ -1700,6 +1714,10 @@ function replayWindow(
       const hit = exitOnBar(leg.side, leg.tp, leg.sl, bar, ++leg.hold, maxHold);
       if (hit || offset === slots.length - 1) {
         const pnl = closePnl(leg.side, leg.entry, hit?.exit ?? bar.c, leg.qty, cost);
+        if (laned) {
+          laned.closes.push(pnl);
+          if (leg.active === false) laned.shadowPnl.push(pnl);
+        }
         ledger?.push({
           t: bar.t,
           side: leg.side,

@@ -46,6 +46,7 @@ const HELP = `CTS-H BingX Trading Desk
          [--strategies none|axis,block,dca,relate] [--min-pf 1.0] [--auto-pf on|off]
          [--strategy-settings config.json] [--volume-factor 1.0] [--independent-indications] [--reselect-hours 24]
          [--period-hours 4] [--html report.html] [--markdown report.md]
+         [--profile staged --per-symbol 2 --thins 2 --min-closes 6]
   doctor
   account --connection bingx-x02
   propose --connection bingx-x02 --symbol ETH-USDT --side long --qty N --stop N --target N --why TEXT
@@ -136,6 +137,9 @@ async function main() {
       "volume-factor": { type: "string" },
       "selected-only": { type: "boolean" },
       "period-hours": { type: "string" },
+      "per-symbol": { type: "string" },
+      thins: { type: "string" },
+      "min-closes": { type: "string" },
       markdown: { type: "string" },
       "independent-indications": { type: "boolean" },
       "reselect-hours": { type: "string" },
@@ -220,8 +224,8 @@ async function main() {
     if (!Number.isInteger((history * HOUR_MS) / step))
       throw new Error("History must span a whole number of candles.");
     const profile = values.profile ?? "coordinated";
-    if (!["baseline", "filtered", "coordinated", "both", "all"].includes(profile))
-      throw new Error("Choose coordinated, filtered, baseline, both or all.");
+    if (!["baseline", "filtered", "coordinated", "staged", "both", "all"].includes(profile))
+      throw new Error("Choose coordinated, staged, filtered, baseline, both or all.");
     const profiles: ReplayProfile[] =
       profile === "both"
         ? ["baseline", "filtered"]
@@ -263,6 +267,7 @@ async function main() {
       ...(volume === undefined ? {} : { volumeFactor: number(volume, "volume factor", [0.1, 10]) }),
       ...(minimumPf === undefined ? {} : { minimumPf: number(minimumPf, "minimum PF", [1, 4]) }),
       ...(autoPf === undefined ? {} : { autoPf: autoPf === "on" }),
+      ...(profile === "staged" ? { extendedTargets: true, enabledIndications: INDICATIONS } : {}),
       ...(values.indication === "all" ? { enabledIndications: INDICATIONS } : {}),
     };
     const slip = number(values["slip-bps"] ?? "1", "slippage basis points", [0, 200]);
@@ -322,6 +327,12 @@ async function main() {
           selectedOnly: true,
           independentIndications: values["independent-indications"],
           reselectHours,
+          staged: {
+            perSymbol: number(values["per-symbol"] ?? "1", "cells per market", [1, 10]),
+            minPf: number(values["min-pf"] ?? "1", "minimum PF", [0.1, 4]),
+            thins: number(values.thins ?? "2", "thin stages", [0, 4]),
+            minCloses: number(values["min-closes"] ?? "6", "minimum closes", [1, 200]),
+          },
         }),
       );
     });

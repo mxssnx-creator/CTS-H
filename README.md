@@ -64,6 +64,24 @@ Use `--history-hours 1000` for a continuous capture that supports earlier cutoff
 
 The CLI and web desk accept 1m, 5m, 15m, 30m, 1h and 4h candles. Settings are retained independently per connection and interval, and open paper positions retain their original interval and hold limit. The engine warms indicators on 22 contiguous candles and selects one configuration per market using the pre window. Holdout entries use the next open, ambiguous stops and targets settle at the stop, and open positions close at the boundary. Coordinated intraday holds are configured in minutes; other cases use 24 candles. Profitable periods use hourly equity on intervals up to 1h and four-hour equity on 4h candles. Drawdown uses candle equity. The CLI models the venue taker fee and configurable `--slip-bps` per fill. The browser uses a fixed 0.12% round-trip cost. Funding payments, depth-limited execution and liquidation are outside the model.
 
+### Staged lanes
+
+`--profile staged` evaluates each candidate cell (market × configuration) on its own position history. Each lane looks at the last N closed positions of that cell and computes a PF. Stages recurse: Base, then Main, then thinner stages. Each stage evaluates only the cells validated before it, so no candidate is re-checked by a stage it never passed.
+
+- **Lanes:** long (N = 10–30), short (N = 4–8 in Base, 8–16 later) and last (N = 1–4). Every lane is independent.
+- **Both lanes** confirm a cell when PF ≥ `--min-pf` and veto it below. The short lanes in Main are positive-only, as specified.
+- **Evidence floor:** a lane gives evidence only once the cell has at least 4 closes. Thin stages raise the PF bar by 0.05 each.
+- **Validation:** no lane vetoes and at least one lane confirms.
+- **Holdout:** the top `--per-symbol` validated cells per market (default 1, ranked by net P&L) trade. The lanes of the final stage gate every entry, using the cell's closes so far. A blocked entry becomes a shadow position: it is tracked so the lanes can recover, but it is not booked.
+
+The design is in [docs/staged-lanes.md](docs/staged-lanes.md). Its results against the coordinated engine, on research and held-out windows, are in [reports/staged-lanes-10d-60-markets](reports/staged-lanes-10d-60-markets/README.md). The staged profile lost less and drew down less than the coordinated engine, but its PF stayed below 1 and it placed far fewer orders, so it is not a recommended profile. The report shows every stage, lane, validated share, median PF in and out, and the per-market cells with their shadow statistics.
+
+```sh
+node scripts/cts-h.ts replay --connection bingx-x01 --symbols <markets> \
+  --hours 240 --pre-hours 72 --history-hours 1440 --interval 1h --profile staged \
+  --per-symbol 1 --min-pf 1 --thins 2 --min-closes 6 --html staged.html --markdown staged.md
+```
+
 ### Period reports and coverage
 
 `--html` writes the full report. `--markdown` writes the same results as text, and `--period-hours` (default 4) sets the period length. Periods start at the beginning of each window, so a 120-hour holdout with 4-hour periods has exactly 30 full lines, and the 72-hour prehistory has 18. Each run also includes a coverage table with one row per indication and range. The table shows how many configurations were evaluated, how many reached the closes minimum, how many passed the gates, which symbols selected them, and the signal counts in each window. The status column explains each empty row. Low-frequency indications can clear every gate with a longer prehistory, so a short window can leave them with no qualifying configuration even when their signals are sound.

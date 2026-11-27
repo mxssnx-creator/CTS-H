@@ -761,6 +761,7 @@ const REPLAY_PROFILES: Record<ReplayProfile, string> = {
   coordinated: "Coordinated",
   filtered: "Filtered",
   baseline: "Baseline",
+  staged: "Staged lanes",
 };
 const REPLAY_SIZING: { size: ReplaySize; label: string }[] = [
   { size: "base", label: "Base" },
@@ -934,6 +935,79 @@ export function ReplayPage() {
               </div>
             </Panel>
           )}
+          {report.staged ? (
+            <Panel title="Staged lanes" aside={<span className="muted mono">{report.staged.plan.join(" → ")}</span>}>
+              <p className="muted">
+                {num.format(report.staged.pool)} candidate cells, {num.format(report.staged.validatedFinal)} validated by the final stage,
+                {" "}{num.format(report.staged.chosen)} chosen (up to {report.staged.perSymbol} per market). {num.format(report.staged.bookedCloses)} booked closes;
+                {" "}{num.format(report.staged.shadows)} entries blocked and tracked as shadows (shadow PF {report.staged.shadowPf.toFixed(2)}).
+              </p>
+              <div className="table-scroll">
+                <table className="desk-table">
+                  <thead>
+                    <tr>
+                      <th>Stage</th>
+                      <th>Input</th>
+                      <th>Validated</th>
+                      <th>Vetoed</th>
+                      <th>Retained</th>
+                      <th>Median PF in</th>
+                      <th>Median PF out</th>
+                      <th>Relation out/in</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.staged.stages.map((stage) => (
+                      <tr key={stage.id}>
+                        <td>{stage.name}</td>
+                        <td>{num.format(stage.input)}</td>
+                        <td>{num.format(stage.validated)}</td>
+                        <td>{num.format(stage.vetoed)}</td>
+                        <td>{(stage.retained * 100).toFixed(1)}%</td>
+                        <td>{stage.medianPfIn.toFixed(2)}</td>
+                        <td>{stage.medianPfOut.toFixed(2)}</td>
+                        <td>{stage.relation.toFixed(2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {report.staged.cells.length ? (
+                <div className="table-scroll">
+                  <table className="desk-table">
+                    <thead>
+                      <tr>
+                        <th>Cell</th>
+                        <th>Closes pre</th>
+                        <th>PF pre</th>
+                        <th>Closes holdout</th>
+                        <th>PF holdout</th>
+                        <th>Net holdout</th>
+                        <th>Shadows</th>
+                        <th>Shadow PF</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {report.staged.cells.map((cell) => (
+                        <tr key={cell.name}>
+                          <td>{cell.name}</td>
+                          <td>{cell.closesPre}</td>
+                          <td>{cell.pfPre.toFixed(2)}</td>
+                          <td>{cell.closesHoldout}</td>
+                          <td>{cell.pfHoldout.toFixed(2)}</td>
+                          <td className={tone(cell.netHoldout)}>{sign(cell.netHoldout)}</td>
+                          <td>{cell.shadows}</td>
+                          <td>{cell.shadowPf.toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <Empty>No cell validated through every stage.</Empty>
+              )}
+            </Panel>
+          ) : null}
           <div className="columns-even">
             <Panel title="Selected configurations">
               {report.selected.length ? (

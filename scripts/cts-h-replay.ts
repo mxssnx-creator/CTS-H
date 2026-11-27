@@ -12,6 +12,7 @@ import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/
 import { loadKlines } from "../src/lib/desk/market.server.ts";
 import { positionNotional } from "../src/lib/desk/math.ts";
 import { periodRows, type PeriodRow } from "../src/lib/desk/periods.ts";
+import { simulateStaged } from "../src/lib/desk/staged.ts";
 import {
   simulateSessions,
   sizedNotional,
@@ -102,7 +103,7 @@ export async function captureReplay(
 const SIZES: ReplaySize[] = ["base", "axis", "block", "both"];
 type ReplayScope = Pick<
   ReplayOpts, "preHours" | "indication" | "range" | "trailing" | "selectedOnly" | "reselectHours" | "independentIndications"
->;
+> & { staged?: { perSymbol: number; minPf: number; thins: number; minCloses: number } };
 const fingerprints = new WeakMap<Capture, Map<number, string>>();
 
 export function replayCosts(capture: Capture, slipBps: number) {
@@ -134,20 +135,36 @@ export function runReplay(
   const strategies = preferences ?? defaultForInterval(capture.interval ?? "1h");
   const { costs, feesEstimated } = replayCosts(capture, slipBps);
   const began = performance.now();
-  const report = simulateSessions(capture.books, BOOK, DEFAULT_FLOORS, {
-    ...scope,
+  const { staged, ...engineScope } = scope;
+  const common = {
     hours,
     end: capture.end,
     costs,
     connection: capture.connection,
-    profile,
     interval: capture.interval ?? "1h",
-    size: "base",
     strategies,
-  });
+  };
+  const report =
+    profile === "staged"
+      ? simulateStaged(capture.books, BOOK, DEFAULT_FLOORS, {
+          ...common,
+          preHours: scope.preHours ?? hours,
+          indication: scope.indication,
+          range: scope.range,
+          perSymbol: staged?.perSymbol,
+          minPf: staged?.minPf,
+          thins: staged?.thins,
+          minCloses: staged?.minCloses,
+        })
+      : simulateSessions(capture.books, BOOK, DEFAULT_FLOORS, {
+          ...engineScope,
+          ...common,
+          profile,
+          size: "base",
+        });
   const elapsed = performance.now() - began;
   const base = positionNotional(BOOK);
-  const variants = (profile === "coordinated" ? SIZES.slice(0, 1) : SIZES).map((size) => {
+  const variants = (profile === "coordinated" || profile === "staged" ? SIZES.slice(0, 1) : SIZES).map((size) => {
     const scale =
       sizedNotional(base, {
         axis: size === "axis" || size === "both",
@@ -318,6 +335,57 @@ function markdownTable(head: string[], body: (string | number)[][]) {
   ].join("\n");
 }
 
+const pct = (value: number) => `${fmt(value * 100)}%`;
+
+// Staged lanes: stage table, lane table, summary and per-market cells, as HTML.
+function stagedHtml(run: ReplayRun): string {
+  const staged = run.report.staged;
+  if (!staged) return "";
+  const stageRows = staged.stages.map((stage) =>
+    row([stage.name, stage.input, stage.validated, stage.vetoed, pct(stage.retained), stage.medianPfIn, stage.medianPfOut, stage.relation]),
+  ).join("");
+  const laneRows = staged.stages.flatMap((stage) =>
+    stage.lanes.map((lane) =>
+      row([stage.name, lane.id, lane.window, lane.mode, lane.minPf, lane.evidence, lane.confirmed, lane.vetoed, lane.medianPf]),
+    ),
+  ).join("");
+  const cellRows = staged.cells.map((cell) =>
+    row([cell.name, cell.closesPre, cell.pfPre, cell.closesHoldout, cell.pfHoldout, cell.netHoldout, cell.shadows, cell.shadowPf]),
+  ).join("");
+  return `<h3>Staged lanes</h3>
+      <p>${esc(staged.plan.join(" → "))}. ${fmt(staged.pool)} candidate cells in the prehistory pool; ${fmt(staged.validatedFinal)} validated by the final stage; ${fmt(staged.chosen)} chosen for the holdout (up to ${staged.perSymbol} per market). ${fmt(staged.bookedCloses)} booked closes, ${fmt(staged.shadows)} entries blocked by the lanes and tracked as shadows (shadow PF ${fmt(staged.shadowPf)}).</p>
+      ${table(["Stage", "Input cells", "Validated", "Vetoed", "Retained", "Median PF in", "Median PF out", "Relation out/in"], stageRows)}
+      ${table(["Stage", "Lane", "Window", "Mode", "Min PF", "Evidence", "Confirmed", "Vetoed", "Median PF"], laneRows)}
+      ${table(["Cell", "Closes prehistory", "PF prehistory", "Closes holdout", "PF holdout", "Net holdout", "Shadow entries", "Shadow PF"], cellRows)}`;
+}
+
+function stagedMarkdown(run: ReplayRun): string[] {
+  const staged = run.report.staged;
+  if (!staged) return [];
+  return [
+    "### Staged lanes",
+    "",
+    `${staged.plan.join(" → ")}. ${fmt(staged.pool)} candidate cells; ${fmt(staged.validatedFinal)} validated by the final stage; ${fmt(staged.chosen)} chosen (up to ${staged.perSymbol} per market). ${fmt(staged.bookedCloses)} booked closes; ${fmt(staged.shadows)} blocked entries tracked as shadows (shadow PF ${fmt(staged.shadowPf)}).`,
+    "",
+    markdownTable(
+      ["Stage", "Input cells", "Validated", "Vetoed", "Retained", "Median PF in", "Median PF out", "Relation out/in"],
+      staged.stages.map((stage) => [stage.name, stage.input, stage.validated, stage.vetoed, pct(stage.retained), stage.medianPfIn, stage.medianPfOut, stage.relation]),
+    ),
+    "",
+    markdownTable(
+      ["Stage", "Lane", "Window", "Mode", "Min PF", "Evidence", "Confirmed", "Vetoed", "Median PF"],
+      staged.stages.flatMap((stage) => stage.lanes.map((lane) => [stage.name, lane.id, lane.window, lane.mode, lane.minPf, lane.evidence, lane.confirmed, lane.vetoed, lane.medianPf])),
+    ),
+    "",
+    markdownTable(
+      ["Cell", "Closes prehistory", "PF prehistory", "Closes holdout", "PF holdout", "Net holdout", "Shadow entries", "Shadow PF"],
+      staged.cells.map((cell) => [cell.name, cell.closesPre, cell.pfPre, cell.closesHoldout, cell.pfHoldout, cell.netHoldout, cell.shadows, cell.shadowPf]),
+    ),
+    "",
+  ];
+}
+
+
 export function renderMarkdown(runs: ReplayRun[], periodHours = 4): string {
   const sections = runs.map((run) => {
     const holdoutStart = run.end - run.hours * HOUR_MS;
@@ -351,6 +419,7 @@ export function renderMarkdown(runs: ReplayRun[], periodHours = 4): string {
       "",
       markdownTable(PERIOD_HEAD, prehistory.map(periodCells)),
       "",
+      ...stagedMarkdown(run),
       "### Indication and range coverage",
       "",
       markdownTable(
@@ -527,6 +596,7 @@ export function renderReplay(runs: ReplayRun[], introduction = "", periodHours =
       ${periodTable(periodRows(raw.bookLive, periodHours, run.end - run.hours * HOUR_MS))}
       <h3>Prehistory by ${periodHours}-hour period (UTC, from the window start)</h3>
       ${periodTable(periodRows(raw.bookPre, periodHours, run.end - (run.hours + run.preHours) * HOUR_MS))}
+      ${stagedHtml(run)}
       <h3>Indication and range coverage</h3>
       <p>Every indication and range is evaluated on each symbol. A cell without a selection shows the gate that stopped it.</p>
       ${coverageTable(run)}
