@@ -29,7 +29,7 @@ const MIN_POSITIVE_SHARE = 0.6;
 const FIELDS = 12;
 
 type NativeFile = { symbol: string; end: number; complete: boolean; bars: { time: number; open: number; high: number; low: number; close: number; volume: number }[] };
-type Market = { symbol: string; end: number; bars: Bar[]; book: MicroBook | null };
+type Market = { symbol: string; end: number; bars: Bar[]; book: MicroBook | null; trend: Int8Array | null };
 
 const [dir, outDir, intervalText, limitText = "50"] = process.argv.slice(2);
 if (!dir || !outDir || !intervalText) throw new Error("Usage: regime <nativeDir> <outDir> <interval> [markets]");
@@ -43,7 +43,7 @@ for (const name of readdirSync(dir).filter((item) => item.endsWith(".json") && i
   const file = JSON.parse(readFileSync(join(dir, name), "utf8")) as NativeFile;
   if (!file.complete) continue;
   const bars: Bar[] = file.bars.map((row) => ({ t: row.time, o: row.open, h: row.high, l: row.low, c: row.close, v: row.volume, closed: true }));
-  markets.push({ symbol: file.symbol, end: file.end, bars, book: null });
+  markets.push({ symbol: file.symbol, end: file.end, bars, book: null, trend: null });
 }
 if (markets.length === 0) throw new Error("No complete markets.");
 const dataStart = Math.max(...markets.map((market) => market.bars[0]!.t));
@@ -58,7 +58,20 @@ for (let j = 0; ; j++) {
   spans.unshift({ start, end });
 }
 const K = spans.length;
-for (const market of markets) market.book = buildMicroBook(market.bars, interval);
+// TREND=on (Experiment C): +1 or -1 by the sign of the return over the last TREND_BARS closed bars, causal.
+const trendOn = process.env.TREND === "on";
+const trendBars = Math.round((10 * 24 * HOUR_MS) / step);
+for (const market of markets) {
+  market.book = buildMicroBook(market.bars, interval);
+  if (trendOn) {
+    const trend = new Int8Array(market.bars.length);
+    for (let i = trendBars; i < market.bars.length; i++) {
+      const change = market.bars[i]!.c - market.bars[i - trendBars]!.c;
+      trend[i] = change > 0 ? 1 : change < 0 ? -1 : 0;
+    }
+    market.trend = trend;
+  }
+}
 
 // Coverage and per-window market move (open of the first bar to close of the last, in percent).
 const ranges = markets.map((market) =>
@@ -110,7 +123,7 @@ sets.forEach((set, s) => {
       const r = ranges[m]![w]!;
       if (!r.ok) continue;
       current = w;
-      simulateMicro(market.book!, set, r.from, r.to, accs[w]!, { sink });
+      simulateMicro(market.book!, set, r.from, r.to, accs[w]!, { sink, trendFilter: trendOn ? market.trend! : undefined });
     }
   });
   for (let w = 0; w < K; w++) {
@@ -244,7 +257,7 @@ const result = {
   seconds: Math.round((Date.now() - started) / 1000),
 };
 mkdirSync(outDir, { recursive: true });
-writeFileSync(join(outDir, `regime-${interval}${atrBrackets ? "-atr" : ""}.json`), JSON.stringify(result, null, 1));
+writeFileSync(join(outDir, `regime-${interval}${atrBrackets ? "-atr" : ""}${trendOn ? "-trend" : ""}.json`), JSON.stringify(result, null, 1));
 console.log(`${interval}: ${S} sets, ${markets.length} markets, ${windows.length} windows (${JSON.stringify(result.regimeCounts)}), ${result.seconds}s`);
 console.log(`  out of sample pooled PF ${result.oosPooled.pf}, net ${result.oosPooled.net}, traded ${result.oosPooled.tradedWindows}, flat ${result.oosPooled.flatWindows}`);
 for (const [regime, row] of Object.entries(result.oosByRegime)) console.log(`  ${regime}: traded ${row.tradedWindows}, flat ${row.flatWindows}, PF ${row.pf}, net ${row.net}`);

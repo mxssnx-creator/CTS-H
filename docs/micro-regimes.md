@@ -35,3 +35,17 @@ Rules, fixed before the run.
 - Windows, regime labels, walk rule and success criterion as in Experiment A.
 - Timeframes: 4h first, then 1h and 30m as their candles finish.
 - Not part of the brief's percent grid: it is a second bracket family, reported separately.
+
+## Experiment B result: ATR brackets, 4 hours (recorded)
+
+- 7,600 sets, 48 markets, 49 windows. Out of sample: pooled PF 0.75, net −1,536, traded 35 of 37 windows.
+- BULL: PF 0.33, net −1,088 (7 windows). BEAR: PF 0.83. CHOP: PF 0.96.
+- Population direction by regime: BULL long PF 1.33, short PF 0.48. BEAR long PF 0.52, short PF 1.42. CHOP long 0.93, short 0.84.
+- Reading: the ATR brackets carry a trend-following signature. Longs win in rising markets and shorts win in falling ones. The walk still traded counter-trend, because it selects on pooled history.
+
+## Experiment C: trend-filtered entries (pre-registered before the run)
+
+- Filter: a long is allowed only if the instrument's trailing return over the last 10 days (60 bars at 4 hours, measured on the signal bar) is above zero. A short is allowed only if it is below zero. The lookback is fixed, not tuned.
+- Brackets, grid, windows, regime labels and walk rule as Experiment B.
+- Validation: the test windows are split in time. First half: test windows 12 to 30. Second half: test windows 31 to 48. The direction table in Experiment B was computed over all windows, so this experiment is a test only in the time split, and the report says so.
+- Success: out-of-sample pooled PF above 1.00 in each half of the time split, and above 1.00 in each regime with at least five traded windows. Anything else is reported as not profitable.

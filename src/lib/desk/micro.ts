@@ -218,6 +218,8 @@ export type MicroOptions = {
   trace?: Fill[];
   // Receives every fill as it happens, without storing it.
   sink?: (fill: Fill) => void;
+  // Per bar: +1 or -1 when the trend allows only that side of signal, 0 when it allows none. Undefined disables it.
+  trendFilter?: Int8Array;
 };
 
 export type MicroStateOptions = { notional?: number; cost?: number };
@@ -519,7 +521,9 @@ export function simulateMicro(book: MicroBook, set: MicroSet, from: number, to: 
     while (k < n && events.at[k]! < b - 1) k++;
     let signal: Side | 0 = 0;
     if (k < n && events.at[k]! === b - 1) {
-      signal = events.side[k]! as Side;
+      const eventSide = events.side[k]! as Side;
+      // A trend filter passes a signal only when the trend on the signal bar points the same way.
+      signal = options.trendFilter && options.trendFilter[b - 1] !== eventSide ? 0 : eventSide;
       k++;
     }
     run.step(bars[b]!, b, signal, b === to - 1, allow, acc, closes, book.atr[b - 1] ?? Number.NaN);
