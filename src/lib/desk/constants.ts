@@ -31,6 +31,9 @@ export const MAX_HOLD = 24;
 export const MODEL_STOP_RISK = 0.008;
 export const WIDE_TP_ATR = [0.8, 1, 1.2, 1.4, 1.6, 1.8, 2];
 export const WIDE_SL_OF_TP = [0.5, 0.75, 1, 1.25, 1.5];
+// Opt-in longer targets for hourly candles; trailing exits let these winners run.
+export const EXTENDED_TP_ATR = [2.5, 3, 4];
+export const EXTENDED_SL_OF_TP = [0.75, 1, 1.5];
 export const MAX_LIVE_LEGS = 12;
 
 export const ACTIONS = [
@@ -157,6 +160,11 @@ export const NEW_INDICATIONS = [
   "momentumPullback",
   "squeezeBreak",
   "rsiRecovery",
+  "donchian",
+  "supertrend",
+  "vwapReclaim",
+  "adxDi",
+  "stochRsi",
 ] as const;
 export const INDICATIONS = [...LEGACY_INDICATIONS, ...NEW_INDICATIONS] as const;
 export type Indication = (typeof INDICATIONS)[number];
@@ -175,6 +183,11 @@ export const INDICATION_LABELS: Record<Indication, string> = {
   momentumPullback: "Momentum pullback",
   squeezeBreak: "Compression breakout",
   rsiRecovery: "RSI trend recovery",
+  donchian: "Donchian breakout with ADX",
+  supertrend: "Supertrend flip",
+  vwapReclaim: "VWAP reclaim with Stochastic RSI",
+  adxDi: "ADX with DI cross",
+  stochRsi: "Stochastic RSI cross",
 };
 
 export type Floors = {

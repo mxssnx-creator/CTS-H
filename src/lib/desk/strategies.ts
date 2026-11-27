@@ -56,6 +56,7 @@ export type StrategySettings = TrailSettings &
     autoPfRecent: boolean;
     microExtended: boolean;
     microReplayGate: boolean;
+    extendedTargets: boolean;
     interval: CandleInterval;
   };
 
@@ -74,6 +75,7 @@ export const DEFAULT_STRATEGIES: StrategySettings = {
   microReselectHours: 0,
   microExtended: false,
   microReplayGate: false,
+  extendedTargets: false,
   interval: "1h",
   enabledIndications: ["break", "ema", "rangeFade"],
   shortRange: true,
@@ -135,6 +137,7 @@ export function normalizeStrategies(input?: Partial<StrategySettings>): Strategy
     "autoPfRecent",
     "microExtended",
     "microReplayGate",
+    "extendedTargets",
   ] as const) {
     const value = input[key];
     if (typeof value === "boolean") config[key] = value;

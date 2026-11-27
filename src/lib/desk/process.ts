@@ -1,4 +1,6 @@
 import {
+  EXTENDED_SL_OF_TP,
+  EXTENDED_TP_ATR,
   INDICATIONS,
   LEGACY_INDICATIONS,
   NEW_INDICATIONS,
@@ -162,6 +164,22 @@ export type Series = {
   mid: number[];
   sd: number[];
   vol: number[];
+  adx: number[];
+  pdi: number[];
+  mdi: number[];
+  st: Array<Side | 0>;
+  stoch: number[];
+  vwap: number[];
+};
+
+export type TradeLeg = {
+  t: number;
+  side: Side;
+  entry: number;
+  exit: number;
+  pnl: number;
+  reason: "tp" | "sl" | "time" | "end";
+  hold: number;
 };
 
 const PF_NO_LOSS_NEAR = 3.999;
@@ -209,6 +227,14 @@ const COORDINATED_CONFIGS = [
   COORDINATIONS.map((mode) => settings(indication, tpAtr, slOfTp, true, mode)),
 );
 
+const EXTENDED_COORDINATED_CONFIGS = ([...LEGACY_INDICATIONS, ...NEW_INDICATIONS] as Indication[]).flatMap((indication) =>
+  EXTENDED_TP_ATR.flatMap((tpAtr) =>
+    EXTENDED_SL_OF_TP.flatMap((slOfTp) =>
+      COORDINATIONS.map((mode) => settings(indication, tpAtr, slOfTp, true, mode)),
+    ),
+  ),
+);
+
 const MICRO_EXTRA_CONFIGS = INDICATIONS.flatMap((indication) =>
   [2.5, 3, 4, 6].flatMap((tpAtr) =>
     WIDE_SL_OF_TP.flatMap((slOfTp) =>
@@ -218,10 +244,11 @@ const MICRO_EXTRA_CONFIGS = INDICATIONS.flatMap((indication) =>
 );
 
 function coordinatedConfigs(trailing: boolean, preferences?: StrategySettings, step = REPLAY_HOUR) {
-  const candidates =
+  const base =
     step <= 15 * 60_000 && preferences?.microExtended
       ? [...COORDINATED_CONFIGS, ...MICRO_EXTRA_CONFIGS]
       : COORDINATED_CONFIGS;
+  const candidates = preferences?.extendedTargets ? [...base, ...EXTENDED_COORDINATED_CONFIGS] : base;
   if (
     trailing &&
     (!preferences ||
@@ -322,15 +349,122 @@ function bbSeries(bars: Bar[], n = 20): { mid: number[]; sd: number[] } {
   return { mid, sd };
 }
 
+// Wilder ADX with +DI and -DI, causal: each value uses only bars up to its index.
+function adxSeries(bars: Bar[], n = 14) {
+  const len = bars.length;
+  const adx = new Array<number>(len).fill(0);
+  const pdi = new Array<number>(len).fill(0);
+  const mdi = new Array<number>(len).fill(0);
+  let sPlus = 0;
+  let sMinus = 0;
+  let sTr = 0;
+  let dxAvg = 0;
+  for (let i = 1; i < len; i++) {
+    const b = bars[i]!;
+    const p = bars[i - 1]!;
+    const up = b.h - p.h;
+    const down = p.l - b.l;
+    const plus = up > down && up > 0 ? up : 0;
+    const minus = down > up && down > 0 ? down : 0;
+    const tr = Math.max(b.h - b.l, Math.abs(b.h - p.c), Math.abs(b.l - p.c));
+    if (i <= n) {
+      sPlus += plus;
+      sMinus += minus;
+      sTr += tr;
+      if (i < n) continue;
+    } else {
+      sPlus = sPlus - sPlus / n + plus;
+      sMinus = sMinus - sMinus / n + minus;
+      sTr = sTr - sTr / n + tr;
+    }
+    const plusDi = sTr > 0 ? (100 * sPlus) / sTr : 0;
+    const minusDi = sTr > 0 ? (100 * sMinus) / sTr : 0;
+    const sum = plusDi + minusDi;
+    const dx = sum > 0 ? (100 * Math.abs(plusDi - minusDi)) / sum : 0;
+    dxAvg = i === n ? dx : (dxAvg * (n - 1) + dx) / n;
+    pdi[i] = plusDi;
+    mdi[i] = minusDi;
+    adx[i] = dxAvg;
+  }
+  return { adx, pdi, mdi };
+}
+
+// Supertrend direction (1 up, -1 down) using ATR bands; causal.
+function supertrendSeries(bars: Bar[], atr: number[], mult = 3): Array<Side | 0> {
+  const out = new Array<Side | 0>(bars.length).fill(0);
+  let upper = 0;
+  let lower = 0;
+  let dir: Side = 1;
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i]!;
+    const hl2 = (b.h + b.l) / 2;
+    const basicUpper = hl2 + mult * (atr[i] ?? 0);
+    const basicLower = hl2 - mult * (atr[i] ?? 0);
+    if (i === 0) {
+      upper = basicUpper;
+      lower = basicLower;
+    } else {
+      const prevClose = bars[i - 1]!.c;
+      upper = basicUpper < upper || prevClose > upper ? basicUpper : upper;
+      lower = basicLower > lower || prevClose < lower ? basicLower : lower;
+      if (dir === 1 && b.c < lower) dir = -1;
+      else if (dir === -1 && b.c > upper) dir = 1;
+    }
+    out[i] = dir;
+  }
+  return out;
+}
+
+// Rolling VWAP over the trailing n bars using typical price and volume.
+function vwapSeries(bars: Bar[], n = 24): number[] {
+  const out = new Array<number>(bars.length).fill(0);
+  for (let i = 0; i < bars.length; i++) {
+    let pv = 0;
+    let v = 0;
+    for (let k = Math.max(0, i - n + 1); k <= i; k++) {
+      const b = bars[k]!;
+      const volume = b.v > 0 ? b.v : 0;
+      pv += ((b.h + b.l + b.c) / 3) * volume;
+      v += volume;
+    }
+    out[i] = v > 0 ? pv / v : bars[i]!.c;
+  }
+  return out;
+}
+
+// Stochastic of RSI over the trailing n RSI values, scaled 0 to 100.
+function stochRsiSeries(rsi: number[], n = 14): number[] {
+  const out = new Array<number>(rsi.length).fill(50);
+  for (let i = 0; i < rsi.length; i++) {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let k = Math.max(0, i - n + 1); k <= i; k++) {
+      lo = Math.min(lo, rsi[k]!);
+      hi = Math.max(hi, rsi[k]!);
+    }
+    out[i] = hi - lo > 1e-9 ? (100 * (rsi[i]! - lo)) / (hi - lo) : 50;
+  }
+  return out;
+}
+
 export function buildSeries(bars: Bar[]): Series {
   const { mid, sd } = bbSeries(bars);
+  const atr = atrSeries(bars);
+  const rsi = rsiSeries(bars);
+  const { adx, pdi, mdi } = adxSeries(bars);
   return {
-    atr: atrSeries(bars),
+    adx,
+    pdi,
+    mdi,
+    st: supertrendSeries(bars, atrSeries(bars, 10)),
+    stoch: stochRsiSeries(rsi),
+    vwap: vwapSeries(bars),
+    atr,
     ema9: emaSeries(bars, 9),
     ema12: emaSeries(bars, 12),
     ema21: emaSeries(bars, 21),
     ema26: emaSeries(bars, 26),
-    rsi: rsiSeries(bars),
+    rsi,
     mid,
     sd,
     vol: emaSeries(
@@ -384,6 +518,49 @@ export function signalAt(ind: Indication, bars: Bar[], s: Series, i: number): Si
           impulse > 0.12 && s.rsi[i]! > 50 && s.rsi[i]! < 75) return 1;
       if (trend < -0.12 * a && fast < previous && b.h >= fast && b.c < fast &&
           impulse < -0.12 && s.rsi[i]! < 50 && s.rsi[i]! > 25) return -1;
+      return 0;
+    }
+    case "donchian": {
+      // Breakout of the prior 20-bar range while ADX shows a trend; fires on the first close outside the range.
+      const [hi, lo] = priorRange(bars, i, 20);
+      const [prevHi, prevLo] = priorRange(bars, i - 1, 20);
+      if (s.adx[i]! < 18) return 0;
+      if (b.c > hi && bars[i - 1]!.c <= prevHi) return 1;
+      if (b.c < lo && bars[i - 1]!.c >= prevLo) return -1;
+      return 0;
+    }
+    case "supertrend": {
+      const now = s.st[i];
+      const prev = s.st[i - 1];
+      if (now === 1 && prev === -1) return 1;
+      if (now === -1 && prev === 1) return -1;
+      return 0;
+    }
+    case "vwapReclaim": {
+      // Close crosses the rolling VWAP while Stochastic RSI turns in the same direction.
+      const prev = bars[i - 1]!;
+      const vwap = s.vwap[i]!;
+      const vwapPrev = s.vwap[i - 1]!;
+      const k = s.stoch[i]!;
+      const kPrev = s.stoch[i - 1]!;
+      if (prev.c <= vwapPrev && b.c > vwap && k > 20 && k > kPrev) return 1;
+      if (prev.c >= vwapPrev && b.c < vwap && k < 80 && k < kPrev) return -1;
+      return 0;
+    }
+    case "adxDi": {
+      // Directional line cross, accepted only when ADX confirms a trend.
+      if (s.adx[i]! < 20) return 0;
+      const now = s.pdi[i]! - s.mdi[i]!;
+      const prior = s.pdi[i - 1]! - s.mdi[i - 1]!;
+      if (prior <= 0 && now > 0) return 1;
+      if (prior >= 0 && now < 0) return -1;
+      return 0;
+    }
+    case "stochRsi": {
+      const k = s.stoch[i]!;
+      const kPrev = s.stoch[i - 1]!;
+      if (kPrev < 20 && k >= 20) return 1;
+      if (kPrev > 80 && k <= 80) return -1;
       return 0;
     }
     case "rsiRecovery": {
@@ -487,6 +664,16 @@ export function signalAt(ind: Indication, bars: Bar[], s: Series, i: number): Si
   }
 }
 
+function priorRange(bars: Bar[], i: number, n: number): [number, number] {
+  let hi = -Infinity;
+  let lo = Infinity;
+  for (let k = Math.max(0, i - n); k < i; k++) {
+    hi = Math.max(hi, bars[k]!.h);
+    lo = Math.min(lo, bars[k]!.l);
+  }
+  return [hi, lo];
+}
+
 export type IndicationRow = {
   name: Indication;
   side: Side | 0;
@@ -529,6 +716,16 @@ export function indicationBoard(bars: Bar[]): IndicationRow[] {
                       ? `EMA9 / EMA21 ${(series.ema9[i]! / series.ema21[i]!).toFixed(3)}`
                       : name === "rangeFade"
                         ? `Band deviation ${z.toFixed(2)} · RSI ${series.rsi[i]!.toFixed(1)}`
+                        : name === "donchian"
+                          ? `ADX ${series.adx[i]!.toFixed(1)} · 20-bar range`
+                        : name === "supertrend"
+                          ? `Supertrend ${series.st[i] === 1 ? "up" : "down"}`
+                        : name === "vwapReclaim"
+                          ? `Close vs VWAP ${((b.c / (series.vwap[i] || b.c) - 1) * 100).toFixed(3)}% · StochRSI ${series.stoch[i]!.toFixed(1)}`
+                        : name === "adxDi"
+                          ? `ADX ${series.adx[i]!.toFixed(1)} · +DI ${series.pdi[i]!.toFixed(1)} / -DI ${series.mdi[i]!.toFixed(1)}`
+                        : name === "stochRsi"
+                          ? `StochRSI ${series.stoch[i]!.toFixed(1)}`
                         : name === "volumeBreak" || name === "squeezeBreak"
                           ? `Volume ${b.v.toFixed(2)} · range and volatility filter`
                           : name === "momentumPullback" || name === "rsiRecovery"
@@ -1306,6 +1503,8 @@ export type ReplayOpts = {
   selectedOnly?: boolean;
   reselectHours?: number;
   independentIndications?: boolean;
+  // Replays one bracket on every market without prehistory selection; isolates the signal and exits.
+  fixed?: { indication: Indication; tpAtr: number; slOfTp: number; coordination?: Coordination };
 };
 
 function hourAccumulator(t: number): HourAcc {
@@ -1451,6 +1650,7 @@ function replayWindow(
   interval: CandleInterval,
   gate?: ReplayGate,
   gateAtBar?: boolean[],
+  ledger?: TradeLeg[],
 ) {
   let leg: OpenLeg | null = null;
   let priorMark = 0;
@@ -1500,6 +1700,15 @@ function replayWindow(
       const hit = exitOnBar(leg.side, leg.tp, leg.sl, bar, ++leg.hold, maxHold);
       if (hit || offset === slots.length - 1) {
         const pnl = closePnl(leg.side, leg.entry, hit?.exit ?? bar.c, leg.qty, cost);
+        ledger?.push({
+          t: bar.t,
+          side: leg.side,
+          entry: leg.entry,
+          exit: hit?.exit ?? bar.c,
+          pnl,
+          reason: hit?.reason ?? "end",
+          hold: leg.hold,
+        });
         earlierPnl = priorPnl;
         priorPnl = pnl;
         if (leg.active !== false) {
@@ -1676,6 +1885,31 @@ function managedHoldout(
   return states.map((state) => state.rows);
 }
 
+// Replays one configuration over closed bars and returns every trade, for loss analysis.
+export function traceTrades(
+  bars: Bar[],
+  indication: Indication,
+  tpAtr: number,
+  slOfTp: number,
+  coordination: Coordination = "fixed",
+  interval: CandleInterval = "1h",
+  trailRules?: StrategySettings,
+  gate?: (index: number, side: Side) => boolean,
+): TradeLeg[] {
+  const series = buildSeries(bars);
+  const signals = bars.map((_, i) => {
+    const side = signalAt(indication, bars, series, i);
+    return side && gate && !gate(i, side) ? 0 : side;
+  });
+  const slots = bars.slice(WARMUP).map((b) => hourAccumulator(b.t));
+  const ledger: TradeLeg[] = [];
+  replayWindow(
+    bars, series.atr, signals, WARMUP, slots, positionNotional(10_000), POSITION_RT_COST_PCT,
+    tpAtr, slOfTp, true, coordination, false, trailRules, interval, undefined, undefined, ledger,
+  );
+  return ledger;
+}
+
 export function simulateSessions(
   books: { symbol: string; bars: Bar[] }[],
   equity: number,
@@ -1744,8 +1978,16 @@ export function simulateSessions(
     : coordinated
       ? coordinatedConfigs(opts?.trailing !== false, preferences, step)
       : EXECUTION_CONFIGS;
-  const configs =
-    opts?.indication || opts?.range
+  const fixed = opts?.fixed;
+  const configs = fixed
+    ? availableConfigs.filter(
+        (config) =>
+          config.indication === fixed.indication &&
+          config.tpAtr === fixed.tpAtr &&
+          config.slOfTp === fixed.slOfTp &&
+          config.coordination === (fixed.coordination ?? "fixed"),
+      )
+    : opts?.indication || opts?.range
       ? availableConfigs.filter(
           (config) =>
             (!opts?.indication || config.indication === opts.indication) &&
@@ -1877,11 +2119,12 @@ export function simulateSessions(
         quality.recentSamples < Math.max(3, Math.ceil(minSamples / 2)) ||
         (quality.recentNet > 0 && quality.recentPf >= Math.max(minPf, 1));
       const pass =
-        config.liveFloor &&
-        quality.n >= minSamples &&
-        quality.net > 0 &&
-        quality.pf >= threshold &&
-        followThrough;
+        fixed !== undefined ||
+        (config.liveFloor &&
+          quality.n >= minSamples &&
+          quality.net > 0 &&
+          quality.pf >= threshold &&
+          followThrough);
       if (quality.n > 0) cov.withCloses++;
       if (quality.n >= minSamples) {
         cov.reachedSamples++;

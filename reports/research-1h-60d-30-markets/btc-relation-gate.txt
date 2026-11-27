@@ -1,0 +1,9 @@
+stochRsi    tp4    sl1.5   breakeven ungated : research PF 1.58 n 1037 | TEST PF 1.46 n 244   BTC-gated: research PF 0.56 n 679 | TEST PF 3.96 n 201
+stochRsi    tp4    sl1.5   dynamic   ungated : research PF 1.48 n 1107 | TEST PF 1.45 n 253   BTC-gated: research PF 0.56 n 694 | TEST PF 3.94 n 203
+stochRsi    tp4    sl1     dynamic   ungated : research PF 1.33 n 1192 | TEST PF 1.43 n 273   BTC-gated: research PF 0.61 n 713 | TEST PF 3.89 n 204
+bollinger   tp4    sl1.5   breakeven ungated : research PF 1.38 n 841 | TEST PF 0.90 n 206   BTC-gated: research PF 0.80 n 426 | TEST PF 4.82 n 72
+bollinger   tp3    sl1.5   fixed     ungated : research PF 1.32 n 915 | TEST PF 1.00 n 226   BTC-gated: research PF 0.86 n 434 | TEST PF 4.61 n 72
+rangeFade   tp3    sl1     fixed     ungated : research PF 1.27 n 863 | TEST PF 0.94 n 189   BTC-gated: research PF 1.12 n 471 | TEST PF 4.47 n 101
+ema         tp3    sl1.5   dynamic   ungated : research PF 1.34 n 932 | TEST PF 0.86 n 210   BTC-gated: research PF 0.96 n 632 | TEST PF 2.48 n 171
+adxDi       tp4    sl1.5   dynamic   ungated : research PF 1.16 n 456 | TEST PF 0.32 n 79   BTC-gated: research PF 1.31 n 231 | TEST PF 6.31 n 43
+vwapReclaim tp2.5  sl1.5   breakeven ungated : research PF 1.27 n 846 | TEST PF 0.58 n 203   BTC-gated: research PF 0.92 n 544 | TEST PF 2.83 n 154

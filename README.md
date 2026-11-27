@@ -84,6 +84,19 @@ node scripts/cts-h.ts replay --connection bingx-x01 \
 
 Use `npm run --silent desk -- replay …` when you need JSON on stdout, because `npm run` otherwise prints its own header.
 
+### Walk-forward research
+
+`scripts/cts-h-research.ts` runs an indication-by-range sweep and a trade-level loss analysis on four research windows, and reports a fifth window as the test. `scripts/cts-h-fixed.ts` replays one bracket on every market without prehistory selection. Results, the BTC relation experiment and the conclusions are in [reports/research-1h-60d-30-markets](reports/research-1h-60d-30-markets/README.md).
+
+Indications added in this round are `donchian`, `supertrend`, `vwapReclaim`, `adxDi` and `stochRsi`. Coordinated replays can also use longer 2.5–4 ATR targets with `"extendedTargets": true` in a `--strategy-settings` file. Signals are causal: a test checks that truncating later bars never changes an earlier signal.
+
+```sh
+node scripts/cts-h.ts replay --connection bingx-x01 --symbols <30 markets> \
+  --history-hours 1440 --hours 120 --pre-hours 72 --interval 1h --capture capture-1440.json
+node scripts/cts-h-research.ts capture-1440.json <outDir>
+node scripts/cts-h-fixed.ts capture-1440.json
+```
+
 ### Configuration selection
 
 The default **coordinated** profile qualifies each enabled indication, bracket and stop mode independently. It ranks eligible candidates by profitable periods and uses realized P&L to break ties. It adds EMA pullback and range fade. The **filtered** profile adds 0.8–2.0 ATR targets with 0.5–1.5× stop-to-target ratios to the execution-eligible short grid. The **baseline** preserves the original grid. Filtered and coordinated sizing cap modeled stop risk plus costs at 0.8% of planned position notional. Coordinated sizing reduces entry size after two consecutive losses.
