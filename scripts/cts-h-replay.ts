@@ -21,7 +21,7 @@ import {
   type SessionReport,
 } from "../src/lib/desk/process.ts";
 import {
-  DEFAULT_STRATEGIES,
+  defaultForInterval,
   STRATEGY_LABELS,
   STRATEGY_TYPES,
   type StrategySettings,
@@ -98,7 +98,9 @@ export async function captureReplay(
 }
 
 const SIZES: ReplaySize[] = ["base", "axis", "block", "both"];
-type ReplayScope = Pick<ReplayOpts, "preHours" | "indication" | "range" | "trailing">;
+type ReplayScope = Pick<
+  ReplayOpts, "preHours" | "indication" | "range" | "trailing" | "selectedOnly" | "reselectHours" | "independentIndications"
+>;
 const fingerprints = new WeakMap<Capture, Map<number, string>>();
 
 export function replayCosts(capture: Capture, slipBps: number) {
@@ -124,9 +126,10 @@ export function runReplay(
   hours: number,
   slipBps: number,
   profile: ReplayProfile = "filtered",
-  strategies: StrategySettings = DEFAULT_STRATEGIES,
+  preferences?: StrategySettings,
   scope: ReplayScope = {},
 ) {
+  const strategies = preferences ?? defaultForInterval(capture.interval ?? "1h");
   const { costs, feesEstimated } = replayCosts(capture, slipBps);
   const began = performance.now();
   const report = simulateSessions(capture.books, BOOK, DEFAULT_FLOORS, {
@@ -362,17 +365,26 @@ export function renderReplay(runs: ReplayRun[], introduction = ""): string {
       const actions = STRATEGY_TYPES.filter((kind) => run.strategies.includes(kind))
         .map((kind) => `${STRATEGY_LABELS[kind]} ${raw.strategyActions[kind]}`)
         .join(" · ");
+      const independent = Object.entries(raw.indicationSummaries ?? {})
+        .map(([name, result]) => row([
+          name, result.selected, result.samples, pf(result.grossProfit, result.grossLoss),
+          result.net, result.drawdown,
+          `${result.green}/${result.bookLive.length}`,
+        ]))
+        .join("");
       return `<section><details><summary>${esc(run.connection)} · ${esc(run.interval)} · ${esc(profileName(run))} · ${iso(run.end)}</summary>
       <p>${esc(run.origin)} · ${raw.symbols}/${run.requested} symbols with complete coverage · ${raw.proven} configurations cleared preselection · ${raw.selected.length} selected for replay</p>
       <p>${fmt(raw.evaluatedConfigs)} market configurations scored. ${raw.rejectedPf === undefined ? "" : `${fmt(raw.rejectedPf)} failed preselection. `}${raw.disabledConfigs} market-specific configurations excluded by the published calibration.</p>
       <p>Pre window starts ${iso(run.end - (run.hours + run.preHours) * HOUR_MS)}. Replay starts ${iso(run.end - run.hours * HOUR_MS)} and ends ${iso(run.end)}.</p>
       <p>Replay calculation ${fmt(run.replayMs)} ms. Fill win rate ${base.samples ? fmt((base.wins * 100) / base.samples) + "%" : "—"}.</p>
+      <p>${esc(raw.note)}</p>
       ${run.strategySettings ? `<p>Volume ${fmt(run.strategySettings.volumeFactor)}× · ${actions ? "Strategy actions " + esc(actions) : "No strategy sizing overlays"}. ${run.indication ? esc(run.indication) + " indication." : ""} ${run.range ? esc(run.range) + " target grid." : ""}</p>` : ""}
       ${raw.unavailable.length ? `<p>Missing contiguous data for ${esc(raw.unavailable.join(", "))}.</p>` : ""}
       ${run.feesEstimated.length ? `<p>Fee fallback applied to ${esc(run.feesEstimated.join(", "))}.</p>` : ""}
       <h3>Holdout P&amp;L</h3><div class="chart" role="img" aria-label="Net profit and loss per reporting period">${bars}</div>
       ${table(["UTC period", "Closes", "Wins", "Losses", "Realized", "MTM change", "Net", "Trade PF", "Open"], hourly)}
-      <h3>Frozen selections</h3>
+      ${independent ? `<h3>Independent indications</h3><p>Each indication selects its own qualifying configuration per market and period. These portfolios overlap and are not additive.</p>${table(["Indication", "Selections", "Closes", "PF", "Net", "Drawdown", "Positive hours"], independent)}` : ""}
+      <h3>Selections by period</h3>
       ${table(["Symbol and configuration", "Costs", "Pre closes", "Pre PF", "Required PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD"], selected)}
       <p class="hash">Capture and cost SHA-256 ${run.evidence}</p></details></section>`;
     })
@@ -391,8 +403,8 @@ export function renderReplay(runs: ReplayRun[], introduction = ""): string {
   ${introduction}
   ${comparisons ? `<section><h2>Matched holdouts</h2>${table(["End", "Connection", "Candles", "Reference", "Trial", "Symbols", "Reference PF", "Trial PF", "Reference net", "Trial net", "Reference closes", "Trial closes", "Reference drawdown", "Trial drawdown", "Reference green", "Trial green"], comparisons)}</section>` : ""}
   <section><h2>Holdout results by profile</h2>${table(["End", "Connection", "Candles", "Profile", "Sizing", "Scale", "Pre closes", "Pre PF", "Pre net", "Replay closes", "Replay PF", "Replay net", "Replay DD", "Green periods"], variants)}
-  <p>The baseline uses the original short grid. The filtered profile adds 0.8–2.0 ATR targets and the calibrated 1h exclusions. The coordinated profile adds two indications, independently qualifies fixed, ATR-trailing and break-even exits, and ranks qualified candidates by positive periods. Modeled stop distance and costs are limited to 0.8% of planned notional per setup in the filtered and coordinated profiles. Legacy Axis and Block multipliers preserve the reference trade sequence. Coordinated overlays execute their own sizing and add rules.</p>
-  <p>Each market advances one prequalified configuration into a flat-start holdout. Entries use the next candle open, ambiguous candles hit the stop first, managed stops update after the candle, and any remaining position closes at the boundary. Time exits use 24 candles. PF uses realized gains and losses after taker fees and ${runs[0]?.slipBps ?? 0} bp slippage per fill. P&amp;L and candle-equity drawdown are in settlement units. Positive periods use hourly equity on intervals up to 1h and four-hour equity on 4h candles. Funding, depth and liquidation are outside the model.</p></section>
+  <p>The baseline uses the original short grid. The filtered profile adds 0.8–2.0 ATR targets and the calibrated 1h exclusions. The coordinated profile qualifies enabled indications, fixed, ATR-trailing and break-even exits independently, and ranks qualified candidates by positive periods. Modeled stop distance and costs are limited to 0.8% of planned notional per setup in the filtered and coordinated profiles. Legacy Axis and Block multipliers preserve the reference trade sequence. Coordinated overlays execute their own sizing and add rules.</p>
+  <p>Each market advances one prequalified configuration into a flat-start holdout. Entries use the next candle open, ambiguous candles hit the stop first, managed stops update after the candle, and any remaining position closes at a session boundary. Coordinated 1m, 5m and 15m sessions use their configured hold time; other profiles and intervals use 24 candles. PF uses realized gains and losses after taker fees and ${runs[0]?.slipBps ?? 0} bp slippage per fill. P&amp;L and candle-equity drawdown are in settlement units. Positive periods use hourly equity on intervals up to 1h and four-hour equity on 4h candles. Funding, depth and liquidation are outside the model.</p></section>
   <section><h2>Exclusion evidence</h2>
   <p>Historical calibration cutoffs ${CALIBRATION_CUTOFFS.map(iso).join(" · ")}.</p>
   <p>Each exclusion applies to one connection, symbol, indication and bracket. It required at least 24 closes, at least three losing periods with six or more closes each, zero adequately sampled winning periods and pooled PF no greater than 0.80. Alternate grid configurations share market data and their fills can be correlated.</p>

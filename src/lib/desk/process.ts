@@ -38,12 +38,13 @@ import {
   COORDINATIONS,
   protectiveStop,
   sizeAfterLosses,
+  targetDistance,
   type Coordination,
   type TrailRules,
 } from "./management.ts";
 
 import {
-  DEFAULT_STRATEGIES,
+  defaultForInterval,
   STRATEGY_TYPES,
   RelationLedger,
   adjustPosition,
@@ -74,6 +75,7 @@ export type Cell = {
   id: string;
   symbol: string;
   indication: Indication;
+  interval?: CandleInterval;
   tpAtr: number;
   slOfTp: number;
   liveFloor: boolean;
@@ -103,6 +105,7 @@ type OpenLeg = {
   hold: number;
   favorable?: number;
   plan?: ScalePlan;
+  active?: boolean;
 };
 
 export type LivePos = {
@@ -124,6 +127,8 @@ export type LivePos = {
   plan?: ScalePlan;
   sizing?: { axis: boolean; relate: boolean };
   realized?: number;
+  interval?: CandleInterval;
+  maxHoldBars?: number;
   hold: number;
   dca: number;
   openedAt: number;
@@ -204,7 +209,19 @@ const COORDINATED_CONFIGS = [
   COORDINATIONS.map((mode) => settings(indication, tpAtr, slOfTp, true, mode)),
 );
 
-function coordinatedConfigs(trailing: boolean, preferences?: StrategySettings) {
+const MICRO_EXTRA_CONFIGS = INDICATIONS.flatMap((indication) =>
+  [2.5, 3, 4, 6].flatMap((tpAtr) =>
+    WIDE_SL_OF_TP.flatMap((slOfTp) =>
+      COORDINATIONS.map((mode) => settings(indication, tpAtr, slOfTp, true, mode)),
+    ),
+  ),
+);
+
+function coordinatedConfigs(trailing: boolean, preferences?: StrategySettings, step = REPLAY_HOUR) {
+  const candidates =
+    step <= 15 * 60_000 && preferences?.microExtended
+      ? [...COORDINATED_CONFIGS, ...MICRO_EXTRA_CONFIGS]
+      : COORDINATED_CONFIGS;
   if (
     trailing &&
     (!preferences ||
@@ -214,8 +231,8 @@ function coordinatedConfigs(trailing: boolean, preferences?: StrategySettings) {
         preferences.wideRange &&
         preferences.enabledIndications.length === INDICATIONS.length))
   )
-    return COORDINATED_CONFIGS;
-  return COORDINATED_CONFIGS.filter(
+    return candidates;
+  return candidates.filter(
     ({ coordination }) =>
       coordination === "fixed" || (trailing && preferences?.[coordination] === true),
   ).filter(
@@ -337,6 +354,45 @@ export function signalAt(ind: Indication, bars: Bar[], s: Series, i: number): Si
   const a = Math.max(s.atr[i] ?? 0, b.c * 0.0004);
   const impulse = (b.c - b.o) / a;
   switch (ind) {
+    case "volumeBreak":
+    case "squeezeBreak": {
+      let high = -Infinity;
+      let low = Infinity;
+      for (let k = i - 8; k < i; k++) {
+        high = Math.max(high, bars[k]!.h);
+        low = Math.min(low, bars[k]!.l);
+      }
+      const priorVolume = s.vol[i - 1] ?? 0;
+      if (!(priorVolume > 0)) return 0;
+      if (ind === "volumeBreak") {
+        if (b.v < 1.25 * priorVolume) return 0;
+        if (b.c > high && s.ema9[i]! > s.ema21[i]! && impulse > 0.15) return 1;
+        if (b.c < low && s.ema9[i]! < s.ema21[i]! && impulse < -0.15) return -1;
+      } else {
+        if (high - low > 4 * a || b.v < 0.8 * priorVolume) return 0;
+        if (b.c > high && impulse > 0.2) return 1;
+        if (b.c < low && impulse < -0.2) return -1;
+      }
+      return 0;
+    }
+    case "momentumPullback": {
+      const fast = s.ema9[i]!;
+      const slow = s.ema21[i]!;
+      const previous = s.ema9[i - 1]!;
+      const trend = fast - slow;
+      if (trend > 0.12 * a && fast > previous && b.l <= fast && b.c > fast &&
+          impulse > 0.12 && s.rsi[i]! > 50 && s.rsi[i]! < 75) return 1;
+      if (trend < -0.12 * a && fast < previous && b.h >= fast && b.c < fast &&
+          impulse < -0.12 && s.rsi[i]! < 50 && s.rsi[i]! > 25) return -1;
+      return 0;
+    }
+    case "rsiRecovery": {
+      const previous = s.rsi[i - 1]!;
+      const current = s.rsi[i]!;
+      if (previous < 45 && current >= 45 && s.ema9[i]! > s.ema21[i]!) return 1;
+      if (previous > 55 && current <= 55 && s.ema9[i]! < s.ema21[i]!) return -1;
+      return 0;
+    }
     case "pullback": {
       const prev = bars[i - 1]!;
       const fast = s.ema9[i]!;
@@ -473,6 +529,10 @@ export function indicationBoard(bars: Bar[]): IndicationRow[] {
                       ? `EMA9 / EMA21 ${(series.ema9[i]! / series.ema21[i]!).toFixed(3)}`
                       : name === "rangeFade"
                         ? `Band deviation ${z.toFixed(2)} · RSI ${series.rsi[i]!.toFixed(1)}`
+                        : name === "volumeBreak" || name === "squeezeBreak"
+                          ? `Volume ${b.v.toFixed(2)} · range and volatility filter`
+                          : name === "momentumPullback" || name === "rsiRecovery"
+                            ? `RSI ${series.rsi[i]!.toFixed(1)} · EMA trend`
                         : `vol ${b.v.toFixed(2)} vs ema ${series.vol[i]!.toFixed(2)}`;
     return { name, side, detail };
   });
@@ -555,12 +615,17 @@ export function gateCell(cell: Cell, floors: Floors, settings?: PfSettings) {
     !cell.validExec && cell.lastN.length - suspension >= LASTN.minSamples && suspensionNet < 0;
 }
 
-function blankCell(symbol: string, config: (typeof STRATEGY_CONFIGS)[number]): Cell {
+function blankCell(
+  symbol: string,
+  config: (typeof STRATEGY_CONFIGS)[number],
+  interval: CandleInterval = "1h",
+): Cell {
   const { key, indication, tpAtr, slOfTp, liveFloor, coordination } = config;
   return {
-    id: `${symbol}|${key}`,
+    id: `${interval === "1h" ? "" : `${interval}|`}${symbol}|${key}`,
     symbol,
     indication,
+    interval,
     tpAtr,
     slOfTp,
     liveFloor,
@@ -586,10 +651,11 @@ export function exitOnBar(
   sl: number,
   bar: Bar,
   hold: number,
+  maxHold = MAX_HOLD,
 ): { exit: number; reason: "tp" | "sl" | "time" } | null {
   const hitTp = side > 0 ? bar.h >= tp : bar.l <= tp;
   const hitSl = side > 0 ? bar.l <= sl : bar.h >= sl;
-  if (!(hitTp || hitSl || hold >= MAX_HOLD)) return null;
+  if (!(hitTp || hitSl || hold >= maxHold)) return null;
   // OHLC does not establish which trigger traded first. Use the adverse fill.
   if (hitSl) return { exit: side > 0 ? Math.min(bar.o, sl) : Math.max(bar.o, sl), reason: "sl" };
   if (hitTp) return { exit: tp, reason: "tp" };
@@ -605,7 +671,8 @@ function advance(
   from: number,
   capped: boolean,
   coordinated: boolean,
-  trailRules: TrailRules | undefined,
+  trailRules: StrategySettings | undefined,
+  interval: CandleInterval,
   push: (fill: TapeFill) => void,
 ) {
   const start = Math.max(from, 22);
@@ -616,7 +683,8 @@ function advance(
       const side = sides[i] ?? 0;
       cell.cursorT = b.t;
       if (!side) continue;
-      const tpDist = cell.tpAtr * a;
+      const tpDist = targetDistance(cell.tpAtr, a, b.c, POSITION_RT_COST_PCT,
+        CANDLE_INTERVALS[interval] <= 15 * 60_000 ? trailRules?.microTargetCosts : 0);
       const slDist = cell.slOfTp * tpDist;
       const tp = b.c + side * tpDist;
       const sl = b.c - side * slDist;
@@ -639,7 +707,10 @@ function advance(
     }
     const leg = cell.leg;
     leg.hold += 1;
-    const hit = exitOnBar(leg.side, leg.tp, leg.sl, b, leg.hold);
+    const maxHold = CANDLE_INTERVALS[interval] <= 15 * 60_000 && trailRules
+      ? Math.ceil(trailRules.microHoldMinutes * 60_000 / CANDLE_INTERVALS[interval])
+      : MAX_HOLD;
+    const hit = exitOnBar(leg.side, leg.tp, leg.sl, b, leg.hold, maxHold);
     cell.cursorT = b.t;
     if (!hit) {
       if (coordinated)
@@ -700,15 +771,18 @@ export function syncBooks(
     coordinated: boolean;
     trailing: boolean;
     trailRules?: StrategySettings;
+    interval?: CandleInterval;
   },
 ): { cells: Cell[]; internFills: TapeFill[]; closes: number; valid: number; symbols: number } {
   const byId = new Map(prev.map((c) => [c.id, c]));
   const notional = positionNotional(equity);
+  const interval = options?.interval ?? "1h";
+  const step = CANDLE_INTERVALS[interval];
   const configs = !connection
     ? STRATEGY_CONFIGS
     : options?.coordinated !== true
       ? EXECUTION_CONFIGS
-      : coordinatedConfigs(options.trailing, options.trailRules);
+      : coordinatedConfigs(options.trailing, options.trailRules, step);
   const indications = options?.coordinated
     ? (options.trailRules?.enabledIndications ?? INDICATIONS)
     : LEGACY_INDICATIONS;
@@ -728,7 +802,7 @@ export function syncBooks(
     if (bars.length < 24) continue;
     symbols += 1;
     const lastT = bars.at(-1)!.t;
-    const excluded = excludedConfigurations(connection, lastT + REPLAY_HOUR);
+    const excluded = excludedConfigurations(step === REPLAY_HOUR ? connection : undefined, lastT + step);
     const series = buildSeries(bars);
     const sides = {} as Record<Indication, Array<Side | 0>>;
     for (const indication of indications) {
@@ -737,13 +811,14 @@ export function syncBooks(
       sides[indication] = row;
     }
     for (const config of configs) {
-      const id = `${book.symbol}|${config.key}`;
-      if (excluded.has(id)) continue;
+      const marketKey = `${book.symbol}|${config.key}`;
+      if (excluded.has(marketKey)) continue;
+      const id = `${interval === "1h" ? "" : `${interval}|`}${marketKey}`;
       const prior = byId.get(id);
       const cell =
         prior && prior.cursorT <= lastT
           ? { ...prior, lastN: prior.lastN.slice(), leg: prior.leg ? { ...prior.leg } : null }
-          : blankCell(book.symbol, config);
+          : blankCell(book.symbol, config, interval);
       const from = cell.cursorT ? indexAfter(bars, cell.cursorT) : WARMUP;
       const before = cell.n;
       advance(
@@ -756,6 +831,7 @@ export function syncBooks(
         Boolean(connection),
         options?.coordinated === true,
         options?.trailRules,
+        interval,
         push,
       );
       closes += cell.n - before;
@@ -788,6 +864,7 @@ export type SizeOpts = {
   evidence?: RelationLedger;
   actions?: StrategyActions;
   limit?: number;
+  interval?: CandleInterval;
 };
 
 export function sizedNotional(base: number, opts: { block: boolean; axis: boolean }): number {
@@ -831,8 +908,10 @@ export function openFromPerforming(
     seen.add(key);
     symbols.add(c.symbol);
     const side = (c.signal ?? c.side) as Side;
-    const a = Math.max(m.atr, m.price * 0.0008);
-    const tpDist = c.tpAtr * a;
+    const a = Math.max(m.atr, m.price * 0.0004);
+    const interval = opts.interval ?? "1h";
+    const tpDist = targetDistance(c.tpAtr, a, m.price, POSITION_RT_COST_PCT,
+      CANDLE_INTERVALS[interval] <= 15 * 60_000 ? opts.strategies?.microTargetCosts : 0);
     const slDist = c.slOfTp * tpDist;
     const tp = m.price + side * tpDist;
     const sl = m.price - side * slDist;
@@ -845,7 +924,7 @@ export function openFromPerforming(
         });
     const exact = opts.evidence?.recent(`${c.id}|${side}`) ?? [];
     const related = opts.strategies
-      ? (opts.evidence?.recent(relationKey(opts.strategies.relateScope, c.symbol, side)) ?? [])
+      ? (opts.evidence?.recent(relationKey(opts.strategies.relateScope, c.symbol, side, interval)) ?? [])
       : [];
     const { qty, plan, sizing } = opts.strategies
       ? managedEntry(
@@ -890,6 +969,10 @@ export function openFromPerforming(
         : undefined,
       plan,
       sizing,
+      interval,
+      maxHoldBars: CANDLE_INTERVALS[interval] <= 15 * 60_000 && opts.strategies
+        ? Math.ceil(opts.strategies.microHoldMinutes * 60_000 / CANDLE_INTERVALS[interval])
+        : MAX_HOLD,
       hold: 0,
       dca: 0,
       openedAt: Date.now(),
@@ -938,8 +1021,9 @@ export function markPositions(
       continue;
     }
     const asOf = opts.asOf ?? 0;
+    const intervalMs = CANDLE_INTERVALS[p.interval ?? "1h"];
     const elapsed =
-      asOf > 0 ? Math.floor(asOf / 3_600_000) - Math.floor(p.openedAt / 3_600_000) : p.hold;
+      asOf > 0 ? Math.floor(asOf / intervalMs) - Math.floor(p.openedAt / intervalMs) : p.hold;
     const next: LivePos = {
       ...p,
       plan: p.plan ? { ...p.plan } : undefined,
@@ -957,7 +1041,8 @@ export function markPositions(
     const hitTp = next.side > 0 ? px >= next.tp : px <= next.tp;
     const hitSl = next.side > 0 ? px <= next.sl : px >= next.sl;
     if (hitSl) {
-      const exit = next.configId ? px : next.sl;
+      // A stop-market order can gap past its trigger; paper uses the observed quote.
+      const exit = px;
       closed.push({
         pos: next,
         pnl: closePnl(next.side, next.entry, exit, next.qty),
@@ -971,7 +1056,7 @@ export function markPositions(
         px: next.tp,
         reason: "tp",
       });
-    } else if (next.hold >= MAX_HOLD) {
+    } else if (next.hold >= (next.maxHoldBars ?? MAX_HOLD)) {
       closed.push({
         pos: next,
         pnl: closePnl(next.side, next.entry, px, next.qty),
@@ -1101,6 +1186,13 @@ export type HourPoint = {
 };
 
 type HourAcc = Omit<HourPoint, "net" | "pf">;
+type ReplayGate = { cell: Cell; floors: Floors; settings: StrategySettings };
+type EquityStats = { net: number; peak: number; trough: number; drawdown: number };
+type IndicationSummary = ReplaySummary & {
+  selected: number;
+  bookLive: HourPoint[];
+  equity: EquityStats;
+};
 
 type ReplaySummary = {
   net: number;
@@ -1129,6 +1221,7 @@ export type SessionReport = {
   disabledConfigs: number;
   rejectedPf: number;
   strategyActions: StrategyActions;
+  indicationSummaries?: Partial<Record<Indication, IndicationSummary>>;
   unavailable: string[];
   preNet: number;
   liveNet: number;
@@ -1148,6 +1241,7 @@ export type SessionReport = {
   bookNetLive: number;
   bookDrawdownPre: number;
   bookDrawdownLive: number;
+  bookEquityLive: EquityStats;
   greenBookPre: number;
   greenBookLive: number;
   bookNames: string[];
@@ -1184,6 +1278,9 @@ export type ReplayOpts = {
   onQualified?: (row: QualifiedReplay) => void;
   strategies?: StrategySettings;
   trailing?: boolean;
+  selectedOnly?: boolean;
+  reselectHours?: number;
+  independentIndications?: boolean;
 };
 
 function hourAccumulator(t: number): HourAcc {
@@ -1275,22 +1372,37 @@ function clockHours(rows: HourAcc[], step: number) {
   return seal(hourly);
 }
 
-function candleDrawdown(rows: HourAcc[]) {
+function candleEquity(rows: HourAcc[]): EquityStats {
   let equity = 0;
   let peak = 0;
+  let trough = 0;
   let drawdown = 0;
   for (const row of rows) {
     equity += row.realized + row.mtm;
     peak = Math.max(peak, equity);
+    trough = Math.min(trough, equity);
     drawdown = Math.max(drawdown, peak - equity);
   }
-  return drawdown;
+  return { net: equity, peak, trough, drawdown };
 }
 
 function summarizeCandles(rows: HourAcc[], step: number) {
   const summary = summarizeReplay(clockHours(rows, step));
-  if (step < REPLAY_HOUR) summary.drawdown = candleDrawdown(rows);
+  if (step < REPLAY_HOUR) summary.drawdown = candleEquity(rows).drawdown;
   return summary;
+}
+
+function replayGate(
+  symbol: string,
+  config: (typeof COORDINATED_CONFIGS)[number],
+  rows: readonly Pick<HourAcc, "trades" | "realized">[],
+  floors: Floors,
+  settings: StrategySettings,
+): ReplayGate {
+  const cell = blankCell(symbol, config);
+  for (const row of rows) if (row.trades) pushPnl(cell, row.realized);
+  gateCell(cell, floors, settings);
+  return { cell, floors, settings };
 }
 
 function replayWindow(
@@ -1306,7 +1418,10 @@ function replayWindow(
   capped: boolean,
   coordination: Coordination,
   throttle: boolean,
-  trailRules: TrailRules | undefined,
+  trailRules: StrategySettings | undefined,
+  interval: CandleInterval,
+  gate?: ReplayGate,
+  gateAtBar?: boolean[],
 ) {
   let leg: OpenLeg | null = null;
   let priorMark = 0;
@@ -1314,6 +1429,7 @@ function replayWindow(
   let earlierPnl: number | undefined;
   for (let offset = 0; offset < slots.length; offset++) {
     const row = slots[offset]!;
+    if (gateAtBar) gateAtBar[offset] = gate?.cell.validExec ?? true;
     const i = from + offset;
     const bar = bars[i]!;
     row.trades =
@@ -1327,7 +1443,8 @@ function replayWindow(
         0;
     const side = signals[i - 1];
     if (!leg && offset > 0 && side) {
-      const dist = tpAtr * Math.max(atr[i - 1] ?? 0, bar.o * 0.0004);
+      const dist = targetDistance(tpAtr, atr[i - 1] ?? 0, bar.o, cost,
+        CANDLE_INTERVALS[interval] <= 15 * 60_000 ? trailRules?.microTargetCosts : 0);
       const stopDistance = dist * slOfTp;
       const planned = throttle ? notional * sizeAfterLosses(earlierPnl, priorPnl) : notional;
       const tp = bar.o + side * dist;
@@ -1342,31 +1459,41 @@ function replayWindow(
             ? stopCappedQty(planned, bar.o, stopDistance, cost, throttle ? side : 0)
             : notional / bar.o,
           hold: 0,
+          active: gate?.cell.validExec ?? true,
         };
       }
     }
     if (leg) {
-      const hit = exitOnBar(leg.side, leg.tp, leg.sl, bar, ++leg.hold);
+      const maxHold = CANDLE_INTERVALS[interval] <= 15 * 60_000 && trailRules
+        ? Math.ceil(trailRules.microHoldMinutes * 60_000 / CANDLE_INTERVALS[interval])
+        : MAX_HOLD;
+      const hit = exitOnBar(leg.side, leg.tp, leg.sl, bar, ++leg.hold, maxHold);
       if (hit || offset === slots.length - 1) {
         const pnl = closePnl(leg.side, leg.entry, hit?.exit ?? bar.c, leg.qty, cost);
         earlierPnl = priorPnl;
         priorPnl = pnl;
-        row.trades = 1;
-        row.realized = pnl;
-        if (pnl > 0) {
-          row.wins = 1;
-          row.grossProfit = pnl;
+        if (leg.active !== false) {
+          row.trades = 1;
+          row.realized = pnl;
+          if (pnl > 0) {
+            row.wins = 1;
+            row.grossProfit = pnl;
+          }
+          if (pnl < 0) {
+            row.losses = 1;
+            row.grossLoss = -pnl;
+          }
         }
-        if (pnl < 0) {
-          row.losses = 1;
-          row.grossLoss = -pnl;
+        if (gate) {
+          pushPnl(gate.cell, pnl);
+          gateCell(gate.cell, gate.floors, gate.settings);
         }
         leg = null;
       } else {
         advanceProtection(leg, bar, coordination, cost, trailRules);
       }
     }
-    const mark = leg ? closePnl(leg.side, leg.entry, bar.c, leg.qty, cost) : 0;
+    const mark = leg && leg.active !== false ? closePnl(leg.side, leg.entry, bar.c, leg.qty, cost) : 0;
     row.mtm = mark - priorMark;
     row.openLegs = Number(Boolean(leg));
     priorMark = mark;
@@ -1427,6 +1554,7 @@ type ManagedReplayInput = {
   pre: HourAcc[];
   cost: number;
   slot: number;
+  gateAtBar?: boolean[];
 };
 
 function managedHoldout(
@@ -1436,11 +1564,12 @@ function managedHoldout(
   notional: number,
   strategy: StrategySettings,
   actions: StrategyActions,
+  interval: CandleInterval,
 ) {
   const ledger = new RelationLedger();
   const states = inputs.map((input) => ({
     input,
-    exact: `${input.symbol}|${input.config.key}`,
+    exact: `${interval === "1h" ? "" : `${interval}|`}${input.symbol}|${input.config.key}`,
     rows: Array.from({ length: hours }, (_, i) => hourAccumulator(input.bars[from + i]!.t)),
     closed: input.pre.filter((row) => row.trades > 0).map((row) => row.realized),
     leg: null as OpenLeg | null,
@@ -1461,17 +1590,18 @@ function managedHoldout(
       if (state.leg) {
         const adjustment = adjustPosition(state.leg, bar.o, cost, strategy.block, strategy.dca);
         if (adjustment) actions[adjustment]++;
-      } else if (offset > 0 && side) {
-        const targetDistance = config.tpAtr * Math.max(atr[i - 1] ?? 0, bar.o * 0.0004);
-        const tp = bar.o + side * targetDistance;
-        const sl = bar.o - side * targetDistance * config.slOfTp;
+      } else if (offset > 0 && side && (input.gateAtBar?.[offset] ?? true)) {
+        const distance = targetDistance(config.tpAtr, atr[i - 1] ?? 0, bar.o, cost,
+          CANDLE_INTERVALS[interval] <= 15 * 60_000 ? strategy.microTargetCosts : 0);
+        const tp = bar.o + side * distance;
+        const sl = bar.o - side * distance * config.slOfTp;
         if (tp > 0 && sl > 0) {
           const funded = notional * sizeAfterLosses(state.earlierPnl, state.priorPnl);
           const entry = managedEntry(
             { notional: funded, entry: bar.o, stop: sl, target: tp, cost },
             strategy,
             state.closed,
-            ledger.recent(relationKey(strategy.relateScope, symbol, side)),
+            ledger.recent(relationKey(strategy.relateScope, symbol, side, interval)),
             actions,
             ledger.recent(`${exact}|${side}`),
           );
@@ -1480,7 +1610,10 @@ function managedHoldout(
       }
       const leg = state.leg;
       if (leg) {
-        const hit = exitOnBar(leg.side, leg.tp, leg.sl, bar, ++leg.hold);
+        const maxHold = CANDLE_INTERVALS[interval] <= 15 * 60_000
+          ? Math.ceil(strategy.microHoldMinutes * 60_000 / CANDLE_INTERVALS[interval])
+          : MAX_HOLD;
+        const hit = exitOnBar(leg.side, leg.tp, leg.sl, bar, ++leg.hold, maxHold);
         if (hit || offset === hours - 1) {
           const pnl = closePnl(leg.side, leg.entry, hit?.exit ?? bar.c, leg.qty, cost);
           row.trades = 1;
@@ -1506,7 +1639,7 @@ function managedHoldout(
     }
     // A close within this candle can only influence orders in later candles.
     for (const close of settled)
-      recordRelationClose(ledger, close.exact, close.symbol, close.side, close.pnl);
+      recordRelationClose(ledger, close.exact, close.symbol, close.side, close.pnl, interval);
   }
   return states.map((state) => state.rows);
 }
@@ -1534,10 +1667,21 @@ export function simulateSessions(
     throw new Error(
       "Replay windows must align with the candle interval and span at most 336 hours.",
     );
+  const reselectHours = opts?.reselectHours ??
+    (opts?.profile === "coordinated"
+      ? (opts?.strategies ?? defaultForInterval(interval)).microReselectHours
+      : 0);
+  if (reselectHours !== 0) {
+    if (!Number.isInteger(reselectHours) || reselectHours < 1 || reselectHours > 336 ||
+        (reselectHours * REPLAY_HOUR) % step !== 0)
+      throw new Error("Reselection must be an aligned positive number of hours.");
+    if (hours > reselectHours)
+      return simulateReselected(books, equity, floors, { ...opts, interval, hours, preHours, reselectHours });
+  }
   const profile = opts?.profile ?? "filtered";
   const baseline = profile === "baseline";
   const coordinated = profile === "coordinated";
-  const saved = opts?.strategies ?? DEFAULT_STRATEGIES;
+  const saved = opts?.strategies ?? defaultForInterval(interval);
   const preferences = !coordinated
     ? undefined
     : opts?.indication || opts?.range
@@ -1566,7 +1710,7 @@ export function simulateSessions(
   const availableConfigs = baseline
     ? STRATEGY_CONFIGS
     : coordinated
-      ? coordinatedConfigs(opts?.trailing !== false, preferences)
+      ? coordinatedConfigs(opts?.trailing !== false, preferences, step)
       : EXECUTION_CONFIGS;
   const configs =
     opts?.indication || opts?.range
@@ -1579,6 +1723,8 @@ export function simulateSessions(
   const indications = new Set(configs.map((config) => config.indication));
   const strategies =
     preferences && STRATEGY_TYPES.some((type) => preferences[type]) ? preferences : null;
+  if (opts?.independentIndications && strategies)
+    throw new Error("Independent indication studies require strategy overlays to be disabled.");
   const qualification = preferences;
   const minSamples = qualification?.autoPf ? qualification.autoPfSamples : LASTN.minSamples;
   const recentGate = qualification?.autoPf && qualification.autoPfRecent;
@@ -1599,6 +1745,9 @@ export function simulateSessions(
   const bookLiveAcc = clock(replayFrom);
   const preWork = clock(WARMUP);
   const liveWork = clock(replayFrom);
+  const indicationBooks = opts?.independentIndications
+    ? new Map([...indications].map((name) => [name, { rows: clock(replayFrom), selected: 0 }]))
+    : undefined;
   const notional = positionNotional(equity) * (preferences?.volumeFactor ?? 1);
   const scale =
     notional > 0
@@ -1611,6 +1760,8 @@ export function simulateSessions(
   let proven = 0;
   let disabledConfigs = 0;
   let rejectedPf = 0;
+  const selectedOnly = opts?.selectedOnly === true && !opts.onQualified;
+  const onlineGate = Boolean(coordinated && step <= 15 * 60_000 && preferences?.microReplayGate);
   for (const { symbol, bars } of aligned) {
     const series = buildSeries(bars);
     const cost = opts?.costs?.[symbol] ?? POSITION_RT_COST_PCT;
@@ -1620,6 +1771,12 @@ export function simulateSessions(
     let bestGreen = -1;
     let selectedFloor = minPf;
     let winner: (typeof COORDINATED_CONFIGS)[number] | undefined;
+    const winners = new Map<Indication, {
+      config: (typeof COORDINATED_CONFIGS)[number];
+      green: number;
+      net: number;
+      pre: Pick<HourAcc, "trades" | "realized">[];
+    }>();
     let name = "";
     const signalsByIndication = new Map(
       [...indications].map((indication) => [
@@ -1648,6 +1805,7 @@ export function simulateSessions(
         config.coordination,
         coordinated,
         preferences,
+        interval,
       );
       const quality = rankPre(preWork, coordinated, recentGate);
       const threshold = requiredPf(minPf, quality.n, qualification);
@@ -1664,25 +1822,41 @@ export function simulateSessions(
       addHours(preAcc, preWork);
       if (config.liveFloor && !pass) rejectedPf++;
       if (!pass && !baseline) continue;
-      replayWindow(
-        bars,
-        series.atr,
-        signals,
-        replayFrom,
-        liveWork,
-        notional,
-        cost,
-        tpAtr,
-        slOfTp,
-        !baseline,
-        config.coordination,
-        coordinated,
-        preferences,
-      );
-      addHours(liveAcc, liveWork);
+      if (!selectedOnly) {
+        replayWindow(
+          bars,
+          series.atr,
+          signals,
+          replayFrom,
+          liveWork,
+          notional,
+          cost,
+          tpAtr,
+          slOfTp,
+          !baseline,
+          config.coordination,
+          coordinated,
+          preferences,
+          interval,
+          onlineGate && preferences ? replayGate(symbol, config, preWork, floors, preferences) : undefined,
+        );
+        addHours(liveAcc, liveWork);
+      }
       if (!pass) continue;
       proven++;
-      addHours(promotedAcc, liveWork);
+      if (indicationBooks) {
+        const prior = winners.get(indication);
+        let better = !prior;
+        if (prior)
+          better = coordinated && quality.green !== prior.green
+            ? quality.green > prior.green
+            : quality.net > prior.net;
+        if (better) winners.set(indication, {
+          config, green: quality.green, net: quality.net,
+          pre: onlineGate ? preWork.filter((row) => row.trades).map(({ trades, realized }) => ({ trades, realized })) : [],
+        });
+      }
+      if (!selectedOnly) addHours(promotedAcc, liveWork);
       if (opts?.onQualified) {
         const realized = rankPre(liveWork);
         opts.onQualified({
@@ -1704,10 +1878,26 @@ export function simulateSessions(
         winner = config;
         name = `${symbol} ${indication} ${comboId(tpAtr, slOfTp)}${coordinated ? ` ${config.coordination}` : ""}`;
         for (let i = 0; i < preLength; i++) Object.assign(bestPre[i]!, preWork[i]);
-        for (let i = 0; i < replayLength; i++) Object.assign(bestLive[i]!, liveWork[i]);
+        if (!selectedOnly)
+          for (let i = 0; i < replayLength; i++) Object.assign(bestLive[i]!, liveWork[i]);
       }
     }
     if (name) {
+      let gateAtBar: boolean[] | undefined;
+      if (winner && (selectedOnly || (onlineGate && strategies))) {
+        gateAtBar = onlineGate ? [] : undefined;
+        replayWindow(
+          bars, series.atr, signalsByIndication.get(winner.indication)!, replayFrom,
+          bestLive, notional, cost, winner.tpAtr, winner.slOfTp,
+          !baseline, winner.coordination, coordinated, preferences, interval,
+          onlineGate && preferences ? replayGate(symbol, winner, bestPre, floors, preferences) : undefined,
+          gateAtBar,
+        );
+        if (selectedOnly) {
+          addHours(liveAcc, bestLive);
+          addHours(promotedAcc, bestLive);
+        }
+      }
       addHours(bookPreAcc, bestPre, scale);
       const slot = selected.length;
       if (strategies && winner) {
@@ -1720,6 +1910,7 @@ export function simulateSessions(
           cost,
           pre: bestPre,
           slot,
+          gateAtBar,
         });
       } else addHours(bookLiveAcc, bestLive, scale);
       selected.push({
@@ -1730,6 +1921,19 @@ export function simulateSessions(
         replay: summarizeCandles(bestLive, step),
       });
     }
+    if (indicationBooks) {
+      for (const [indication, chosen] of winners) {
+        const book = indicationBooks.get(indication)!;
+        replayWindow(
+          bars, series.atr, signalsByIndication.get(indication)!, replayFrom, liveWork,
+          notional, cost, chosen.config.tpAtr, chosen.config.slOfTp,
+          !baseline, chosen.config.coordination, coordinated, preferences, interval,
+          onlineGate && preferences ? replayGate(symbol, chosen.config, chosen.pre, floors, preferences) : undefined,
+        );
+        addHours(book.rows, liveWork, scale);
+        book.selected++;
+      }
+    }
   }
   if (strategies && managed.length) {
     const rows = managedHoldout(
@@ -1739,6 +1943,7 @@ export function simulateSessions(
       notional,
       strategies,
       strategyActions,
+      interval,
     );
     for (const input of managed) {
       const tape = rows[input.slot]!;
@@ -1756,10 +1961,18 @@ export function simulateSessions(
   const c = summarizeReplay(promoted);
   const d = summarizeReplay(bookPre);
   const e = summarizeReplay(bookLive);
+  const indicationSummaries: SessionReport["indicationSummaries"] = indicationBooks
+    ? Object.fromEntries([...indicationBooks].map(([name, book]) => [name, {
+        ...summarizeCandles(book.rows, step),
+        selected: book.selected,
+        bookLive: clockHours(book.rows, step),
+        equity: candleEquity(book.rows),
+      }]))
+    : undefined;
   return {
     ready: aligned.length > 0,
     note: aligned.length
-      ? `The ${preHours}h pre-window selects one cell per symbol after PF qualification. The next ${hours}h start flat with those cells${coordinated ? "" : ` at ${size} size`}. Entries use the next open and ambiguous candles hit the stop first.`
+      ? `The ${preHours}h pre-window selects one cell per symbol after PF qualification. The next ${hours}h start flat with those cells${coordinated ? "" : ` at ${size} size`}. Entries use the next open and ambiguous candles hit the stop first.${selectedOnly ? " Portfolio outcomes cover selected cells." : ""}`
       : `Need ${span} contiguous closed BingX ${interval} candles for a ${hours}h replay.`,
     pre,
     live,
@@ -1774,6 +1987,7 @@ export function simulateSessions(
     disabledConfigs,
     rejectedPf,
     strategyActions,
+    indicationSummaries,
     unavailable,
     preNet: a.net,
     liveNet: b.net,
@@ -1791,11 +2005,125 @@ export function simulateSessions(
     bookLive,
     bookNetPre: d.net,
     bookNetLive: e.net,
-    bookDrawdownPre: step < REPLAY_HOUR ? candleDrawdown(bookPreAcc) : d.drawdown,
-    bookDrawdownLive: step < REPLAY_HOUR ? candleDrawdown(bookLiveAcc) : e.drawdown,
+    bookDrawdownPre: step < REPLAY_HOUR ? candleEquity(bookPreAcc).drawdown : d.drawdown,
+    bookDrawdownLive: step < REPLAY_HOUR ? candleEquity(bookLiveAcc).drawdown : e.drawdown,
+    bookEquityLive: candleEquity(bookLiveAcc),
     greenBookPre: d.green,
     greenBookLive: e.green,
     bookNames: selected.map((r) => r.name),
+    selected,
+  };
+}
+
+function simulateReselected(
+  books: { symbol: string; bars: Bar[] }[],
+  equity: number,
+  floors: Floors,
+  opts: ReplayOpts & { interval: CandleInterval; hours: number; preHours: number },
+): SessionReport {
+  const step = CANDLE_INTERVALS[opts.interval];
+  const latest = Math.max(0, ...books.map((book) => lastClosedBar(book.bars)?.t ?? 0));
+  const end = opts.end ?? latest + step;
+  const duration = opts.reselectHours! * REPLAY_HOUR;
+  const reports: SessionReport[] = [];
+  for (let start = end - opts.hours * REPLAY_HOUR; start < end; start += duration) {
+    const until = Math.min(end, start + duration);
+    reports.push(simulateSessions(books, equity, floors, {
+      ...opts,
+      end: until,
+      hours: (until - start) / REPLAY_HOUR,
+      reselectHours: 0,
+    }));
+  }
+  const first = reports[0]!;
+  const joined = (select: (report: SessionReport) => HourPoint[]) =>
+    reports.flatMap(select);
+  const live = joined((report) => report.live);
+  const promoted = joined((report) => report.promoted);
+  const bookLive = joined((report) => report.bookLive);
+  const b = summarizeReplay(live);
+  const c = summarizeReplay(promoted);
+  const d = summarizeReplay(bookLive);
+  const totals = newStrategyActions();
+  let position = 0;
+  let peak = 0;
+  let trough = 0;
+  let drawdown = 0;
+  for (const report of reports) {
+    for (const kind of STRATEGY_TYPES) totals[kind] += report.strategyActions[kind];
+    const path = report.bookEquityLive;
+    drawdown = Math.max(drawdown, path.drawdown, peak - (position + path.trough));
+    peak = Math.max(peak, position + path.peak);
+    trough = Math.min(trough, position + path.trough);
+    position += path.net;
+  }
+  const selected = reports.flatMap((report) =>
+    report.selected.map((row) => ({
+      ...row,
+      name: `${new Date(report.bookLive[0]?.t ?? end).toISOString().slice(0, 10)} · ${row.name}`,
+    })),
+  );
+  const missing = [...new Set(reports.flatMap((report) => report.unavailable))];
+  const sum = (key: "proven" | "evaluatedConfigs" | "disabledConfigs" | "rejectedPf") =>
+    reports.reduce((total, report) => total + report[key], 0);
+  const indicationSummaries: SessionReport["indicationSummaries"] = opts.independentIndications
+    ? Object.fromEntries([...new Set(reports.flatMap((report) =>
+        Object.keys(report.indicationSummaries ?? {}) as Indication[],
+      ))].map((indication) => {
+        const parts = reports.flatMap((report) => {
+          const part = report.indicationSummaries?.[indication];
+          return part ? [part] : [];
+        });
+        const rows = parts.flatMap((part) => part.bookLive);
+        let net = 0;
+        let top = 0;
+        let bottom = 0;
+        let maxDrawdown = 0;
+        for (const part of parts) {
+          const path = part.equity;
+          maxDrawdown = Math.max(maxDrawdown, path.drawdown, top - (net + path.trough));
+          top = Math.max(top, net + path.peak);
+          bottom = Math.min(bottom, net + path.trough);
+          net += path.net;
+        }
+        return [indication, {
+          ...summarizeReplay(rows),
+          drawdown: maxDrawdown,
+          selected: parts.reduce((total, part) => total + part.selected, 0),
+          bookLive: rows,
+          equity: { net, peak: top, trough: bottom, drawdown: maxDrawdown },
+        }];
+      }))
+    : undefined;
+  return {
+    ...first,
+    ready: reports.every((report) => report.ready),
+    note: `Each ${opts.reselectHours}h period selects configurations from the preceding ${opts.preHours}h. Positions are flattened at each period boundary.`,
+    replayHours: opts.hours,
+    symbols: Math.min(...reports.map((report) => report.symbols)),
+    unavailable: missing,
+    proven: sum("proven"),
+    evaluatedConfigs: sum("evaluatedConfigs"),
+    disabledConfigs: sum("disabledConfigs"),
+    rejectedPf: sum("rejectedPf"),
+    strategyActions: totals,
+    indicationSummaries,
+    live,
+    promoted,
+    liveNet: b.net,
+    promotedNet: c.net,
+    greenLive: b.green,
+    greenPromoted: c.green,
+    livePf: b.pf,
+    promotedPf: c.pf,
+    samplesLive: b.samples,
+    samplesPromoted: c.samples,
+    bookLive,
+    bookNetLive: d.net,
+    bookDrawdownLive: drawdown,
+    bookEquityLive: { net: position, peak, trough, drawdown },
+    greenBookLive: d.green,
+    bookNames: selected.map((row) => row.name),
     selected,
   };
 }

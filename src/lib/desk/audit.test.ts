@@ -75,7 +75,7 @@ test("denying new entries still fills a resting stop", () => {
   useDesk.getState().ingest([book(97)], Date.now());
   const s = useDesk.getState();
   assert.equal(s.positions.length, 0);
-  assert.equal(s.liveFills[0]?.px, 99);
+  assert.equal(s.liveFills[0]?.px, 97);
 });
 
 test("protect off drops in-scope control orders immediately", () => {

@@ -32,6 +32,7 @@ import { CANDLE_INTERVALS, HOUR_MS, isCandleInterval } from "../src/lib/desk/int
 import { REPLAY_WARMUP_BARS } from "../src/lib/desk/process.ts";
 import {
   STRATEGY_TYPES,
+  defaultForInterval,
   normalizeStrategies,
   type StrategySettings,
 } from "../src/lib/desk/strategies.ts";
@@ -43,7 +44,7 @@ const HELP = `CTS-H BingX Trading Desk
          [--symbols BTC-USDT,ETH-USDT] [--end ISO] [--history-hours 132] [--input candles.json] [--capture candles.json]
          [--profile coordinated|filtered|baseline|both|all] [--indication NAME|all] [--range short|wide]
          [--strategies none|axis,block,dca,relate] [--min-pf 1.0] [--auto-pf on|off]
-         [--strategy-settings config.json] [--volume-factor 1.0] [--html report.html]
+         [--strategy-settings config.json] [--volume-factor 1.0] [--selected-only] [--independent-indications] [--reselect-hours 24] [--html report.html]
   doctor
   account --connection bingx-x02
   propose --connection bingx-x02 --symbol ETH-USDT --side long --qty N --stop N --target N --why TEXT
@@ -132,6 +133,9 @@ async function main() {
       strategies: { type: "string" },
       "strategy-settings": { type: "string" },
       "volume-factor": { type: "string" },
+      "selected-only": { type: "boolean" },
+      "independent-indications": { type: "boolean" },
+      "reselect-hours": { type: "string" },
       "min-pf": { type: "string" },
       "auto-pf": { type: "string" },
       "control-mode": { type: "string" },
@@ -244,21 +248,25 @@ async function main() {
     const volume = values["volume-factor"];
     const minimumPf = values["min-pf"];
     const autoPf = values["auto-pf"];
+    const reselectHours = values["reselect-hours"] === undefined ? undefined :
+      number(values["reselect-hours"], "reselection hours", [0, 336]);
+    if (reselectHours !== undefined && !Number.isInteger(reselectHours))
+      throw new Error("Reselection hours must be a whole number.");
     if (autoPf && autoPf !== "on" && autoPf !== "off")
       throw new Error("Choose on or off for Auto PF.");
-    const strategies = normalizeStrategies({
+    const overrides = {
       ...configured,
       ...activated,
       ...(volume === undefined ? {} : { volumeFactor: number(volume, "volume factor", [0.1, 10]) }),
       ...(minimumPf === undefined ? {} : { minimumPf: number(minimumPf, "minimum PF", [1, 4]) }),
       ...(autoPf === undefined ? {} : { autoPf: autoPf === "on" }),
       ...(values.indication === "all" ? { enabledIndications: INDICATIONS } : {}),
-    });
+    };
     const slip = number(values["slip-bps"] ?? "1", "slippage basis points", [0, 200]);
     const source = values.connection ?? "bingx-x01";
     const connections = source === "both" ? ["bingx-x01", "bingx-x02"] : [source];
     const symbols = [...new Set((values.symbols?.split(",") ?? REPLAY_SYMBOLS).map(requireSymbol))];
-    if (!symbols.length || symbols.length > 50) throw new Error("Supply 1 to 50 unique symbols.");
+    if (!symbols.length || symbols.length > 60) throw new Error("Supply 1 to 60 unique symbols.");
     const end = values.end ? Date.parse(values.end) : undefined;
     if (
       end !== undefined &&
@@ -295,15 +303,22 @@ async function main() {
       if (!books.length) throw new Error("No requested markets exist in the capture.");
       return { ...capture, end: cutoff, books };
     });
-    const runs = replayInput.flatMap((capture) =>
-      profiles.map((selection) =>
+    const runs = replayInput.flatMap((capture) => {
+      const strategies = normalizeStrategies({
+        ...defaultForInterval(capture.interval ?? "1h"),
+        ...overrides,
+      });
+      return profiles.map((selection) =>
         runReplay(capture, hours, slip, selection, strategies, {
           preHours,
           indication: indication as Indication | undefined,
           range,
+          selectedOnly: values["selected-only"],
+          independentIndications: values["independent-indications"],
+          reselectHours,
         }),
-      ),
-    );
+      );
+    });
     if (values.capture) await writeFile(values.capture, JSON.stringify(captures), { flag: "wx" });
     if (values.html) await writeFile(values.html, renderReplay(runs), { flag: "wx" });
     print(
@@ -316,6 +331,7 @@ async function main() {
         disabledConfigs: report.disabledConfigs,
         rejectedPf: report.rejectedPf,
         strategyActions: report.strategyActions,
+        indicationSummaries: report.indicationSummaries,
         chosen: report.bookNames,
       })),
     );

@@ -1,23 +1,16 @@
 import { useEffect } from "react";
 import { fetchQuoteSnapshot, fetchSnapshot } from "@/lib/desk/market";
-import { PREFERRED_SYMBOLS } from "@/lib/desk/constants";
-import { HOUR_MS } from "@/lib/desk/intervals";
+import { REPLAY_SYMBOLS } from "@/lib/desk/constants";
+import { CANDLE_INTERVALS } from "@/lib/desk/intervals";
+import { mergeSnapshots } from "@/lib/desk/snapshot";
 import { useDesk, type SnapBook } from "@/lib/desk/store";
-
-function mergeSnapshots(current: SnapBook[], incoming: SnapBook[], withHistory: boolean) {
-  const previous = new Map(current.map((book) => [book.symbol, book]));
-  return incoming.flatMap((book) => {
-    const prior = previous.get(book.symbol);
-    if (!prior && !withHistory) return [];
-    const newer =
-      prior && (prior.quote.exchangeTime ?? 0) > (book.quote.exchangeTime ?? 0) ? prior : book;
-    return [{ ...newer, bars: book.bars.length ? book.bars : (prior?.bars ?? []) }];
-  });
-}
 
 export function DeskFeed() {
   const focus = useDesk((s) => s.focus);
   const connection = useDesk((s) => s.connection);
+  const interval = useDesk((s) => s.strategies.interval);
+  const marketCount = useDesk((s) => s.strategies.marketCount);
+  const step = CANDLE_INTERVALS[interval];
   const ingest = useDesk((s) => s.ingest);
   const degrade = useDesk((s) => s.degrade);
   const allowFeed = useDesk((s) => s.allow.connect_exchange);
@@ -33,37 +26,50 @@ export function DeskFeed() {
     let quoteWait = 2_000;
     let quotesTimer = 0;
     let historyTimer = 0;
-    const active = () => !stop && useDesk.getState().connection === connection;
+    const active = () => !stop && useDesk.getState().connection === connection &&
+      useDesk.getState().strategies.interval === interval &&
+      useDesk.getState().strategies.marketCount === marketCount;
     const apply = (
       snap: { ts: number; books: SnapBook[]; unavailable: string[]; stale: boolean },
       withHistory: boolean,
     ) => {
       if (!active()) return;
       const state = useDesk.getState();
-      const books = mergeSnapshots(state.books, snap.books, withHistory);
-      const note = snap.unavailable.length
-        ? `Unavailable: ${snap.unavailable.join(", ")}`
+      const resetHistory = withHistory && state.bookInterval !== interval;
+      const held = new Set(state.positions.map((position) => position.symbol));
+      const watched = new Set([...REPLAY_SYMBOLS.slice(0, marketCount), ...held]);
+      const incoming = withHistory
+        ? snap.books.map((book) => ({ ...book, candleInterval: interval }))
+        : snap.books;
+      const books = mergeSnapshots(state.books, incoming, withHistory, resetHistory, held);
+      const unavailable = snap.unavailable.filter((symbol) => watched.has(symbol));
+      const note = unavailable.length
+        ? `Unavailable: ${unavailable.join(", ")}`
         : undefined;
       ingest(books, Math.max(state.lastTs, snap.ts), {
-        stale: snap.stale,
-        unavailable: snap.unavailable,
+        stale: snap.stale || (!withHistory && unavailable.length === watched.size),
+        unavailable,
         note,
+        resetHistory,
       });
     };
     const pullHistory = async () => {
       let untilNext = 30_000;
       try {
-        const before = useDesk.getState().books;
+        const symbols = new Set(REPLAY_SYMBOLS.slice(0, marketCount));
+        const before = useDesk.getState().books.filter((book) => symbols.has(book.symbol) &&
+          (!book.candleInterval || book.candleInterval === interval));
         const finalBars = before.map((book) => book.bars.at(-1)?.t);
         const last = finalBars[0];
         const knownEnd =
-          last && before.length === PREFERRED_SYMBOLS.length && finalBars.every((t) => t === last)
-            ? last + HOUR_MS
+          last && useDesk.getState().bookInterval === interval &&
+          before.length === marketCount && finalBars.every((t) => t === last)
+            ? last + step
             : undefined;
-        const snap = await fetchSnapshot({ data: { connection, focus, knownEnd } });
+        const snap = await fetchSnapshot({ data: { connection, focus, knownEnd, interval, marketCount } });
         apply(snap, true);
-        if (snap.books.length === PREFERRED_SYMBOLS.length)
-          untilNext = Math.max(2_000, snap.historyEnd + HOUR_MS + 3_000 - snap.ts);
+        if (snap.books.length === marketCount)
+          untilNext = Math.max(2_000, snap.historyEnd + step + 3_000 - snap.ts);
       } catch (err) {
         if (active() && !useDesk.getState().books.length)
           degrade(err instanceof Error ? err.message : "BingX history failed");
@@ -94,7 +100,7 @@ export function DeskFeed() {
       window.clearTimeout(quotesTimer);
       window.clearTimeout(historyTimer);
     };
-  }, [connection, focus, ingest, degrade, allowFeed]);
+  }, [connection, focus, interval, marketCount, step, ingest, degrade, allowFeed]);
 
   return null;
 }

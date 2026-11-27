@@ -55,7 +55,7 @@ export type ActionId = (typeof ACTIONS)[number];
 
 export const ACTION_COPY: Record<ActionId, string> = {
   intern_arm: "Arm scoring for eligible short-grid configurations",
-  intern_all_pre: "Walk closed 1h bars through the enabled paper configurations",
+  intern_all_pre: "Walk closed candles through the enabled paper configurations",
   promote_real: "Promote last-N valid cells onto the performing set",
   live_paper_execute: "Open gated paper legs tagged CTS-H on the live tape",
   block_volume: "Allow funded Block additions before the target",
@@ -128,6 +128,16 @@ export const REPLAY_SYMBOLS = [
   "COMP-USDT",
   "ZRX-USDT",
   "NEO-USDT",
+  "1000PEPE-USDT",
+  "ZRO-USDT",
+  "BOME-USDT",
+  "HYPE-USDT",
+  "ETHFI-USDT",
+  "BANANA-USDT",
+  "STRK-USDT",
+  "DYM-USDT",
+  "GALA-USDT",
+  "CFX-USDT",
 ];
 
 export const LEGACY_INDICATIONS = [
@@ -140,7 +150,14 @@ export const LEGACY_INDICATIONS = [
   "ema",
   "active",
 ] as const;
-export const NEW_INDICATIONS = ["pullback", "rangeFade"] as const;
+export const NEW_INDICATIONS = [
+  "pullback",
+  "rangeFade",
+  "volumeBreak",
+  "momentumPullback",
+  "squeezeBreak",
+  "rsiRecovery",
+] as const;
 export const INDICATIONS = [...LEGACY_INDICATIONS, ...NEW_INDICATIONS] as const;
 export type Indication = (typeof INDICATIONS)[number];
 export const INDICATION_LABELS: Record<Indication, string> = {
@@ -154,6 +171,10 @@ export const INDICATION_LABELS: Record<Indication, string> = {
   active: "Volume activity",
   pullback: "EMA pullback",
   rangeFade: "Range fade",
+  volumeBreak: "Volume breakout",
+  momentumPullback: "Momentum pullback",
+  squeezeBreak: "Compression breakout",
+  rsiRecovery: "RSI trend recovery",
 };
 
 export type Floors = {

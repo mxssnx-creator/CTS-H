@@ -1,15 +1,22 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { Bingx, BingxError, requireRows } from "./bingx.server.ts";
 import { requireConnection, requireSymbol, type ConnectionId } from "./connections.ts";
-import { PREFERRED_SYMBOLS } from "./constants.ts";
+import { PREFERRED_SYMBOLS, REPLAY_SYMBOLS } from "./constants.ts";
 import { saneBars } from "./heal.ts";
 import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "./intervals.ts";
 import type { Bar } from "./process.ts";
 
 export { HOUR_MS } from "./intervals.ts";
 export const MAX_QUOTE_AGE_MS = 20_000;
-const KLINE_LOOKBACK = 132;
-const KLINE_MIN_SPACING = 1_075;
+const KLINE_LOOKBACK: Record<CandleInterval, number> = {
+  "1m": 762,
+  "5m": 600,
+  "15m": 410,
+  "30m": 220,
+  "1h": 132,
+  "4h": 132,
+};
+const KLINE_MIN_SPACING = 1_250;
 
 export type Quote = {
   symbol: string;
@@ -43,7 +50,15 @@ export type Snapshot = {
 
 type CacheRow = { until: number; value: Promise<unknown> };
 const reads = new Map<string, CacheRow>();
+const MAX_CACHED_READS = 128;
 let nextCandleSlot = 0;
+
+function trimReads(now: number) {
+  for (const [key, row] of reads) {
+    if (row.until !== Infinity && (row.until <= now || reads.size > MAX_CACHED_READS))
+      reads.delete(key);
+  }
+}
 
 function cached<T>(
   key: string,
@@ -52,21 +67,24 @@ function cached<T>(
 ): Promise<T> {
   const now = Date.now();
   const hit = reads.get(key);
-  if (hit && hit.until > now) return hit.value as Promise<T>;
+  if (hit && hit.until > now) {
+    reads.delete(key);
+    reads.set(key, hit);
+    return hit.value as Promise<T>;
+  }
   const value = load();
   const row = { value, until: Infinity };
   reads.set(key, row);
   void value.then(
     (item) => {
       row.until = Date.now() + (typeof ttl === "number" ? ttl : ttl(item));
+      trimReads(Date.now());
     },
     () => {
       if (reads.get(key) === row) reads.delete(key);
     },
   );
-  if (reads.size > 256) {
-    for (const [id, item] of reads) if (item.until <= now) reads.delete(id);
-  }
+  if (reads.size > MAX_CACHED_READS) trimReads(now);
   return value;
 }
 
@@ -261,39 +279,45 @@ export async function loadQuoteSnapshot(connection: ConnectionId, focus: string)
   const ts = client.now();
   const books: BookSnap[] = [];
   const unavailable: string[] = [];
-  for (const symbol of PREFERRED_SYMBOLS) {
+  for (const symbol of REPLAY_SYMBOLS) {
     const quote = quotes.get(symbol);
     if (!quote || !quoteIsFresh(quote, ts)) unavailable.push(symbol);
     if (quote)
       books.push({ symbol, quote, bars: [], ...(focus === symbol ? detail : EMPTY_DETAIL) });
   }
-  return { ts, books, unavailable, stale: unavailable.length === PREFERRED_SYMBOLS.length };
+  return { ts, books, unavailable, stale: unavailable.length === REPLAY_SYMBOLS.length };
 }
 
 export async function loadSnapshot(
   connection: ConnectionId,
   focus: string,
   knownEnd?: number,
+  interval: CandleInterval = "1h",
+  marketCount = 16,
 ): Promise<Snapshot> {
   const client = new Bingx(requireConnection(connection));
-  // The brief delay after each hour gives the exchange time to finalize the candle.
-  const end = Math.floor((client.now() - 3_000) / HOUR_MS) * HOUR_MS;
+  const step = CANDLE_INTERVALS[interval];
+  const symbols = REPLAY_SYMBOLS.slice(0, Math.max(1, Math.min(
+    interval === "1m" ? 32 : 60, Number.isFinite(marketCount) ? Math.round(marketCount) : 16,
+  )));
+  // The brief delay after each boundary gives the exchange time to finalize the candle.
+  const end = Math.floor((client.now() - 3_000) / step) * step;
   const history = await Promise.allSettled(
-    PREFERRED_SYMBOLS.map((symbol) => loadKlines(client, symbol, KLINE_LOOKBACK, end)),
+    symbols.map((symbol) => loadKlines(client, symbol, KLINE_LOOKBACK[interval], end, interval)),
   );
   const quotes = await loadTickers(client);
   const detail = await focusDetails(client, focus, quotes.get(focus));
   const unavailable: string[] = [];
   const books: BookSnap[] = [];
   const ts = client.now();
-  for (const [i, symbol] of PREFERRED_SYMBOLS.entries()) {
+  for (const [i, symbol] of symbols.entries()) {
     const result = history[i];
     const quote = quotes.get(symbol);
     if (
       !quote ||
       result?.status !== "fulfilled" ||
       result.value.length < 48 ||
-      !contiguous(result.value, end)
+      !contiguous(result.value, end, step)
     ) {
       unavailable.push(symbol);
       continue;
@@ -309,7 +333,7 @@ export async function loadSnapshot(
   return {
     ts,
     books,
-    stale: unavailable.length === PREFERRED_SYMBOLS.length,
+    stale: unavailable.length === symbols.length,
     unavailable,
     historyEnd: end,
   };

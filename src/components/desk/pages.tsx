@@ -19,12 +19,12 @@ import {
   BOOK,
   INDICATIONS,
   INDICATION_LABELS,
-  MAX_LIVE_LEGS,
 } from "@/lib/desk/constants";
 import { CALIBRATED_EXCLUSIONS } from "@/lib/desk/calibration";
 import type { ReplayProfile } from "@/lib/desk/config-policy";
 import { CONNECTIONS } from "@/lib/desk/connections";
 import { COORDINATION_LABELS } from "@/lib/desk/management";
+import { type CandleInterval } from "@/lib/desk/intervals";
 import { closePnl } from "@/lib/desk/math";
 import {
   barSignature,
@@ -34,7 +34,7 @@ import {
   type SessionReport,
 } from "@/lib/desk/process";
 import {
-  DEFAULT_STRATEGIES,
+  defaultForInterval,
   STRATEGY_LABELS,
   STRATEGY_LIMITS,
   STRATEGY_TYPES,
@@ -81,6 +81,7 @@ function Empty({ children }: { children: ReactNode }) {
 
 function PaperSummary() {
   const net = useNet();
+  const capacity = useDesk((s) => s.strategies.maxPaperPositions);
   const positions = useDesk((s) => s.positions);
   const fills = useDesk((s) => s.liveFills);
   const realized = useDesk((s) => s.closedNet);
@@ -109,7 +110,7 @@ function PaperSummary() {
       <Stat
         label="Open paper positions"
         value={String(positions.length)}
-        detail={`${MAX_LIVE_LEGS} position capacity`}
+        detail={`${capacity} position capacity`}
       />
     </div>
   );
@@ -117,6 +118,7 @@ function PaperSummary() {
 
 function MarketPanel() {
   const book = useDesk(focusBook);
+  const interval = useDesk((s) => s.bookInterval);
   const status = useDesk((s) => s.status);
   const [range, setRange] = useState(48);
   const bars = useMemo(() => book?.bars.slice(-range) ?? [], [book?.bars, range]);
@@ -127,7 +129,7 @@ function MarketPanel() {
         <div className="segmented">
           {[12, 24, 48, 96].map((n) => (
             <button key={n} aria-pressed={range === n} onClick={() => setRange(n)}>
-              {n}H
+              {n} × {interval}
             </button>
           ))}
         </div>
@@ -416,6 +418,7 @@ function PositionTable({ compact = false }: { compact?: boolean }) {
                     <td>{num.format(p.tp)}</td>
                     <td>
                       {p.coordination ? COORDINATION_LABELS[p.coordination] : "Manual"}
+                      {` · ${p.interval ?? "1h"}`}
                       {p.sizing?.axis ? " · Axis" : ""}
                       {p.sizing?.relate ? " · Relate" : ""}
                       {p.plan?.blockSteps
@@ -668,6 +671,7 @@ function TicketDraft() {
 
 export function IndicationsPage() {
   const book = useDesk(focusBook);
+  const interval = useDesk((s) => s.bookInterval);
   const cells = useDesk((s) => s.cells);
   const qualified = useMemo(
     () =>
@@ -683,7 +687,7 @@ export function IndicationsPage() {
         title="Market research"
         secondary={
           book
-            ? `${book.symbol} · closed hourly candles and desk signals`
+            ? `${book.symbol} · closed ${interval} candles and desk signals`
             : "Close-bar evidence and trade proposals"
         }
       />
@@ -745,7 +749,14 @@ export function IndicationsPage() {
   );
 }
 
-const REPLAY_HOURS = [12, 24, 48] as const;
+const REPLAY_HOURS: Record<CandleInterval, readonly number[]> = {
+  "1m": [3, 6],
+  "5m": [6, 12, 24],
+  "15m": [12, 24, 48],
+  "30m": [12, 24, 48],
+  "1h": [12, 24, 48],
+  "4h": [24, 48, 96],
+};
 const REPLAY_PROFILES: Record<ReplayProfile, string> = {
   coordinated: "Coordinated",
   filtered: "Filtered",
@@ -763,13 +774,19 @@ export function ReplayPage() {
   const floors = useDesk((s) => s.floors);
   const connection = useDesk((s) => s.connection);
   const strategies = useDesk((s) => s.strategies);
+  const bookInterval = useDesk((s) => s.bookInterval);
+  const interval = strategies.interval;
   const trailing = useDesk((s) => s.toggles.trailing);
-  const [hours, setHours] = useState<(typeof REPLAY_HOURS)[number]>(48);
+  const [chosenHours, setHours] = useState(48);
+  const choices = REPLAY_HOURS[interval];
+  const hours = choices.includes(chosenHours) ? chosenHours : choices[choices.length - 1]!;
   const [size, setSize] = useState<ReplaySize>("base");
+  const setStrategies = useDesk((s) => s.setStrategies);
+  const dailyReselect = strategies.microReselectHours > 0;
   const [profile, setProfile] = useState<ReplayProfile>("coordinated");
   const [report, setReport] = useState<SessionReport | null>(null);
   const [error, setError] = useState("");
-  const sig = barSignature(books);
+  const sig = bookInterval === interval ? barSignature(books) : "";
   useEffect(() => {
     setError("");
     setReport(null);
@@ -786,24 +803,27 @@ export function ReplayPage() {
     worker.postMessage({
       books: source,
       floors,
-      opts: { hours, size, connection, profile, strategies, trailing },
+      opts: {
+        hours, size, connection, profile, strategies, trailing, interval, selectedOnly: true,
+        reselectHours: strategies.microReselectHours,
+      },
     });
     return () => worker.terminate();
-  }, [sig, floors, hours, size, connection, profile, strategies, trailing]);
+  }, [sig, floors, hours, size, connection, profile, strategies, trailing, interval, dailyReselect]);
   const pre = report?.ready ? summarizeReplay(report.bookPre) : null;
   const replay = report?.ready ? summarizeReplay(report.bookLive) : null;
   return (
     <>
       <Heading
         title="Trade replay"
-        secondary="Select on the pre window. Measure on the next closed BingX candles."
+        secondary={`Select on the pre window. Measure on the next closed ${interval} BingX candles.`}
       />
       <Panel title="Simulation settings">
         <div className="replay-controls">
           <div>
             <span>Prehistory + replay</span>
             <div className="segmented">
-              {REPLAY_HOURS.map((n) => (
+              {choices.map((n) => (
                 <button key={n} onClick={() => setHours(n)} aria-pressed={hours === n}>
                   {n}h + {n}h
                 </button>
@@ -845,6 +865,16 @@ export function ReplayPage() {
                   </button>
                 ))}
               </div>
+            </div>
+          )}
+          {hours > 24 && (
+            <div>
+              <span>Reselection</span>
+              <label>
+                <input type="checkbox" checked={dailyReselect}
+                  onChange={(event) => setStrategies({ microReselectHours: event.currentTarget.checked ? 24 : 0 })} />
+                {" "}Reselect and close daily
+              </label>
             </div>
           )}
         </div>
@@ -1234,7 +1264,7 @@ export function SettingsPage() {
       <Panel
         title="Position sizing and stops"
         aside={
-          <button className="desk-button" onClick={() => setStrategies(DEFAULT_STRATEGIES)}>
+          <button className="desk-button" onClick={() => setStrategies(defaultForInterval(strategies.interval))}>
             Restore strategy defaults
           </button>
         }
@@ -1257,6 +1287,42 @@ export function SettingsPage() {
           <StrategyField name="trailDistance" label="ATR trail gap (× target distance)" />
         </div>
       </Panel>
+      <Panel title="Short-timeframe settings">
+        <div className="form-grid stop-fields">
+          <label>
+            Candle interval
+            <select value={strategies.interval} onChange={(event) => {
+              const value = event.currentTarget.value as CandleInterval;
+              setStrategies({ interval: value });
+            }}>
+              <option value="1m">1 minute</option>
+              <option value="5m">5 minutes</option>
+              <option value="15m">15 minutes</option>
+              <option value="30m">30 minutes</option>
+              <option value="1h">1 hour</option>
+              <option value="4h">4 hours</option>
+            </select>
+          </label>
+          <StrategyField name="microTargetCosts" label="Minimum target (× round-trip costs)" />
+          <StrategyField name="microHoldMinutes" label="Maximum hold (minutes)" />
+          <StrategyField name="microReselectHours" label="Replay reselection hours (0 = off)" />
+          <StrategyField name="marketCount" label="Markets in live paper feed" />
+          <StrategyField name="maxPaperPositions" label="Maximum open paper positions" />
+        </div>
+        <p className="muted detail-copy">The 1-minute feed is limited to 32 markets to fit BingX candle request limits. Other intervals support up to 60. Open paper positions remain monitored when this count changes.</p>
+        <div className="option-list">
+          <label>
+            <span>Evaluate extended ATR targets on 1–15 minute candles</span>
+            <input type="checkbox" checked={strategies.microExtended}
+              onChange={(event) => setStrategies({ microExtended: event.currentTarget.checked })} />
+          </label>
+          <label>
+            <span>Apply rolling paper qualification during replay</span>
+            <input type="checkbox" checked={strategies.microReplayGate}
+              onChange={(event) => setStrategies({ microReplayGate: event.currentTarget.checked })} />
+          </label>
+        </div>
+      </Panel>
       <div className="strategy-card-grid">
         {STRATEGY_TYPES.map((kind) => (
           <StrategyCard key={kind} kind={kind} />
@@ -1274,6 +1340,9 @@ export function SettingsPage() {
             </button>
           }
         >
+          {strategies.enabledIndications.length === 0 && (
+            <p className="muted detail-copy">No indications are enabled for this interval. Choose candidates to research and qualify before using automatic paper entries.</p>
+          )}
           <div className="option-list">
             {INDICATIONS.map((kind) => (
               <label key={kind}>
@@ -1312,7 +1381,7 @@ export function SettingsPage() {
       </div>
       <Panel title="Configuration exclusions">
         <p className="muted detail-copy">
-          Automatic paper entries exclude{" "}
+          On 1-hour candles, automatic paper entries exclude{" "}
           {CALIBRATED_EXCLUSIONS[connection === "bingx-x02" ? "bingx-x02" : "bingx-x01"].length}{" "}
           market configurations with recurring losses after costs. The Replay page offers a baseline
           comparison.

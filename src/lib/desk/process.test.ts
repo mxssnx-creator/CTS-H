@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DEFAULT_FLOORS, INDICATIONS } from "./constants.ts";
 import { blockQty, clampAxisPartial, clampBlockVol } from "./math.ts";
-import { cellRollup, exitOnBar, indicationBoard, markPositions, mergeFills, simulateSessions, sizedNotional, syncBooks, type Bar, type LivePos } from "./process.ts";
+import { buildSeries, cellRollup, exitOnBar, indicationBoard, markPositions, mergeFills, signalAt, simulateSessions, sizedNotional, syncBooks, type Bar, type LivePos } from "./process.ts";
 
 function bars(n = 90, drift = 0.003): Bar[] {
   const out: Bar[] = [];
@@ -120,7 +120,24 @@ test("live hold follows closed hours and a repeat quote does not age the leg", (
   assert.equal(aged.closed[0]?.reason, "hold");
   const stopped = markPositions([leg({ sl: 99, tp: 110 })], { "BTC-USDT": 97 }, { trail: false, dca: false, equity: 10_000, asOf: hour });
   assert.equal(stopped.closed[0]?.reason, "sl");
-  assert.equal(stopped.closed[0]?.px, 99);
+  assert.equal(stopped.closed[0]?.px, 97);
+  const shortStopped = markPositions([leg({ side: -1, sl: 101, tp: 90 })],
+    { "BTC-USDT": 103 }, { trail: false, dca: false, equity: 10_000, asOf: hour });
+  assert.equal(shortStopped.closed[0]?.reason, "sl");
+  assert.equal(shortStopped.closed[0]?.px, 103);
+});
+
+test("a minute position ages by its own candle interval after the desk changes timeframe", () => {
+  const minute = 60_000;
+  const position = leg({ openedAt: 100 * minute, interval: "1m", maxHoldBars: 120 });
+  const pending = markPositions([position], { "BTC-USDT": 100 }, {
+    trail: false, dca: false, equity: 10_000, asOf: 159 * minute,
+  });
+  assert.equal(pending.open[0]?.hold, 59);
+  const closed = markPositions(pending.open, { "BTC-USDT": 100 }, {
+    trail: false, dca: false, equity: 10_000, asOf: 220 * minute,
+  });
+  assert.equal(closed.closed[0]?.reason, "hold");
 });
 
 test("intern tape keeps earlier fills when a later bar arrives", () => {
@@ -155,4 +172,19 @@ test("holdout prices cannot change preselection and stale coverage cannot qualif
   const c = simulateSessions([{ symbol: "BTC-USDT", bars: gap }], 10_000, DEFAULT_FLOORS, { hours: 48 });
   assert.equal(c.ready, false);
   assert.deepEqual(c.unavailable, ["BTC-USDT"]);
+});
+
+test("all indications use only candles available at the signal time", () => {
+  const original = bars(100, 0.002);
+  const edited = original.map((bar, index) => index <= 60 ? bar : {
+    ...bar, o: bar.o * 1.2, h: bar.h * 1.3, l: bar.l * 0.9,
+    c: bar.c * 1.2, v: bar.v * 30,
+  });
+  const before = buildSeries(original);
+  const after = buildSeries(edited);
+  for (const indication of INDICATIONS) {
+    for (let index = 0; index <= 60; index++)
+      assert.equal(signalAt(indication, original, before, index),
+        signalAt(indication, edited, after, index), `${indication} at bar ${index}`);
+  }
 });
