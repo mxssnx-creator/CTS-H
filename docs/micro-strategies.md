@@ -49,22 +49,25 @@ The forward runner also re-runs the batch simulator on the candles it stored, an
 - Gate variants: `validated` is the shipped rule (no veto, and at least one confirmation). `noveto` lets any entry through unless a lane vetoes it. `lastnet` allows an entry when the cell's last 20 closes are net positive.
 - The lane policy is the shipped default. It is not tuned on any window.
 
-## Windows and the selection protocol
+## Windows and the walk-forward protocol
 
-- Capture: one-minute candles for the 50 USDT perpetuals in `REPLAY_SYMBOLS`, from BingX mainnet, 800 hours, ending at the capture time.
-- Windows are anchored to the capture end on a four-hour grid, so every timeframe shares the same boundaries:
-  - R1 = [anchor − 720 h, anchor − 480 h)
-  - R2 = [anchor − 480 h, anchor − 240 h)
-  - H = [anchor − 240 h, anchor), the holdout
-- Each window has 240 hours. R1 has 80 hours of warm-up before it, which is enough for the indicator series.
-- Research rule, applied to R1 and R2 only: at least 100 positions in each research window, positive net in each, ranked by the lower of the two PFs, with ties broken by the lower of the two drawdowns.
-- H is reported after the choice. It is never used to choose.
+- Capture: one-minute candles for the 50 USDT perpetuals in `REPLAY_SYMBOLS`, from BingX mainnet. The history is captured in segments (the newest 800 hours, then the 640 hours before it) and merged by symbol.
+- Windows are anchored to the latest capture end on a four-hour grid, so every timeframe shares the same boundaries. Each window has 240 hours and keeps 48 hours of history before it.
+  - H is the holdout: the last 240 hours before the anchor.
+  - R1, R2, ... are the research windows before H, oldest first. Their number follows the history the data allows: three windows from 800 hours, five from 1440 hours.
+- Walk-forward rule, fixed before any walk result is read:
+  - Test windows are every window after the first two, so each has at least two windows of training.
+  - A set is eligible for a test window when every training window has at least 100 booked positions, positive booked net, and PF of at least 1.00.
+  - The score is the lowest PF across the training windows. Ties go to the lower largest drawdown.
+  - The selected set runs on the test window, and that result is reported without change.
+- Flat fallback: when no set is eligible, the window is traded flat. Flat windows carry no P&L and a neutral PF of 1.00.
+- The out-of-sample PF pools the gross profit and gross loss of the test windows. The in-sample PF of each selected set is shown next to its out-of-sample PF, so the drop is visible.
 
 ## Metrics
 
 - PF: gross profit over gross loss, over booked closed legs, after costs. 1.0 is neutral: zero net gives 1.00.
-- Drawdown: the largest peak-to-trough fall in the cumulative hourly booked net of the whole portfolio. This is a closed-trade drawdown. Open-position mark-to-market is not included.
-- Hourly success: the share of active hours, meaning hours with at least one booked leg closed, whose booked net is positive.
+- Drawdown: the largest peak-to-trough fall of bar-close equity, where equity is the realized booked P&L plus the mark of the booked open position at each bar close. Open losses count before they close, and shadows never count.
+- Hourly success: the share of active buckets whose equity rose. A bucket is one hour, or one bar when the bar is longer than an hour. Active means the equity changed inside the bucket.
 - Win rate: the share of booked positions, including all their legs, whose total net is positive.
 
 ## Results
@@ -73,7 +76,7 @@ Filled in from the 50-market run, with the report under `reports/`.
 
 ## Limitations
 
-- Fills are at the bar's open, the target or the stop price, or the bar's close. There is no order book, no slippage beyond the model, and no funding.
+- Fills are at the bar's open, the target or the stop price, or the bar's close. Drawdown is measured on bar closes, so an excursion inside a bar is not seen. There is no order book, no slippage beyond the model, and no funding.
 - The portfolio is a sum of independent markets at a fixed notional per position. There are no capital, concurrency or correlation limits.
 - The live forward test runs on five-minute candles. One-minute candles across 100 symbols cannot keep up with the 1.25-second request spacing: a cycle would take about two minutes.
 - The desk's browser loop does not run micro sets yet. The forward runner is headless.

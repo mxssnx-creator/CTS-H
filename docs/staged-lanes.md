@@ -49,6 +49,15 @@ Evidence floor: a lane gives evidence only when the cell has at least 4 closes i
 - Choices were made on research windows only. The results and their limits are in reports/staged-lanes-10d-60-markets/README.md.
 - Targets: high PF, low drawdown, high share of positive hours, and a high count of booked orders. Not met (see the report).
 
+## Stage progression switch
+
+Stage progression is on by default (`stageProgression`, the Auto PF panel's checkbox; the CLI's `--stages on|off`).
+
+- On: cells pass Base, then Main, then the thin stages. Each stage evaluates only the cells the stage before it validated, and the final stage's lanes gate every holdout entry.
+- Off: the legacy logistics run instead, the per-cell last-N gate the coordinated engine has always used (last 50 closes, recent window 15, suspension 12, auto PF). Each cell is validated once from its prehistory closes, and the same gate decides every holdout entry from the cell's own closes. Selection and the books are unchanged, and the report says which logistics ran.
+
+On the 1h research capture (57 symbols, 240h holdout, 72h prehistory), progression on gives net -0.95, 220 closes, PF 0.877 and drawdown 1.92. Off gives net -4.80, 589 closes, PF 0.805 and drawdown 6.57. Neither is net positive on that holdout.
+
 ## Out of scope
 
 - Overlays (Axis, Block, DCA, Relate) are not applied inside the staged holdout. Use the coordinated profile for overlays.
