@@ -79,3 +79,15 @@ Rules, fixed before the run.
 - Score: pooled training PF. The highest-scoring eligible set trades the test window. If none is eligible, the window is flat, which reads PF 1.00.
 - Validation: pooled out-of-sample PF at or above 1.10, in each regime with at least five traded windows, and in each time half. Also reported: the share of traded windows with positive net. A "consistently positive" claim needs that share to be high as well as the PF.
 - Brackets: ATR, as Experiment B. Direction: the breadth gate of Experiment D, and without it. Timeframes: 4h, 1h and 30m.
+
+## Experiment F: 25 indications, minimum-PF validation, ATR brackets (recorded)
+
+- Added six standard causal indications: psar (Parabolic SAR flip), keltnerBreak (2 ATR band around EMA 20), engulf, pinBar, ibsRevert and mfiReversal. The coordinated defaults do not change. Each fires on 2.6% to 39% of 4h bars, in both directions.
+- Out of sample, pooled PF, net, traded and flat windows, with the regime split:
+  - 4h, breadth gate: PF 0.76, net −291, 24 traded. BULL 1.29, BEAR 1.30, CHOP 0.39. No new indication was selected.
+  - 4h, no gate: PF 0.72, net −1,363, 36 traded. BULL 0.45, BEAR 0.73, CHOP 0.91. The walk selected new indications 11 times (mfiReversal 7, psar 4), and they lost.
+  - 1h, breadth gate: PF 0.92, net −26, 15 traded. BULL 1.14, BEAR 1.41, CHOP 0.52. No new indication was selected.
+  - 1h, no gate: PF 0.91, net −125, 22 traded. BULL 1.21, BEAR 1.02, CHOP 0.80.
+  - 30m, either gate: no set passes the minimum-PF eligibility in any window, so every window is flat.
+- Reading: more indications means more candidates that look profitable in training, and under pooled minimum-PF selection those candidates fail out of sample. The new indications don't add a validated edge.
+- The criteria are not met: pooled out-of-sample PF is below 1.10 everywhere, and the share of traded windows with positive net is 36 to 54%.
