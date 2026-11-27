@@ -67,7 +67,7 @@ test("a gate that never allows books no trades and every blocked entry is a shad
   const series = buildSeries(bars);
   const signals = bars.map((_, i) => signalAt("stochRsi", bars, series, i));
   const slots = Array.from({ length: HOLD }, (_, k) => hourAccumulator(bars[REPLAY_WARMUP_BARS + PRE + k]!.t));
-  const laned: LanedReplay = { closes: [], allow: () => false, shadows: 0, shadowPnl: [] };
+  const laned: LanedReplay = { closes: [], costs: [], allow: () => false, shadows: 0, shadowPnl: [] };
   replayWindow(bars, series.atr, signals, REPLAY_WARMUP_BARS + PRE, slots, 10, 0.0012, 4, 1.5, true, "breakeven", true, undefined, "1h", undefined, undefined, undefined, laned);
   assert.equal(slots.reduce((total, row) => total + row.trades, 0), 0);
   assert.ok(laned.shadows > 0, "the stochRsi test fixture should produce entries");
@@ -84,7 +84,7 @@ test("an allowing gate reproduces the ungated holdout", () => {
     replayWindow(bars, series.atr, signals, REPLAY_WARMUP_BARS + PRE, slots, 10, 0.0012, 4, 1.5, true, "breakeven", true, undefined, "1h", undefined, undefined, undefined, laned);
     return slots.map((row) => [row.trades, row.realized]);
   };
-  const open = run({ closes: [], allow: () => true, shadows: 0, shadowPnl: [] });
+  const open = run({ closes: [], costs: [], allow: () => true, shadows: 0, shadowPnl: [] });
   assert.deepEqual(open, run(undefined));
 });
 

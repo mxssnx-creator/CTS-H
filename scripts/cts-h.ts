@@ -37,6 +37,7 @@ import {
   type StrategySettings,
 } from "../src/lib/desk/strategies.ts";
 import { captureReplay, renderMarkdown, renderReplay, runReplay, type Capture } from "./cts-h-replay.ts";
+import type { LanePolicy } from "../src/lib/desk/lanes.ts";
 
 const HELP = `CTS-H BingX Trading Desk
   brief [--connection bingx-x02] [--symbol ETH-USDT]
@@ -46,7 +47,7 @@ const HELP = `CTS-H BingX Trading Desk
          [--strategies none|axis,block,dca,relate] [--min-pf 1.0] [--auto-pf on|off]
          [--strategy-settings config.json] [--volume-factor 1.0] [--independent-indications] [--reselect-hours 24]
          [--period-hours 4] [--html report.html] [--markdown report.md]
-         [--profile staged --per-symbol 2 --thins 2 --min-closes 6]
+         [--profile staged --per-symbol 1 --thins 2 --min-closes 6 --min-pf 1.05 --auto-penalty 0.15 --require-net on|off]
   doctor
   account --connection bingx-x02
   propose --connection bingx-x02 --symbol ETH-USDT --side long --qty N --stop N --target N --why TEXT
@@ -140,10 +141,13 @@ async function main() {
       "per-symbol": { type: "string" },
       thins: { type: "string" },
       "min-closes": { type: "string" },
+      "auto-penalty": { type: "string" },
+      "require-net": { type: "string" },
       markdown: { type: "string" },
       "independent-indications": { type: "boolean" },
       "reselect-hours": { type: "string" },
       "min-pf": { type: "string" },
+      "lane-settings": { type: "string" },
       "auto-pf": { type: "string" },
       "control-mode": { type: "string" },
       "history-hours": { type: "string" },
@@ -313,6 +317,15 @@ async function main() {
     });
     const periodHours = number(values["period-hours"] ?? "4", "period hours", [1, 336]);
     if (!Number.isInteger(periodHours)) throw new Error("Period hours must be a whole number.");
+    // Lane settings: per-relation PF floors, cost multiple, auto PF and net requirement.
+    const laneFile = values["lane-settings"]
+      ? (JSON.parse(await readFile(values["lane-settings"], "utf8")) as Partial<LanePolicy>)
+      : {};
+    const laneSettings: Partial<LanePolicy> = {
+      ...laneFile,
+      ...(values["auto-penalty"] === undefined ? {} : { autoPenalty: number(values["auto-penalty"], "auto PF penalty", [0, 1]) }),
+      ...(values["require-net"] === undefined ? {} : { requireNet: values["require-net"] !== "off" }),
+    };
     const runs = replayInput.flatMap((capture) => {
       const strategies = normalizeStrategies({
         ...defaultForInterval(capture.interval ?? "1h"),
@@ -329,7 +342,8 @@ async function main() {
           reselectHours,
           staged: {
             perSymbol: number(values["per-symbol"] ?? "1", "cells per market", [1, 10]),
-            minPf: number(values["min-pf"] ?? "1", "minimum PF", [0.1, 4]),
+            minPf: values["min-pf"] === undefined ? undefined : number(values["min-pf"], "minimum PF", [0.1, 4]),
+            policy: laneSettings,
             thins: number(values.thins ?? "2", "thin stages", [0, 4]),
             minCloses: number(values["min-closes"] ?? "6", "minimum closes", [1, 200]),
           },

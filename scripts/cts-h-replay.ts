@@ -12,6 +12,7 @@ import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/
 import { loadKlines } from "../src/lib/desk/market.server.ts";
 import { positionNotional } from "../src/lib/desk/math.ts";
 import { periodRows, type PeriodRow } from "../src/lib/desk/periods.ts";
+import type { LanePolicy } from "../src/lib/desk/lanes.ts";
 import { simulateStaged } from "../src/lib/desk/staged.ts";
 import {
   simulateSessions,
@@ -103,7 +104,7 @@ export async function captureReplay(
 const SIZES: ReplaySize[] = ["base", "axis", "block", "both"];
 type ReplayScope = Pick<
   ReplayOpts, "preHours" | "indication" | "range" | "trailing" | "selectedOnly" | "reselectHours" | "independentIndications"
-> & { staged?: { perSymbol: number; minPf: number; thins: number; minCloses: number } };
+> & { staged?: { perSymbol: number; minPf?: number; thins: number; minCloses: number; policy?: Partial<LanePolicy> } };
 const fingerprints = new WeakMap<Capture, Map<number, string>>();
 
 export function replayCosts(capture: Capture, slipBps: number) {
@@ -155,6 +156,8 @@ export function runReplay(
           minPf: staged?.minPf,
           thins: staged?.thins,
           minCloses: staged?.minCloses,
+          policy: staged?.policy,
+          reselectHours: scope.reselectHours,
         })
       : simulateSessions(capture.books, BOOK, DEFAULT_FLOORS, {
           ...engineScope,
@@ -248,8 +251,9 @@ const cell = (v: string | number) => `<td>${esc(typeof v === "number" ? fmt(v) :
 const row = (values: (string | number)[]) => `<tr>${values.map(cell).join("")}</tr>`;
 const table = (head: string[], body: string) =>
   `<div class="scroll"><table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>`;
+// PF 1.00 is neutral: net zero, including a window with no trades.
 const pf = (grossProfit: number, grossLoss: number) =>
-  grossLoss > 0 ? fmt(grossProfit / grossLoss) : grossProfit > 0 ? "No losses" : "—";
+  grossLoss > 0 ? fmt(grossProfit / grossLoss) : grossProfit > 0 ? "No losses" : "1.00";
 
 function profileName(run: ReplayRun) {
   const label = [run.profile, ...run.strategies.map((key) => STRATEGY_LABELS[key])].join(" + ");
@@ -337,6 +341,12 @@ function markdownTable(head: string[], body: (string | number)[][]) {
 
 const pct = (value: number) => `${fmt(value * 100)}%`;
 
+// Policy in one line: PF is net of costs (1.00 is neutral) and every lane needs its cost floor.
+export function policyText(policy: LanePolicy): string {
+  const tuned = Object.keys(policy.laneMinPf ?? {}).length;
+  return `Policy: PF is net of round-trip costs, so 1.00 is neutral. Each lane needs PF ≥ max(lane floor, 1 + ${policy.costMultiple} × costs/gross loss), plus auto PF ${policy.autoPenalty} over ${policy.autoSamples} closes; net positive ${policy.requireNet ? "required" : "not required"}; ratchet ${policy.ratchetStep} per thin stage; ${tuned} per-relation floors set (others ${policy.minPf}).`;
+}
+
 // Staged lanes: stage table, lane table, summary and per-market cells, as HTML.
 function stagedHtml(run: ReplayRun): string {
   const staged = run.report.staged;
@@ -346,16 +356,17 @@ function stagedHtml(run: ReplayRun): string {
   ).join("");
   const laneRows = staged.stages.flatMap((stage) =>
     stage.lanes.map((lane) =>
-      row([stage.name, lane.id, lane.window, lane.mode, lane.minPf, lane.evidence, lane.confirmed, lane.vetoed, lane.medianPf]),
+      row([stage.name, lane.id, lane.window, lane.mode, lane.floor, lane.evidence, lane.confirmed, lane.vetoed, lane.netPositive, lane.medianPf]),
     ),
   ).join("");
   const cellRows = staged.cells.map((cell) =>
     row([cell.name, cell.closesPre, cell.pfPre, cell.closesHoldout, cell.pfHoldout, cell.netHoldout, cell.shadows, cell.shadowPf]),
   ).join("");
   return `<h3>Staged lanes</h3>
+      <p>${esc(policyText(staged.policy))}</p>
       <p>${esc(staged.plan.join(" → "))}. ${fmt(staged.pool)} candidate cells in the prehistory pool; ${fmt(staged.validatedFinal)} validated by the final stage; ${fmt(staged.chosen)} chosen for the holdout (up to ${staged.perSymbol} per market). ${fmt(staged.bookedCloses)} booked closes, ${fmt(staged.shadows)} entries blocked by the lanes and tracked as shadows (shadow PF ${fmt(staged.shadowPf)}).</p>
       ${table(["Stage", "Input cells", "Validated", "Vetoed", "Retained", "Median PF in", "Median PF out", "Relation out/in"], stageRows)}
-      ${table(["Stage", "Lane", "Window", "Mode", "Min PF", "Evidence", "Confirmed", "Vetoed", "Median PF"], laneRows)}
+      ${table(["Stage", "Lane", "Window", "Mode", "Floor (before cost and auto PF)", "Evidence", "Confirmed", "Vetoed", "Net positive", "Median PF"], laneRows)}
       ${table(["Cell", "Closes prehistory", "PF prehistory", "Closes holdout", "PF holdout", "Net holdout", "Shadow entries", "Shadow PF"], cellRows)}`;
 }
 
@@ -365,6 +376,8 @@ function stagedMarkdown(run: ReplayRun): string[] {
   return [
     "### Staged lanes",
     "",
+    policyText(staged.policy),
+    "",
     `${staged.plan.join(" → ")}. ${fmt(staged.pool)} candidate cells; ${fmt(staged.validatedFinal)} validated by the final stage; ${fmt(staged.chosen)} chosen (up to ${staged.perSymbol} per market). ${fmt(staged.bookedCloses)} booked closes; ${fmt(staged.shadows)} blocked entries tracked as shadows (shadow PF ${fmt(staged.shadowPf)}).`,
     "",
     markdownTable(
@@ -373,8 +386,8 @@ function stagedMarkdown(run: ReplayRun): string[] {
     ),
     "",
     markdownTable(
-      ["Stage", "Lane", "Window", "Mode", "Min PF", "Evidence", "Confirmed", "Vetoed", "Median PF"],
-      staged.stages.flatMap((stage) => stage.lanes.map((lane) => [stage.name, lane.id, lane.window, lane.mode, lane.minPf, lane.evidence, lane.confirmed, lane.vetoed, lane.medianPf])),
+      ["Stage", "Lane", "Window", "Mode", "Floor (before cost and auto PF)", "Evidence", "Confirmed", "Vetoed", "Net positive", "Median PF"],
+      staged.stages.flatMap((stage) => stage.lanes.map((lane) => [stage.name, lane.id, lane.window, lane.mode, lane.floor, lane.evidence, lane.confirmed, lane.vetoed, lane.netPositive, lane.medianPf])),
     ),
     "",
     markdownTable(

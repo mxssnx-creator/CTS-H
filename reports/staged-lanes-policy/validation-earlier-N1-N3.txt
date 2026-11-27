@@ -1,0 +1,3 @@
+coordinated reference      net -47.48 PF 0.714 orders 4470 maxDD 16.88 green 36.4% positive 0/3
+staged, untuned floors     net -7.68 PF 0.602 orders 400 maxDD 4.36 green 35.1% positive 0/3
+staged, tuned floors       net -7.16 PF 0.618 orders 396 maxDD 4.28 green 35.1% positive 0/3

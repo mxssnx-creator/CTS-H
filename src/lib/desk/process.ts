@@ -33,6 +33,7 @@ import {
   liveShortOk,
   pfFromPnls,
   positionNotional,
+  positionRtCost,
   profitFactor,
   stopCappedQty,
 } from "./math.ts";
@@ -178,7 +179,10 @@ export type TradeLeg = {
   side: Side;
   entry: number;
   exit: number;
+  // Net P&L after round-trip costs; PF 1.0 means net zero.
   pnl: number;
+  // Round-trip cost in settlement units, already included in pnl.
+  cost: number;
   reason: "tp" | "sl" | "time" | "end";
   hold: number;
 };
@@ -1639,7 +1643,8 @@ function replayGate(
 // entry books or opens a shadow position that is tracked but not booked.
 export type LanedReplay = {
   closes: number[];
-  allow: (closes: readonly number[]) => boolean;
+  costs: number[];
+  allow: (replay: LanedReplay) => boolean;
   shadows: number;
   shadowPnl: number[];
 };
@@ -1695,7 +1700,7 @@ export function replayWindow(
       const tp = bar.o + side * dist;
       const sl = bar.o - side * stopDistance;
       if (tp > 0 && sl > 0) {
-        const active = laned ? laned.allow(laned.closes) : (gate?.cell.validExec ?? true);
+        const active = laned ? laned.allow(laned) : (gate?.cell.validExec ?? true);
         if (laned && !active) laned.shadows += 1;
         leg = {
           side,
@@ -1713,17 +1718,21 @@ export function replayWindow(
     if (leg) {
       const hit = exitOnBar(leg.side, leg.tp, leg.sl, bar, ++leg.hold, maxHold);
       if (hit || offset === slots.length - 1) {
-        const pnl = closePnl(leg.side, leg.entry, hit?.exit ?? bar.c, leg.qty, cost);
+        const exitPrice = hit?.exit ?? bar.c;
+        const pnl = closePnl(leg.side, leg.entry, exitPrice, leg.qty, cost);
+        const roundTripCost = positionRtCost(leg.entry, exitPrice, leg.qty, cost);
         if (laned) {
           laned.closes.push(pnl);
+          laned.costs.push(roundTripCost);
           if (leg.active === false) laned.shadowPnl.push(pnl);
         }
         ledger?.push({
           t: bar.t,
           side: leg.side,
           entry: leg.entry,
-          exit: hit?.exit ?? bar.c,
+          exit: exitPrice,
           pnl,
+          cost: roundTripCost,
           reason: hit?.reason ?? "end",
           hold: leg.hold,
         });

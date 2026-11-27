@@ -52,8 +52,9 @@ const hour = new Intl.DateTimeFormat("en-GB", {
 });
 const sign = (n: number, digits = 2) => `${n > 0 ? "+" : ""}${n.toFixed(digits)}`;
 const tone = (n: number): "positive" | "negative" => (n >= 0 ? "positive" : "negative");
+// PF 1.00 is neutral: net zero, including a window with no trades.
 const PFText = (win: number, loss: number) =>
-  loss > 0 ? (win / loss).toFixed(2) : win > 0 ? "No losses" : "—";
+  loss > 0 ? (win / loss).toFixed(2) : win > 0 ? "No losses" : "1.00";
 
 function Heading({
   title,
@@ -937,6 +938,11 @@ export function ReplayPage() {
           )}
           {report.staged ? (
             <Panel title="Staged lanes" aside={<span className="muted mono">{report.staged.plan.join(" → ")}</span>}>
+              <p className="muted">
+                PF is net of round-trip costs, so 1.00 is neutral. Each lane needs PF ≥ max(its floor, 1 + {report.staged.policy.costMultiple} × costs / gross loss),
+                with auto PF {report.staged.policy.autoPenalty} over {report.staged.policy.autoSamples} closes and positive net{" "}
+                {report.staged.policy.requireNet ? "required" : "optional"}.
+              </p>
               <p className="muted">
                 {num.format(report.staged.pool)} candidate cells, {num.format(report.staged.validatedFinal)} validated by the final stage,
                 {" "}{num.format(report.staged.chosen)} chosen (up to {report.staged.perSymbol} per market). {num.format(report.staged.bookedCloses)} booked closes;

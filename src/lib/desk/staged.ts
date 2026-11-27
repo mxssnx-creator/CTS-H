@@ -5,7 +5,22 @@ import { DEFAULT_FLOORS, INDICATIONS, POSITION_RT_COST_PCT, type Floors, type In
 import { saneBars } from "./heal.ts";
 import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "./intervals.ts";
 import { comboId, positionNotional } from "./math.ts";
-import { laneValue, median, ratchetPlan, scanStage, stagePlan, verdict, DEFAULT_MIN_PF, type Lane, type LaneStage, type LaneSummary, type LaneTally, type StageSummary, type StagedSummary } from "./lanes.ts";
+import {
+  buildPlan,
+  DEFAULT_LANE_POLICY,
+  laneValue,
+  median,
+  scanStage,
+  verdict,
+  type Closes,
+  type Lane,
+  type LanePolicy,
+  type LaneStage,
+  type LaneSummary,
+  type LaneTally,
+  type StageSummary,
+  type StagedSummary,
+} from "./lanes.ts";
 import type { Coordination } from "./management.ts";
 import {
   addHours,
@@ -30,7 +45,7 @@ import {
 import { defaultForInterval, newStrategyActions, normalizeStrategies, type StrategySettings } from "./strategies.ts";
 
 const WARMUP = REPLAY_WARMUP_BARS;
-// Research windows R1–R4 chose one validated cell per market, ranked by net P&L, as the default.
+// One validated cell per market is the default; research windows R1–R7 chose it (see docs/staged-lanes.md).
 export const DEFAULT_PER_SYMBOL = 1;
 
 export type StagedOpts = {
@@ -41,8 +56,11 @@ export type StagedOpts = {
   connection?: ConnectionId;
   // Preferences for the candidate pool: enabledIndications, extendedTargets, range flags and coordination modes.
   strategies?: StrategySettings;
+  // Lane policy overrides: minimum PF, auto PF penalty and samples, net requirement and ratchet step.
+  policy?: Partial<LanePolicy>;
   plan?: LaneStage[];
   thins?: number;
+  // Shortcut for policy.minPf.
   minPf?: number;
   perSymbol?: number;
   minCloses?: number;
@@ -50,6 +68,8 @@ export type StagedOpts = {
   rank?: "pf" | "net";
   // When false, the holdout enters every signal (lanes still select cells); used to measure the gate.
   gate?: boolean;
+  // Re-run the lanes on a rolling prehistory every this many hours; open positions are flattened at each boundary.
+  reselectHours?: number;
   costs?: Readonly<Record<string, number>>;
   indication?: Indication;
   range?: "short" | "wide";
@@ -64,7 +84,7 @@ type StagedCell = {
   tpAtr: number;
   slOfTp: number;
   coordination: Coordination;
-  pnls: number[];
+  closes: Closes;
   cost: number;
 };
 
@@ -101,9 +121,11 @@ type Pool = {
   notional: number;
 };
 
-// The prehistory pool depends on the window and the preferences, not on the stage plan, the minimum PF
-// or the cells per market. Tuning runs over the same windows therefore reuse one pool.
+// The prehistory pool depends on the window and the preferences, not on the lane policy, the stage plan or the
+// cells per market. Tuning runs over the same windows therefore reuse one pool.
 const poolCache = new WeakMap<object, Map<string, Pool>>();
+// Rolling runs build one pool per block; the cache keeps only the most recent few so memory stays bounded.
+const MAX_CACHED_POOLS = 8;
 
 function buildPool(
   books: { symbol: string; bars: Bar[] }[],
@@ -175,6 +197,7 @@ function buildPool(
         undefined, undefined, ledger,
       );
       const pnls = ledger.map((leg) => leg.pnl);
+      const costs = ledger.map((leg) => leg.cost);
       if (pnls.length >= 1) item.withCloses += 1;
       if (pnls.length >= 4) item.reachedSamples += 1;
       cells.push({
@@ -185,7 +208,7 @@ function buildPool(
         tpAtr: config.tpAtr,
         slOfTp: config.slOfTp,
         coordination: config.coordination,
-        pnls,
+        closes: { pnls, costs },
         cost,
       });
     }
@@ -194,26 +217,121 @@ function buildPool(
   const per = poolCache.get(books) ?? new Map<string, Pool>();
   if (!poolCache.has(books)) poolCache.set(books, per);
   per.set(key, pool);
+  while (per.size > MAX_CACHED_POOLS) per.delete(per.keys().next().value as string);
   return pool;
+}
+
+function resolvePolicy(opts: StagedOpts): LanePolicy {
+  const policy: LanePolicy = {
+    ...DEFAULT_LANE_POLICY,
+    ...opts.policy,
+    ...(opts.minPf === undefined ? {} : { minPf: opts.minPf }),
+  };
+  if (!(policy.minPf > 0)) throw new Error("The minimum PF must be positive.");
+  if (!(policy.autoPenalty >= 0) || !(policy.autoSamples >= 1)) throw new Error("Auto PF needs a non-negative penalty and at least one sample.");
+  if (!(policy.ratchetStep >= 0)) throw new Error("The ratchet step must be non-negative.");
+  return policy;
 }
 
 export function simulateStaged(
   books: { symbol: string; bars: Bar[] }[],
   equity: number,
-  _floors: Floors = DEFAULT_FLOORS,
+  floors: Floors = DEFAULT_FLOORS,
+  opts: StagedOpts,
+): SessionReport {
+  const reselect = opts.reselectHours ?? 0;
+  if (reselect > 0 && opts.hours > reselect) return simulateStagedReselected(books, equity, floors, opts, reselect);
+  return simulateStagedWindow(books, equity, opts);
+}
+
+// Rolling version: the lanes are re-run on each block's own prehistory, and block results are chained.
+function simulateStagedReselected(
+  books: { symbol: string; bars: Bar[] }[],
+  equity: number,
+  floors: Floors,
+  opts: StagedOpts,
+  reselectHours: number,
+): SessionReport {
+  const interval = opts.interval ?? "1h";
+  const step = CANDLE_INTERVALS[interval];
+  const latest = Math.max(0, ...books.map((book) => closedBars(saneBars(book.bars)).at(-1)?.t ?? 0));
+  const end = opts.end ?? latest + step;
+  const start = end - opts.hours * HOUR_MS;
+  const parts: SessionReport[] = [];
+  for (let from = start; from < end; from += reselectHours * HOUR_MS) {
+    const until = Math.min(end, from + reselectHours * HOUR_MS);
+    parts.push(simulateStaged(books, equity, floors, { ...opts, end: until, hours: (until - from) / HOUR_MS, reselectHours: 0 }));
+  }
+  const first = parts[0]!;
+  const live = parts.flatMap((part) => part.bookLive);
+  const total = summarizeReplay(live);
+  let running = 0;
+  let peak = 0;
+  let drawdown = 0;
+  for (const row of live) {
+    running += row.net;
+    peak = Math.max(peak, running);
+    drawdown = Math.max(drawdown, peak - running);
+  }
+  const stagedParts = parts.flatMap((part) => (part.staged ? [part.staged] : []));
+  const shadowTotal = stagedParts.reduce((sum, item) => sum + item.shadowCloses, 0);
+  const staged: StagedSummary | undefined = first.staged
+    ? {
+        ...first.staged,
+        pool: stagedParts.reduce((sum, item) => sum + item.pool, 0),
+        validatedFinal: stagedParts.reduce((sum, item) => sum + item.validatedFinal, 0),
+        chosen: stagedParts.reduce((sum, item) => sum + item.chosen, 0),
+        bookedCloses: total.samples,
+        shadows: stagedParts.reduce((sum, item) => sum + item.shadows, 0),
+        shadowCloses: shadowTotal,
+        shadowPf: shadowTotal ? stagedParts.reduce((sum, item) => sum + item.shadowPf * item.shadowCloses, 0) / shadowTotal : 0,
+        cells: stagedParts.flatMap((item) => item.cells),
+      }
+    : undefined;
+  return {
+    ...first,
+    ready: parts.every((part) => part.ready),
+    note: `Each ${reselectHours}h block re-runs the lanes on the preceding ${opts.preHours}h. Open positions are flattened at each block boundary.`,
+    replayHours: opts.hours,
+    bookLive: live,
+    live,
+    promoted: live,
+    samplesLive: total.samples,
+    samplesPromoted: total.samples,
+    liveNet: total.net,
+    bookNetLive: total.net,
+    promotedNet: total.net,
+    livePf: total.pf,
+    promotedPf: total.pf,
+    greenLive: total.green,
+    greenPromoted: total.green,
+    greenBookLive: total.green,
+    bookDrawdownLive: drawdown,
+    evaluatedConfigs: parts.reduce((sum, part) => sum + part.evaluatedConfigs, 0),
+    disabledConfigs: parts.reduce((sum, part) => sum + part.disabledConfigs, 0),
+    rejectedPf: parts.reduce((sum, part) => sum + part.rejectedPf, 0),
+    proven: parts.reduce((sum, part) => sum + part.proven, 0),
+    selected: parts.flatMap((part) => part.selected),
+    bookNames: parts.flatMap((part) => part.bookNames),
+    staged,
+  };
+}
+
+function simulateStagedWindow(
+  books: { symbol: string; bars: Bar[] }[],
+  equity: number,
   opts: StagedOpts,
 ): SessionReport {
   const interval = opts.interval ?? "1h";
   const step = CANDLE_INTERVALS[interval];
   if (!Number.isInteger((opts.preHours * HOUR_MS) / step) || !Number.isInteger((opts.hours * HOUR_MS) / step) || opts.hours < 1 || opts.preHours < 1 || opts.hours > 336 || opts.preHours > 336)
     throw new Error("Staged windows must align with the candle interval and span at most 336 hours.");
-  const minPf = opts.minPf ?? DEFAULT_MIN_PF;
+  const policy = resolvePolicy(opts);
   const perSymbol = opts.perSymbol ?? DEFAULT_PER_SYMBOL;
   const minCloses = opts.minCloses ?? 6;
-  const rank = opts.rank ?? "net";
   if (!Number.isInteger(perSymbol) || perSymbol < 1 || perSymbol > 10) throw new Error("Choose 1 to 10 cells per market.");
   if (!Number.isInteger(minCloses) || minCloses < 1) throw new Error("The closes requirement must be a positive whole number.");
-  const plan = opts.plan ?? ratchetPlan(stagePlan(opts.thins ?? 2), minPf);
+  const plan = opts.plan ?? buildPlan(opts.thins ?? 2, policy);
   if (!plan.length) throw new Error("A staged run needs at least one stage.");
   const preferences = opts.strategies ?? normalizeStrategies({ ...defaultForInterval(interval), extendedTargets: true, enabledIndications: [...INDICATIONS] });
   const pool = buildPool(books, equity, opts, preferences, interval);
@@ -225,7 +343,7 @@ export function simulateStaged(
   let finalLanes: Lane[] = plan[0]!.lanes;
   for (const stage of plan) {
     const input = active;
-    const scan = scanStage(input.map((cell) => cell.pnls), stage.lanes);
+    const scan = scanStage(input.map((cell) => cell.closes), stage.lanes, policy.requireNet);
     const output = input.filter((_, i) => scan.validated[i] === 1);
     stageSummaries.push(summarizeStage(stage, input, scan, output));
     finalLanes = stage.lanes;
@@ -233,7 +351,7 @@ export function simulateStaged(
     if (!output.length) break;
   }
 
-  // Selection: top validated cells per market by prehistory PF, requiring a minimum of closes.
+  // Selection: top validated cells per market, with a minimum of closes and positive net P&L when required.
   const byMarket = new Map<string, StagedCell[]>();
   for (const cell of active) {
     const list = byMarket.get(cell.symbol) ?? [];
@@ -243,9 +361,10 @@ export function simulateStaged(
   const chosen: StagedCell[] = [];
   for (const { symbol } of aligned) {
     const candidates = (byMarket.get(symbol) ?? [])
-      .filter((cell) => cell.pnls.length >= minCloses)
-      .map((cell) => ({ cell, value: laneValue(cell.pnls, cell.pnls.length) }))
-      .sort((a, b) => (rank === "net" ? b.value.net - a.value.net : b.value.pf - a.value.pf) || b.value.n - a.value.n);
+      .filter((cell) => cell.closes.pnls.length >= minCloses)
+      .map((cell) => ({ cell, value: laneValue(cell.closes, cell.closes.pnls.length) }))
+      .filter((item) => !policy.requireNet || item.value.net > 0)
+      .sort((a, b) => (opts.rank === "pf" ? b.value.pf - a.value.pf : b.value.net - a.value.net) || b.value.n - a.value.n);
     for (const item of candidates.slice(0, perSymbol)) chosen.push(item.cell);
   }
 
@@ -257,6 +376,7 @@ export function simulateStaged(
   const cellRows: StagedSummary["cells"] = [];
   let shadows = 0;
   const shadowPnl: number[] = [];
+  const gated = opts.gate !== false;
   for (const cell of chosen) {
     const { bars, atr, signals } = contextBySymbol.get(cell.symbol)!;
     const cellSignals = signals.get(cell.indication)!;
@@ -264,25 +384,32 @@ export function simulateStaged(
     replayWindow(bars, atr, cellSignals, WARMUP, pre, notional, cell.cost, cell.tpAtr, cell.slOfTp, true, cell.coordination, true, preferences, interval);
     addHours(bookPreAcc, pre);
     const live: HourAcc[] = Array.from({ length: replayLength }, (_, k) => hourAccumulator(bars[replayFrom + k]!.t));
-    const gated = opts.gate !== false;
-    const laned: LanedReplay = { closes: cell.pnls.slice(), allow: (closes) => !gated || verdict(closes, finalLanes).validated, shadows: 0, shadowPnl: [] };
+    const laned: LanedReplay = {
+      closes: cell.closes.pnls.slice(),
+      costs: cell.closes.costs.slice(),
+      allow: (replay) => !gated || verdict({ pnls: replay.closes, costs: replay.costs }, finalLanes, policy.requireNet).validated,
+      shadows: 0,
+      shadowPnl: [],
+    };
     replayWindow(bars, atr, cellSignals, replayFrom, live, notional, cell.cost, cell.tpAtr, cell.slOfTp, true, cell.coordination, true, preferences, interval, undefined, undefined, undefined, laned);
     addHours(bookLiveAcc, live);
     shadows += laned.shadows;
     shadowPnl.push(...laned.shadowPnl);
     const preSummary = summarizeReplay(clockHours(pre, step));
     const liveSummary = summarizeReplay(clockHours(live, step));
-    selected.push({ name: cell.name, symbol: cell.symbol, indication: cell.indication, range: cell.range, requiredPf: minPf, pre: preSummary, replay: liveSummary });
+    selected.push({ name: cell.name, symbol: cell.symbol, indication: cell.indication, range: cell.range, requiredPf: policy.minPf, pre: preSummary, replay: liveSummary });
+    const prePnl = laneValue(cell.closes, cell.closes.pnls.length);
     cellRows.push({
       symbol: cell.symbol,
       name: cell.name,
-      closesPre: cell.pnls.length,
-      pfPre: laneValue(cell.pnls, cell.pnls.length).pf,
+      closesPre: cell.closes.pnls.length,
+      pfPre: prePnl.pf,
+      netPre: prePnl.net,
       closesHoldout: liveSummary.samples,
       pfHoldout: liveSummary.pf,
       netHoldout: liveSummary.net,
       shadows: laned.shadows,
-      shadowPf: laneValue(laned.shadowPnl, laned.shadowPnl.length).pf,
+      shadowPf: laneValue({ pnls: laned.shadowPnl, costs: laned.shadowPnl.map(() => 0) }, laned.shadowPnl.length).pf,
     });
   }
 
@@ -290,13 +417,14 @@ export function simulateStaged(
   const live = clockHours(bookLiveAcc, step);
   const preSum = summarizeReplay(pre);
   const liveSum = summarizeReplay(live);
-  const shadow = laneValue(shadowPnl, shadowPnl.length);
+  const shadow = laneValue({ pnls: shadowPnl, costs: shadowPnl.map(() => 0) }, shadowPnl.length);
   const staged: StagedSummary = {
     plan: plan.map((stage) => stage.name),
+    policy,
     stages: stageSummaries,
     finalStage: stageSummaries.at(-1)?.name ?? "",
     perSymbol,
-    minPf,
+    minPf: policy.minPf,
     minCloses,
     pool: cells.length,
     validatedFinal: active.length,
@@ -325,7 +453,7 @@ export function simulateStaged(
   return {
     ready: aligned.length > 0,
     note: aligned.length
-      ? `Staged lanes: ${plan.map((stage) => stage.name).join(" → ")}. Each stage evaluates only the cells validated before it. Up to ${perSymbol} validated cells per market trade the holdout with the final lanes gating entries; blocked entries are tracked as shadow positions.`
+      ? `Staged lanes: ${plan.map((stage) => stage.name).join(" → ")}. Each lane applies its own auto PF (minimum ${policy.minPf}) and each stage evaluates only the cells validated before it. Up to ${perSymbol} validated cells per market trade the holdout with the final lanes gating entries; blocked entries are tracked as shadow positions.`
       : `Need ${span} contiguous closed BingX ${interval} candles for a ${opts.hours}h staged replay.`,
     pre,
     live,
@@ -366,7 +494,7 @@ export function simulateStaged(
     bookNames: selected.map((item) => item.name),
     coverage: coverageRows,
     selected,
-    staged,
+    staged: staged,
   };
 }
 
@@ -383,15 +511,16 @@ function summarizeStage(
       kind: lane.kind,
       window: lane.window,
       mode: lane.mode,
-      minPf: lane.minPf,
+      floor: lane.minPf + lane.ratchet,
       evidence: tally.evidence,
       confirmed: tally.confirmed,
       vetoed: tally.vetoed,
+      netPositive: tally.netPositive,
       medianPf: median(tally.pfs),
     };
   });
-  const medianIn = median(input.filter((cell) => cell.pnls.length).map((cell) => laneValue(cell.pnls, cell.pnls.length).pf));
-  const medianOut = median(output.map((cell) => laneValue(cell.pnls, cell.pnls.length).pf));
+  const medianIn = median(input.filter((cell) => cell.closes.pnls.length).map((cell) => laneValue(cell.closes, cell.closes.pnls.length).pf));
+  const medianOut = median(output.map((cell) => laneValue(cell.closes, cell.closes.pnls.length).pf));
   return {
     id: stage.id,
     name: stage.name,

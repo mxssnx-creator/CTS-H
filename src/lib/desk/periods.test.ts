@@ -84,10 +84,10 @@ test("periods measured from a replay origin are always complete", () => {
   assert.equal(periods.at(-1)!.end, origin + 12 * HOUR_MS);
 });
 
-test("a period without trades reports null win rate and no profit factor", () => {
+test("a period without trades reports null win rate and neutral profit factor 1.0", () => {
   const [period] = periodRows([hour(0, { mtm: 0.1, openLegs: 1 })], 4);
   assert.equal(period!.winRate, null);
-  assert.equal(period!.pf, 0);
+  assert.equal(period!.pf, 1);
   assert.equal(period!.openLegsEnd, 1);
 });
 

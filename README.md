@@ -66,20 +66,25 @@ The CLI and web desk accept 1m, 5m, 15m, 30m, 1h and 4h candles. Settings are re
 
 ### Staged lanes
 
-`--profile staged` evaluates each candidate cell (market × configuration) on its own position history. Each lane looks at the last N closed positions of that cell and computes a PF. Stages recurse: Base, then Main, then thinner stages. Each stage evaluates only the cells validated before it, so no candidate is re-checked by a stage it never passed.
+`--profile staged` evaluates each candidate cell (market × configuration) on its own position history. Each lane (relation) looks at the last N closed positions of that cell. Stages recurse: Base, then Main, then thinner stages. Each stage evaluates only the cells validated before it.
 
-- **Lanes:** long (N = 10–30), short (N = 4–8 in Base, 8–16 later) and last (N = 1–4). Every lane is independent.
-- **Both lanes** confirm a cell when PF ≥ `--min-pf` and veto it below. The short lanes in Main are positive-only, as specified.
-- **Evidence floor:** a lane gives evidence only once the cell has at least 4 closes. Thin stages raise the PF bar by 0.05 each.
-- **Validation:** no lane vetoes and at least one lane confirms.
-- **Holdout:** the top `--per-symbol` validated cells per market (default 1, ranked by net P&L) trade. The lanes of the final stage gate every entry, using the cell's closes so far. A blocked entry becomes a shadow position: it is tracked so the lanes can recover, but it is not booked.
+- **PF is net of round-trip costs.** PF 1.00 is neutral, including a window with no trades.
+- **Cost floor.** Each lane needs PF ≥ max(its floor, 1 + costMultiple × costs / gross loss). With the default costMultiple of 1.0, a PF of 1.1 equals one round trip of costs whenever costs are 10% of gross loss. On the research windows the measured ratio is about 0.10.
+- **Per-relation floors.** Each lane has its own tuned floor (defaults in `TUNED_LANE_MIN_PF`). Lanes without one use `minPf` (1.00).
+- **Auto PF and net.** Short evidence faces the engine's auto PF term. Lanes and whole-history validation need positive net.
+- **Evidence floor:** a lane gives evidence only once the cell has at least 4 closes. Thin stages raise every floor by 0.05 each.
+- **Validation:** no lane vetoes and at least one lane confirms. A cell's full history must also be net positive.
+- **Holdout:** the top `--per-symbol` validated cells per market (default 1, ranked by net P&L) trade. The final stage's lanes gate every entry. A blocked entry becomes a shadow position: tracked so the lanes can recover, but not booked.
 
-The design is in [docs/staged-lanes.md](docs/staged-lanes.md). Its results against the coordinated engine, on research and held-out windows, are in [reports/staged-lanes-10d-60-markets](reports/staged-lanes-10d-60-markets/README.md). The staged profile lost less and drew down less than the coordinated engine, but its PF stayed below 1 and it placed far fewer orders, so it is not a recommended profile. The report shows every stage, lane, validated share, median PF in and out, and the per-market cells with their shadow statistics.
+Settings: `--min-pf`, `--auto-penalty`, `--require-net on|off`, and `--lane-settings file.json` for the per-relation floors, cost multiple and ratchet. [reports/staged-lanes-policy](reports/staged-lanes-policy/README.md) has the tuning trace, the floors and the validation outputs. The design is in [docs/staged-lanes.md](docs/staged-lanes.md).
+
+The result is a limit on losses, not a profit. Against the coordinated engine on the same windows, the staged profile loses far less and draws down less, but it is not net positive in any validation window and does not reach PF 1 with confidence. It is not a recommended profile.
 
 ```sh
 node scripts/cts-h.ts replay --connection bingx-x01 --symbols <markets> \
   --hours 240 --pre-hours 72 --history-hours 1440 --interval 1h --profile staged \
-  --per-symbol 1 --min-pf 1 --thins 2 --min-closes 6 --html staged.html --markdown staged.md
+  --per-symbol 1 --thins 2 --min-closes 6 --lane-settings reports/staged-lanes-policy/tuned-floors.json \
+  --html staged.html --markdown staged.md
 ```
 
 ### Period reports and coverage

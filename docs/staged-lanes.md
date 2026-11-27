@@ -53,3 +53,11 @@ Evidence floor: a lane gives evidence only when the cell has at least 4 closes i
 
 - Overlays (Axis, Block, DCA, Relate) are not applied inside the staged holdout. Use the coordinated profile for overlays.
 - Daily reselection and independent indication books are not combined with the staged profile.
+
+## Conventions and settings (current)
+
+- PF is computed on P&L after round-trip costs. PF 1.0 is neutral, and a window with no trades reads 1.00.
+- Each lane needs PF ≥ max(its floor, 1 + costMultiple × costs / gross loss), plus the auto PF term 0.15 × √(4 / max(4, closes)) and the thin-stage ratchet. The cost multiple defaults to 1.0, so PF 1.1 is one round trip of costs when costs are 10% of gross loss.
+- Each relation (lane id, e.g. `short8`) has its own floor. The defaults are in `TUNED_LANE_MIN_PF`, tuned on research windows R1–R7 and checked on validation windows. Settings can be overridden with `--lane-settings`.
+- Lanes and the full-history validation need positive net. Daily reselection exists (`--reselect-hours`) but is off: it performed much worse.
+- Results and their limits: `reports/staged-lanes-policy/README.md`.
