@@ -775,17 +775,23 @@ function pushPnl(cell: Cell, pnl: number) {
   cell.pf = cell.gl < 1e-12 ? (cell.gw > 1e-12 ? 4 : 0) : cell.gw / cell.gl;
 }
 
-export function gateCell(cell: Cell, floors: Floors, settings?: PfSettings) {
-  const recent = Math.max(0, cell.lastN.length - LASTN.valid);
-  const suspension = Math.max(0, cell.lastN.length - LASTN.disable);
+// The legacy per-cell gate, used by the coordinated engine and by staged runs with stage progression off. A cell is
+// valid when its last N closes clear the auto PF requirement with non-negative net, it follows through after a
+// suspension, and once it has six or more closes its lifetime record is proven.
+export type GateState = { lastN: readonly number[]; n: number; net: number; pf: number; liveFloor: boolean };
+export type GateResult = { validExec: boolean; disabled: boolean; requiredRecentPf: number };
+
+export function gateState(state: GateState, floors: Floors, settings?: PfSettings): GateResult {
+  const recent = Math.max(0, state.lastN.length - LASTN.valid);
+  const suspension = Math.max(0, state.lastN.length - LASTN.disable);
   let gains = 0;
   let losses = 0;
   let net = 0;
   let suspensionNet = 0;
   let recentGains = 0;
   let recentLosses = 0;
-  for (let i = recent; i < cell.lastN.length; i++) {
-    const pnl = cell.lastN[i]!;
+  for (let i = recent; i < state.lastN.length; i++) {
+    const pnl = state.lastN[i]!;
     net += pnl;
     if (pnl > 0) gains += pnl;
     else if (pnl < 0) losses -= pnl;
@@ -795,26 +801,45 @@ export function gateCell(cell: Cell, floors: Floors, settings?: PfSettings) {
       else if (pnl < 0) recentLosses -= pnl;
     }
   }
-  const samples = cell.lastN.length - recent;
+  const samples = state.lastN.length - recent;
   const required = settings?.autoPf ? settings.autoPfSamples : LASTN.minSamples;
   const recentFloor = requiredPf(floors.short, samples, settings);
-  cell.requiredRecentPf = recentFloor;
   const pass = samples >= required && profitFactor(gains, losses) >= recentFloor && net >= 0;
-  const lifetimeFloor = requiredPf(Math.max(floors.base, floors.overall), cell.n, settings);
+  const lifetimeFloor = requiredPf(Math.max(floors.base, floors.overall), state.n, settings);
   const proven =
-    cell.n >= 6 &&
-    cell.pf >= lifetimeFloor &&
-    cell.net > 0 &&
-    !(cell.pf >= PF_NO_LOSS_NEAR && cell.net <= 1e-6);
+    state.n >= 6 &&
+    state.pf >= lifetimeFloor &&
+    state.net > 0 &&
+    !(state.pf >= PF_NO_LOSS_NEAR && state.net <= 1e-6);
   const followThrough =
     !settings?.autoPf ||
     !settings.autoPfRecent ||
-    cell.lastN.length - suspension < Math.max(3, Math.ceil(required / 2)) ||
-    (suspensionNet > 0 &&
-      profitFactor(recentGains, recentLosses) >= Math.max(floors.base, floors.short, 1));
-  cell.validExec = cell.liveFloor && pass && followThrough && (cell.n < 6 || proven);
-  cell.disabled =
-    !cell.validExec && cell.lastN.length - suspension >= LASTN.minSamples && suspensionNet < 0;
+    state.lastN.length - suspension < Math.max(3, Math.ceil(required / 2)) ||
+    (suspensionNet > 0 && profitFactor(recentGains, recentLosses) >= Math.max(floors.base, floors.short, 1));
+  const validExec = state.liveFloor && pass && followThrough && (state.n < 6 || proven);
+  const disabled = !validExec && state.lastN.length - suspension >= LASTN.minSamples && suspensionNet < 0;
+  return { validExec, disabled, requiredRecentPf: recentFloor };
+}
+
+export function gateCell(cell: Cell, floors: Floors, settings?: PfSettings) {
+  const result = gateState(cell, floors, settings);
+  cell.requiredRecentPf = result.requiredRecentPf;
+  cell.validExec = result.validExec;
+  cell.disabled = result.disabled;
+}
+
+// Gate state of a cell built from its closes alone, in the order they closed. The same statistics pushPnl keeps on a cell.
+export function gateStateOf(pnls: readonly number[], liveFloor = true): GateState {
+  let net = 0;
+  let gw = 0;
+  let gl = 0;
+  for (const pnl of pnls) {
+    net += pnl;
+    if (pnl >= 0) gw += pnl;
+    else gl += Math.abs(pnl);
+  }
+  const pf = gl < 1e-12 ? (gw > 1e-12 ? 4 : 0) : gw / gl;
+  return { lastN: pnls.slice(-LASTN.eval), n: pnls.length, net, pf, liveFloor };
 }
 
 function blankCell(

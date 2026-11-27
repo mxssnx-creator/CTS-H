@@ -94,3 +94,36 @@ test("the staged run is deterministic", () => {
   assert.deepEqual(a.staged, b.staged);
   assert.deepEqual(a.bookLive, b.bookLive);
 });
+
+test("stage progression is on by default, and the explicit switch matches the default", () => {
+  const byDefault = simulateStaged(books, BOOK, DEFAULT_FLOORS, { hours: HOLD, preHours: PRE, end: END, strategies: preferences });
+  const explicit = simulateStaged(books, BOOK, DEFAULT_FLOORS, { hours: HOLD, preHours: PRE, end: END, strategies: preferences, progression: true });
+  assert.equal(byDefault.staged!.logistics, "progressive");
+  assert.ok(byDefault.staged!.stages.length >= 2);
+  assert.deepEqual(byDefault.staged, explicit.staged);
+  assert.deepEqual(byDefault.bookLive, explicit.bookLive);
+});
+
+test("the legacy logistics run to completion without stages, and their books stay consistent", () => {
+  const legacy = simulateStaged(books, BOOK, DEFAULT_FLOORS, { hours: HOLD, preHours: PRE, end: END, strategies: preferences, progression: false, perSymbol: 2 });
+  const staged = legacy.staged!;
+  assert.equal(staged.logistics, "legacy");
+  assert.deepEqual(staged.plan, []);
+  assert.deepEqual(staged.stages, []);
+  assert.equal(staged.finalStage, "");
+  assert.ok(legacy.ready);
+  assert.ok(staged.validatedFinal <= staged.pool);
+  const perMarket = new Map<string, number>();
+  for (const cell of legacy.selected) perMarket.set(cell.symbol, (perMarket.get(cell.symbol) ?? 0) + 1);
+  for (const count of perMarket.values()) assert.ok(count <= 2);
+  const bookedTrades = legacy.bookLive.reduce((total, row) => total + row.trades, 0);
+  assert.equal(bookedTrades, legacy.selected.reduce((total, cell) => total + cell.replay.samples, 0));
+  assert.equal(staged.bookedCloses, bookedTrades);
+});
+
+test("the legacy run is deterministic", () => {
+  const a = simulateStaged(books, BOOK, DEFAULT_FLOORS, { hours: HOLD, preHours: PRE, end: END, strategies: preferences, progression: false });
+  const b = simulateStaged(books, BOOK, DEFAULT_FLOORS, { hours: HOLD, preHours: PRE, end: END, strategies: preferences, progression: false });
+  assert.deepEqual(a.staged, b.staged);
+  assert.deepEqual(a.bookLive, b.bookLive);
+});

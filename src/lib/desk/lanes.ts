@@ -274,6 +274,8 @@ export type StagedCellSummary = {
 };
 
 export type StagedSummary = {
+  // Progressive: Base, Main and thin stages in turn. Legacy: one pass of the per-cell last-N gate, with no stages.
+  logistics: "progressive" | "legacy";
   plan: string[];
   policy: LanePolicy;
   stages: StageSummary[];

@@ -937,17 +937,25 @@ export function ReplayPage() {
             </Panel>
           )}
           {report.staged ? (
-            <Panel title="Staged lanes" aside={<span className="muted mono">{report.staged.plan.join(" → ")}</span>}>
-              <p className="muted">
-                PF is net of round-trip costs, so 1.00 is neutral. Each lane needs PF ≥ max(its floor, 1 + {report.staged.policy.costMultiple} × costs / gross loss),
-                with auto PF {report.staged.policy.autoPenalty} over {report.staged.policy.autoSamples} closes and positive net{" "}
-                {report.staged.policy.requireNet ? "required" : "optional"}.
-              </p>
+            <Panel title="Staged lanes" aside={<span className="muted mono">{report.staged.logistics === "legacy" ? "Legacy logistics" : report.staged.plan.join(" → ")}</span>}>
+              {report.staged.logistics === "legacy" ? (
+                <p className="muted">
+                  Stage progression is off. Each cell is validated once by the per-cell last-N gate (last 50 closes, recent window 15,
+                  suspension 12, auto PF), and that gate decides every holdout entry from the cell's own closes. PF is net of costs, so 1.00 is neutral.
+                </p>
+              ) : (
+                <p className="muted">
+                  PF is net of round-trip costs, so 1.00 is neutral. Each lane needs PF ≥ max(its floor, 1 + {report.staged.policy.costMultiple} × costs / gross loss),
+                  with auto PF {report.staged.policy.autoPenalty} over {report.staged.policy.autoSamples} closes and positive net{" "}
+                  {report.staged.policy.requireNet ? "required" : "optional"}.
+                </p>
+              )}
               <p className="muted">
                 {num.format(report.staged.pool)} candidate cells, {num.format(report.staged.validatedFinal)} validated by the final stage,
                 {" "}{num.format(report.staged.chosen)} chosen (up to {report.staged.perSymbol} per market). {num.format(report.staged.bookedCloses)} booked closes;
                 {" "}{num.format(report.staged.shadows)} entries blocked and tracked as shadows (shadow PF {report.staged.shadowPf.toFixed(2)}).
               </p>
+              {report.staged.logistics === "legacy" ? null : (
               <div className="table-scroll">
                 <table className="desk-table">
                   <thead>
@@ -978,6 +986,7 @@ export function ReplayPage() {
                   </tbody>
                 </table>
               </div>
+              )}
               {report.staged.cells.length ? (
                 <div className="table-scroll">
                   <table className="desk-table">
@@ -1320,6 +1329,15 @@ export function SettingsPage() {
               checked={strategies.autoPfRecent}
               disabled={!allow.change_floors || !strategies.autoPf}
               onChange={(event) => setStrategies({ autoPfRecent: event.currentTarget.checked })}
+            />
+          </label>
+          <label>
+            <span>Stage progression (Base, Main, thin lanes)</span>
+            <input
+              type="checkbox"
+              checked={strategies.stageProgression}
+              disabled={!allow.change_floors}
+              onChange={(event) => setStrategies({ stageProgression: event.currentTarget.checked })}
             />
           </label>
         </div>

@@ -54,6 +54,8 @@ export type StrategySettings = TrailSettings &
     wideRange: boolean;
     autoPf: boolean;
     autoPfRecent: boolean;
+    // Staged lanes: Base, Main and thin stages in turn. Off, staged runs use the legacy per-cell last-N logistics.
+    stageProgression: boolean;
     microExtended: boolean;
     microReplayGate: boolean;
     extendedTargets: boolean;
@@ -68,6 +70,7 @@ export const DEFAULT_STRATEGIES: StrategySettings = {
   minimumPf: 1,
   autoPf: true,
   autoPfRecent: true,
+  stageProgression: true,
   autoPfPenalty: 0.15,
   autoPfSamples: 4,
   microTargetCosts: 1.5,
@@ -135,6 +138,7 @@ export function normalizeStrategies(input?: Partial<StrategySettings>): Strategy
     "wideRange",
     "autoPf",
     "autoPfRecent",
+    "stageProgression",
     "microExtended",
     "microReplayGate",
     "extendedTargets",

@@ -28,6 +28,8 @@ import {
   clockHours,
   closedBars,
   coordinatedConfigs,
+  gateState,
+  gateStateOf,
   hourAccumulator,
   REPLAY_WARMUP_BARS,
   replayWindow,
@@ -59,6 +61,9 @@ export type StagedOpts = {
   // Lane policy overrides: minimum PF, auto PF penalty and samples, net requirement and ratchet step.
   policy?: Partial<LanePolicy>;
   plan?: LaneStage[];
+  // Stage progression: on by default. Off, cells are validated by the legacy per-cell last-N gate, and that gate also
+  // decides every holdout entry from the cell's own closes.
+  progression?: boolean;
   thins?: number;
   // Shortcut for policy.minPf.
   minPf?: number;
@@ -331,25 +336,36 @@ function simulateStagedWindow(
   const minCloses = opts.minCloses ?? 6;
   if (!Number.isInteger(perSymbol) || perSymbol < 1 || perSymbol > 10) throw new Error("Choose 1 to 10 cells per market.");
   if (!Number.isInteger(minCloses) || minCloses < 1) throw new Error("The closes requirement must be a positive whole number.");
-  const plan = opts.plan ?? buildPlan(opts.thins ?? 2, policy);
-  if (!plan.length) throw new Error("A staged run needs at least one stage.");
   const preferences = opts.strategies ?? normalizeStrategies({ ...defaultForInterval(interval), extendedTargets: true, enabledIndications: [...INDICATIONS] });
+  // Stage progression is on by default. Off, the run uses the legacy per-cell logistics instead of the stages.
+  const progressive = opts.progression ?? preferences.stageProgression;
+  const plan = progressive ? (opts.plan ?? buildPlan(opts.thins ?? 2, policy)) : [];
+  if (progressive && !plan.length) throw new Error("A staged run needs at least one stage.");
   const pool = buildPool(books, equity, opts, preferences, interval);
   const { cells, contexts, aligned, unavailable, disabledConfigs, coverage, span, preLength, replayLength, replayFrom, notional } = pool;
 
   // Stages: each one evaluates only the cells validated before it.
   const stageSummaries: StageSummary[] = [];
   let active = cells;
-  let finalLanes: Lane[] = plan[0]!.lanes;
-  for (const stage of plan) {
-    const input = active;
-    const scan = scanStage(input.map((cell) => cell.closes), stage.lanes, policy.requireNet);
-    const output = input.filter((_, i) => scan.validated[i] === 1);
-    stageSummaries.push(summarizeStage(stage, input, scan, output));
-    finalLanes = stage.lanes;
-    active = output;
-    if (!output.length) break;
+  let finalLanes: Lane[] = plan[0]?.lanes ?? [];
+  if (progressive) {
+    for (const stage of plan) {
+      const input = active;
+      const scan = scanStage(input.map((cell) => cell.closes), stage.lanes, policy.requireNet);
+      const output = input.filter((_, i) => scan.validated[i] === 1);
+      stageSummaries.push(summarizeStage(stage, input, scan, output));
+      finalLanes = stage.lanes;
+      active = output;
+      if (!output.length) break;
+    }
+  } else {
+    // Legacy logistics: one pass of the per-cell last-N gate over each cell's prehistory closes.
+    active = cells.filter((cell) => gateState(gateStateOf(cell.closes.pnls), DEFAULT_FLOORS, preferences).validExec);
   }
+  // Holdout entries pass the final stage's lanes, or in legacy logistics the per-cell gate on the cell's own closes.
+  const entryGate = progressive
+    ? (replay: LanedReplay) => verdict({ pnls: replay.closes, costs: replay.costs }, finalLanes, policy.requireNet).validated
+    : (replay: LanedReplay) => gateState(gateStateOf(replay.closes), DEFAULT_FLOORS, preferences).validExec;
 
   // Selection: top validated cells per market, with a minimum of closes and positive net P&L when required.
   const byMarket = new Map<string, StagedCell[]>();
@@ -387,7 +403,7 @@ function simulateStagedWindow(
     const laned: LanedReplay = {
       closes: cell.closes.pnls.slice(),
       costs: cell.closes.costs.slice(),
-      allow: (replay) => !gated || verdict({ pnls: replay.closes, costs: replay.costs }, finalLanes, policy.requireNet).validated,
+      allow: (replay) => !gated || entryGate(replay),
       shadows: 0,
       shadowPnl: [],
     };
@@ -419,10 +435,11 @@ function simulateStagedWindow(
   const liveSum = summarizeReplay(live);
   const shadow = laneValue({ pnls: shadowPnl, costs: shadowPnl.map(() => 0) }, shadowPnl.length);
   const staged: StagedSummary = {
+    logistics: progressive ? "progressive" : "legacy",
     plan: plan.map((stage) => stage.name),
     policy,
     stages: stageSummaries,
-    finalStage: stageSummaries.at(-1)?.name ?? "",
+    finalStage: progressive ? (stageSummaries.at(-1)?.name ?? "") : "",
     perSymbol,
     minPf: policy.minPf,
     minCloses,
@@ -453,7 +470,7 @@ function simulateStagedWindow(
   return {
     ready: aligned.length > 0,
     note: aligned.length
-      ? `Staged lanes: ${plan.map((stage) => stage.name).join(" → ")}. Each lane applies its own auto PF (minimum ${policy.minPf}) and each stage evaluates only the cells validated before it. Up to ${perSymbol} validated cells per market trade the holdout with the final lanes gating entries; blocked entries are tracked as shadow positions.`
+      ? progressive ? `Staged lanes: ${plan.map((stage) => stage.name).join(" → ")}. Each lane applies its own auto PF (minimum ${policy.minPf}) and each stage evaluates only the cells validated before it. Up to ${perSymbol} validated cells per market trade the holdout with the final lanes gating entries; blocked entries are tracked as shadow positions.` : `Legacy logistics: stage progression is off. Each cell is validated once by the per-cell last-N gate (last 50 closes, recent window 15, suspension 12, auto PF), and that gate decides every holdout entry from each cell's own closes. ${cells.length} candidate cells, ${active.length} validated, up to ${perSymbol} per market.`
       : `Need ${span} contiguous closed BingX ${interval} candles for a ${opts.hours}h staged replay.`,
     pre,
     live,

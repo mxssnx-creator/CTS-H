@@ -7,6 +7,7 @@ import { exitOnBar, simulateSessions, type Bar } from "./process.ts";
 import {
   adjustPosition,
   managedEntry,
+  DEFAULT_STRATEGIES,
   defaultForInterval,
   normalizeStrategies,
   newStrategyActions,
@@ -331,4 +332,11 @@ test("indication studies match separate runs, including the rolling gate and res
     ...opts, independentIndications: true,
     strategies: normalizeStrategies({ ...strategies, axis: true }),
   }), /overlays/);
+});
+
+test("stage progression is on by default and can be switched off explicitly", () => {
+  assert.equal(DEFAULT_STRATEGIES.stageProgression, true);
+  assert.equal(normalizeStrategies().stageProgression, true);
+  assert.equal(normalizeStrategies({ stageProgression: false }).stageProgression, false);
+  assert.equal(normalizeStrategies({ stageProgression: "off" as unknown as boolean }).stageProgression, true);
 });

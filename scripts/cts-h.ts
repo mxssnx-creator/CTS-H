@@ -48,6 +48,7 @@ const HELP = `CTS-H BingX Trading Desk
          [--strategy-settings config.json] [--volume-factor 1.0] [--independent-indications] [--reselect-hours 24]
          [--period-hours 4] [--html report.html] [--markdown report.md]
          [--profile staged --per-symbol 1 --thins 2 --min-closes 6 --min-pf 1.05 --auto-penalty 0.15 --require-net on|off]
+         [--stages on|off]   stage progression (default on); off runs the legacy per-cell last-N logistics
   doctor
   account --connection bingx-x02
   propose --connection bingx-x02 --symbol ETH-USDT --side long --qty N --stop N --target N --why TEXT
@@ -63,6 +64,13 @@ const HELP = `CTS-H BingX Trading Desk
   clear-controls TICKET --confirm TICKET
   review TICKET --why TEXT
   show TICKET`;
+
+// Strict on/off switch: a typo fails loudly instead of silently taking the default.
+function onOff(value: string, name: string): boolean {
+  if (value === "on") return true;
+  if (value === "off") return false;
+  throw new Error(`Use --${name} on or --${name} off.`);
+}
 
 function envCredentials(connection: PrivateConnection): Credentials | null {
   const prefix = `BINGX_${connection.slot}`;
@@ -143,6 +151,7 @@ async function main() {
       "min-closes": { type: "string" },
       "auto-penalty": { type: "string" },
       "require-net": { type: "string" },
+      stages: { type: "string" },
       markdown: { type: "string" },
       "independent-indications": { type: "boolean" },
       "reselect-hours": { type: "string" },
@@ -271,6 +280,7 @@ async function main() {
       ...(volume === undefined ? {} : { volumeFactor: number(volume, "volume factor", [0.1, 10]) }),
       ...(minimumPf === undefined ? {} : { minimumPf: number(minimumPf, "minimum PF", [1, 4]) }),
       ...(autoPf === undefined ? {} : { autoPf: autoPf === "on" }),
+      ...(values.stages === undefined ? {} : { stageProgression: onOff(values.stages, "stages") }),
       ...(profile === "staged" ? { extendedTargets: true, enabledIndications: INDICATIONS } : {}),
       ...(values.indication === "all" ? { enabledIndications: INDICATIONS } : {}),
     };
@@ -346,6 +356,8 @@ async function main() {
             policy: laneSettings,
             thins: number(values.thins ?? "2", "thin stages", [0, 4]),
             minCloses: number(values["min-closes"] ?? "6", "minimum closes", [1, 200]),
+            // Stage progression is on by default; --stages off runs the legacy per-cell last-N logistics.
+            progression: values.stages === undefined ? undefined : onOff(values.stages, "stages"),
           },
         }),
       );

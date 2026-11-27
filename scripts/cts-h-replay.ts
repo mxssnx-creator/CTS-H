@@ -12,7 +12,7 @@ import { CANDLE_INTERVALS, HOUR_MS, type CandleInterval } from "../src/lib/desk/
 import { loadKlines } from "../src/lib/desk/market.server.ts";
 import { positionNotional } from "../src/lib/desk/math.ts";
 import { periodRows, type PeriodRow } from "../src/lib/desk/periods.ts";
-import type { LanePolicy } from "../src/lib/desk/lanes.ts";
+import type { LanePolicy, StagedSummary } from "../src/lib/desk/lanes.ts";
 import { simulateStaged } from "../src/lib/desk/staged.ts";
 import {
   simulateSessions,
@@ -104,7 +104,7 @@ export async function captureReplay(
 const SIZES: ReplaySize[] = ["base", "axis", "block", "both"];
 type ReplayScope = Pick<
   ReplayOpts, "preHours" | "indication" | "range" | "trailing" | "selectedOnly" | "reselectHours" | "independentIndications"
-> & { staged?: { perSymbol: number; minPf?: number; thins: number; minCloses: number; policy?: Partial<LanePolicy> } };
+> & { staged?: { perSymbol: number; minPf?: number; thins: number; minCloses: number; policy?: Partial<LanePolicy>; progression?: boolean } };
 const fingerprints = new WeakMap<Capture, Map<number, string>>();
 
 export function replayCosts(capture: Capture, slipBps: number) {
@@ -157,6 +157,7 @@ export function runReplay(
           thins: staged?.thins,
           minCloses: staged?.minCloses,
           policy: staged?.policy,
+          progression: staged?.progression,
           reselectHours: scope.reselectHours,
         })
       : simulateSessions(capture.books, BOOK, DEFAULT_FLOORS, {
@@ -362,17 +363,32 @@ function stagedHtml(run: ReplayRun): string {
   const cellRows = staged.cells.map((cell) =>
     row([cell.name, cell.closesPre, cell.pfPre, cell.closesHoldout, cell.pfHoldout, cell.netHoldout, cell.shadows, cell.shadowPf]),
   ).join("");
-  return `<h3>Staged lanes</h3>
-      <p>${esc(policyText(staged.policy))}</p>
-      <p>${esc(staged.plan.join(" → "))}. ${fmt(staged.pool)} candidate cells in the prehistory pool; ${fmt(staged.validatedFinal)} validated by the final stage; ${fmt(staged.chosen)} chosen for the holdout (up to ${staged.perSymbol} per market). ${fmt(staged.bookedCloses)} booked closes, ${fmt(staged.shadows)} entries blocked by the lanes and tracked as shadows (shadow PF ${fmt(staged.shadowPf)}).</p>
-      ${table(["Stage", "Input cells", "Validated", "Vetoed", "Retained", "Median PF in", "Median PF out", "Relation out/in"], stageRows)}
-      ${table(["Stage", "Lane", "Window", "Mode", "Floor (before cost and auto PF)", "Evidence", "Confirmed", "Vetoed", "Net positive", "Median PF"], laneRows)}
+  const legacy = staged.logistics === "legacy";
+  return `<h3>Staged lanes${legacy ? " (legacy logistics)" : ""}</h3>
+      <p>${esc(legacy ? "Stage progression is off: each cell is validated by the per-cell last-N gate, and that gate decides every holdout entry. The lane policy is not used." : policyText(staged.policy))}</p>
+      <p>${esc(legacy ? "Legacy logistics" : staged.plan.join(" → "))}. ${fmt(staged.pool)} candidate cells in the prehistory pool; ${fmt(staged.validatedFinal)} validated by the final stage; ${fmt(staged.chosen)} chosen for the holdout (up to ${staged.perSymbol} per market). ${fmt(staged.bookedCloses)} booked closes, ${fmt(staged.shadows)} entries blocked by the lanes and tracked as shadows (shadow PF ${fmt(staged.shadowPf)}).</p>
+      ${legacy ? "" : table(["Stage", "Input cells", "Validated", "Vetoed", "Retained", "Median PF in", "Median PF out", "Relation out/in"], stageRows)}
+      ${legacy ? "" : table(["Stage", "Lane", "Window", "Mode", "Floor (before cost and auto PF)", "Evidence", "Confirmed", "Vetoed", "Net positive", "Median PF"], laneRows)}
       ${table(["Cell", "Closes prehistory", "PF prehistory", "Closes holdout", "PF holdout", "Net holdout", "Shadow entries", "Shadow PF"], cellRows)}`;
+}
+
+function legacyStagedMarkdown(staged: StagedSummary): string[] {
+  return [
+    "### Staged lanes (legacy logistics)",
+    "",
+    `Stage progression is off: each cell is validated by the per-cell last-N gate (last 50 closes, recent window 15, suspension 12, auto PF), and that gate decides every holdout entry from the cell's own closes. ${fmt(staged.pool)} candidate cells; ${fmt(staged.validatedFinal)} validated; ${fmt(staged.chosen)} chosen (up to ${staged.perSymbol} per market). ${fmt(staged.bookedCloses)} booked closes; ${fmt(staged.shadows)} blocked entries tracked as shadows (shadow PF ${fmt(staged.shadowPf)}).`,
+    "",
+    markdownTable(
+      ["Cell", "Closes prehistory", "PF prehistory", "Closes holdout", "PF holdout", "Net holdout", "Shadow entries", "Shadow PF"],
+      staged.cells.map((cell) => [cell.name, cell.closesPre, cell.pfPre, cell.closesHoldout, cell.pfHoldout, cell.netHoldout, cell.shadows, cell.shadowPf]),
+    ),
+  ];
 }
 
 function stagedMarkdown(run: ReplayRun): string[] {
   const staged = run.report.staged;
   if (!staged) return [];
+  if (staged.logistics === "legacy") return legacyStagedMarkdown(staged);
   return [
     "### Staged lanes",
     "",
