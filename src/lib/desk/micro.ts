@@ -208,6 +208,8 @@ export type MicroOptions = {
   gate?: (closes: Closes, index: number) => boolean;
   closes?: Closes;
   trace?: Fill[];
+  // Receives every fill as it happens, without storing it.
+  sink?: (fill: Fill) => void;
 };
 
 export type MicroStateOptions = { notional?: number; cost?: number };
@@ -489,7 +491,7 @@ export function simulateMicro(book: MicroBook, set: MicroSet, from: number, to: 
   const run = new MicroRun(set, book.interval, {
     notional: options.notional,
     cost: options.cost,
-    sink: trace ? (fill) => trace.push(fill) : undefined,
+    sink: options.sink ?? (trace ? (fill) => trace.push(fill) : undefined),
   });
   const n = events.at.length;
   let k = 0;
